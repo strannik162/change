@@ -18,6 +18,24 @@ You can get binary releases on the [DDNet website](https://ddnet.org/downloads/)
 
 If you want to learn about the source code, you can check the [Development](https://wiki.ddnet.org/wiki/Development) article on the wiki.
 
+## pylot — a bot that completes maps
+
+This fork ships `pylot/`, a self contained **DDNet bot that completes race maps**,
+written in pure Python. It parses `.map` files, simulates the real DDNet tee
+physics offline, searches a jump/hook graph with A*, and plays the resulting
+input sequence back tick by tick until the tee crosses the finish line. Runs can
+be exported as `.gho` ghosts that the DDNet client renders in game.
+
+```sh
+cd pylot
+python -m pylot.cli maps                 # generate the example maps
+python -m pylot.cli run maps/pit.map     # complete a map
+python -m pylot.cli selftest             # complete all example maps
+```
+
+See [`pylot/README.md`](pylot/README.md) for the full documentation. The C++
+game code is untouched, so DDNet still builds exactly like upstream.
+
 ## Cloning
 
 To clone this repository with external libraries and no history (~700 MiB):
