@@ -555,7 +555,7 @@ void CTas::SetSelectedIndex(int Index)
 
 void CTas::RenderTasHud()
 {
-	if(m_State == TAS_STATE_IDLE && !m_IsolatedWorld)
+	if(m_State == TAS_STATE_IDLE && !m_IsolatedWorld && !m_ShowGhost)
 		return;
 
 	Graphics()->TextureClear();
@@ -569,25 +569,69 @@ void CTas::RenderTasHud()
 	else if(m_State == TAS_STATE_PLAYBACK) pStateStr = "PLAYBACK [REAL WORLD]";
 	else if(m_State == TAS_STATE_PAUSED) pStateStr = "PAUSED";
 
-	float y = 20.0f;
-	TextRender()->Text(10.0f, y, 12.0f, pStateStr);
-	y += 14.0f;
-	str_format(aBuf, sizeof(aBuf), "Rec Speed: %d t/s | Rewind: %d t/s | Forward: %d t/s | Frames: %d",
-		m_RecordSpeed, m_RewindSpeed, m_ForwardSpeed, (int)m_vFrames.size());
-	TextRender()->Text(10.0f, y, 10.0f, aBuf);
+	float y = 18.0f;
+	// State header with background
+	CUIRect HudBg = {10.0f, y - 2.0f, 380.0f, 22.0f};
+	HudBg.Draw(ColorRGBA(0.07f, 0.09f, 0.14f, 0.85f), IGraphics::CORNER_ALL, 4.0f);
+	TextRender()->Text(14.0f, y, 11.0f, pStateStr);
+	// Speed graph on right of HUD
+	if(m_vFrames.size() > 1)
+	{
+		CUIRect Graph = {400.0f, y - 2.0f, 140.0f, 22.0f};
+		Graph.Draw(ColorRGBA(0.12f, 0.14f, 0.20f, 0.9f), IGraphics::CORNER_ALL, 3.0f);
+		// compute max speed for scale
+		float MaxSpeed = 1.0f;
+		for(size_t i = std::max<int>(0, (int)m_vFrames.size() - 60); i + 1 < m_vFrames.size(); ++i)
+		{
+			float Dist = distance(m_vFrames[i].m_Pos, m_vFrames[i+1].m_Pos);
+			float Speed = Dist * 50.0f / 32.0f; // approx tiles/sec
+			if(Speed > MaxSpeed) MaxSpeed = Speed;
+		}
+		// draw bars
+		Graphics()->QuadsBegin();
+		int Start = std::max<int>(0, (int)m_vFrames.size() - 60);
+		for(int i = Start; i + 1 < (int)m_vFrames.size(); ++i)
+		{
+			float Dist = distance(m_vFrames[i].m_Pos, m_vFrames[i+1].m_Pos);
+			float Speed = Dist * 50.0f / 32.0f;
+			float H = (Speed / MaxSpeed) * (Graph.h - 4.0f);
+			float X = Graph.x + 2.0f + (i - Start) * (Graph.w - 4.0f) / 60.0f;
+			float W = (Graph.w - 4.0f) / 60.0f - 0.5f;
+			if(W < 1.0f) W = 1.0f;
+			IGraphics::CQuadItem Quad(X, Graph.y + Graph.h - 2.0f - H, W, H);
+			Graphics()->SetColor(0.4f + 0.6f * (Speed/MaxSpeed), 0.8f, 0.3f, 0.9f);
+			Graphics()->QuadsDrawTL(&Quad, 1);
+		}
+		Graphics()->QuadsEnd();
+		Graphics()->SetColor(1,1,1,1);
+		char aSpeed[32];
+		str_format(aSpeed, sizeof(aSpeed), "%.1f u/s", MaxSpeed * 32.0f);
+		TextRender()->Text(Graph.x + 4.0f, y, 7.0f, aSpeed);
+	}
+	y += 20.0f;
+	str_format(aBuf, sizeof(aBuf), "TPS:%d  Rew:%d  Fwd:%d  Frames:%d  Turbo:%s",
+		m_RecordSpeed, m_RewindSpeed, m_ForwardSpeed, (int)m_vFrames.size(), m_TurboActive?"ON":"OFF");
+	TextRender()->Text(14.0f, y, 9.0f, aBuf);
 	y += 12.0f;
 	if(m_IsolatedWorld)
 	{
 		TextRender()->TextColor(0.3f, 1.0f, 0.3f, 1.0f);
-		TextRender()->Text(10.0f, y, 10.0f, "TAS WORLD: only you + dummy visible, others hidden | Turbo: hold bound key");
+		TextRender()->Text(14.0f, y, 8.0f, "TAS WORLD: only you + dummy | Turbo: hold bound key");
 		TextRender()->TextColor(1, 1, 1, 1);
-		y += 12.0f;
+		y += 10.0f;
 	}
 	if(m_Paused)
 	{
 		TextRender()->TextColor(1, 1, 0, 1);
-		TextRender()->Text(10.0f, y, 10.0f, "PAUSED - press Pause again to resume");
+		TextRender()->Text(14.0f, y, 9.0f, "PAUSED - press Pause to resume");
 		TextRender()->TextColor(1, 1, 1, 1);
+	}
+	// Current frame scrubber hint
+	if(m_State == TAS_STATE_PLAYBACK || m_State == TAS_STATE_RECORDING)
+	{
+		char aFrame[64];
+		str_format(aFrame, sizeof(aFrame), "Frame %d / %d", m_CurrentFrame, (int)m_vFrames.size());
+		TextRender()->Text(14.0f, y + 12.0f, 8.0f, aFrame);
 	}
 }
 
