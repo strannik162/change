@@ -119,11 +119,8 @@ void CTas::OnUpdate()
 
 	if(m_State == TAS_STATE_RECORDING && !m_Paused)
 	{
-		// Handle turbo acceleration: world speed increases without changing record tick rate
-		// Turbo multiplies update iterations
-		int TurboMult = m_TurboActive ? std::max(1, g_Config.m_ClTasTurboSpeed) : 1;
-		for(int i = 0; i < TurboMult; i++)
-			DoRecordTick();
+		// Recording tick rate must stay as configured – turbo does NOT change it (KRX spec)
+		DoRecordTick();
 	}
 	else if(m_State == TAS_STATE_REWIND && !m_Paused)
 	{
@@ -143,6 +140,8 @@ void CTas::OnUpdate()
 		for(int i = 0; i < TurboMult; i++)
 			DoPlaybackTick();
 	}
+	// KRX auto tools
+	CheckAutoRewindForward();
 }
 
 void CTas::OnRender()
@@ -235,11 +234,13 @@ void CTas::GiveAllWeapons()
 // Tick logic
 void CTas::DoRecordTick()
 {
-	// Record at configured tick rate 1..50. 50 = every tick, 1 = every 50 ticks.
-	// We accumulate time based on record speed.
-	// Simplified: we record one frame per DoRecordTick call which is already throttled by OnUpdate
-	// OnUpdate is called every client frame (~50-200Hz). We need to map to server tick rate.
-	// Use accumulator: increment by (recordSpeed / 50.0f) per server tick.
+	// KRX TPS: record every Nth server tick. OnUpdate is called each frame, not each tick,
+	// so we track last tick to ensure we only advance once per server tick and use accumulator.
+	int CurTick = Client()->GameTick(g_Config.m_ClDummy);
+	static int s_LastTick = -1;
+	if(CurTick == s_LastTick)
+		return; // already handled this tick
+	s_LastTick = CurTick;
 	m_RecordAccum += (float)m_RecordSpeed / 50.0f;
 	if(m_RecordAccum < 1.0f)
 		return;
@@ -492,33 +493,21 @@ bool CTas::ShouldHideOtherPlayers(int ClientId) const
 {
 	if(!m_IsolatedWorld)
 		return false;
-	// Only show local player and dummy
-	int LocalId = GameClient()->m_Snap.m_LocalClientId;
-	// int DummyId = -1; // unused placeholder
-	// Find dummy id by checking if it's the dummy's client id (if connected)
-	// Simplified: g_Config.m_ClDummy toggles which client id is dummy, but we use Local + Dummy logic
-	// Actually dummy is separate connection; we approximate by allowing two IDs: local and (local ^1)
-	// Better: check GameClient()->m_aClients[ClientId].m_Team check? We'll just show local and next
-	if(ClientId == LocalId)
+	if(ClientId == GameClient()->m_Snap.m_LocalClientId)
 		return false;
-	// Try to find dummy's id: if dummy is active, its id is stored via Client()->GetDummyConnected()
-	// Use engine check: if ClientId == GameClient()->m_DummyId? fallback
-	// For now allow any id where pInfo is dummy-named? We approximate: hide everyone except local
-	// But spec says dummy should remain visible -> we try to detect dummy by name
-	if(GameClient()->m_Snap.m_apPlayerInfos[ClientId])
+	// Keep both local tees (main + dummy) visible – use m_aLocalIds which holds both IDs
+	if(ClientId == GameClient()->m_aLocalIds[0] || ClientId == GameClient()->m_aLocalIds[1])
+		return false;
+	if(GameClient()->PredictDummy())
 	{
-		const char *pName = GameClient()->m_aClients[ClientId].m_aName;
-		// Compare to dummy name config
-		if(str_comp(pName, g_Config.m_ClDummyName) == 0 || str_comp(pName, g_Config.m_PlayerName) == 0)
-		{
-			// keep dummy and local
-			// If name matches dummy name, don't hide
-			if(str_comp(pName, g_Config.m_ClDummyName) == 0)
-				return false;
-		}
+		int DummyId = GameClient()->m_aLocalIds[!g_Config.m_ClDummy];
+		if(ClientId == DummyId)
+			return false;
 	}
-	// Otherwise hide
-	return ClientId != LocalId;
+	// Fallback: dummy is only other visible tee
+	if(Client()->DummyConnected() && ClientId == GameClient()->m_aLocalIds[1])
+		return false;
+	return true;
 }
 
 void CTas::SetSelectedIndex(int Index)
