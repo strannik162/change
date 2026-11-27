@@ -1268,3 +1268,37 @@ void CTas::ConTasTurbo(IConsole::IResult *pResult, void *pUserData)
 	int On = pResult->GetInteger(0);
 	pSelf->SetTurbo(On != 0);
 }
+
+void CTas::ConTasTicks(IConsole::IResult *pResult, void *pUserData)
+{
+	CTas *pSelf = (CTas *)pUserData;
+	int Ticks = pResult->GetInteger(0);
+	g_Config.m_ClTasTicksPerPress = std::clamp(Ticks, 1, 50);
+	pSelf->m_TicksPerPress = g_Config.m_ClTasTicksPerPress;
+	log_info("tas", "Ticks per press set to %d", pSelf->m_TicksPerPress);
+}
+
+void CTas::ConTasValidate(IConsole::IResult *pResult, void *pUserData)
+{
+	CTas *pSelf = (CTas *)pUserData;
+	char aBuf[256];
+	pSelf->ValidateReplay(aBuf, sizeof(aBuf));
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+}
+
+void CTas::ConTasRemoveUseless(IConsole::IResult *pResult, void *pUserData)
+{
+	CTas *pSelf = (CTas *)pUserData;
+	int Removed = pSelf->RemoveUselessInputs();
+	char aBuf[128];
+	str_format(aBuf, sizeof(aBuf), "RemoveUseless: removed %d inputs", Removed);
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+}
+
+void CTas::ConTasShowAll(IConsole::IResult *pResult, void *pUserData)
+{
+	CTas *pSelf = (CTas *)pUserData;
+	pSelf->EnsureShowAll();
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", "showall 1 ensured");
+}
+
