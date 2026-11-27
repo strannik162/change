@@ -2,6 +2,7 @@
 
 #include <base/log.h>
 #include <base/io.h>
+#include <generated/protocol.h>
 #include <base/types.h>
 #include <engine/client.h>
 #include <engine/config.h>
@@ -17,7 +18,6 @@
 #include <game/client/gameclient.h>
 #include <game/client/ui.h>
 #include <game/client/ui_rect.h>
-#include <game/generated/protocol.h>
 
 #include <algorithm>
 #include <cstdio>
