@@ -185,6 +185,7 @@ public:
 	bool ValidateReplay(char *pOut, int OutSize); // Tick-by-tick position check
 	int RemoveUselessInputs(); // Remove hook/jump not needed + aim optimize
 	void GetReplayTime(char *pBuf, int Size);
+	void ClearReplay(); // KRX: clear buffer and respawn
 	void EnsureShowAllOnJoin(); // auto add cl_run_on_join showall 1
 
 	// UI helpers

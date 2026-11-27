@@ -63,7 +63,7 @@ void CTas::OnConsoleInit()
 	Console()->Register("krx_taspause", "", CFGFLAG_CLIENT, ConTasPause, this, "KRX alias: pause");
 	Console()->Register("krx_tasrewind", "i[on]", CFGFLAG_CLIENT, ConTasRewind, this, "KRX alias: rewind hold");
 	Console()->Register("krx_tasforward", "i[on]", CFGFLAG_CLIENT, ConTasForward, this, "KRX alias: forward hold");
-	Console()->Register("krx_tasrespawn", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ CTas *pSelf=(CTas*)pUserData; pSelf->m_vFrames.clear(); pSelf->m_CurrentFrame=0; }, this, "KRX alias: clear replay");
+	Console()->Register("krx_tasrespawn", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ CTas *pSelf=(CTas*)pUserData; pSelf->ClearReplay(); }, this, "KRX alias: clear replay");
 	Console()->Register("krx_tastps", "i[tps]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasRecordSpeed = std::clamp(pResult->GetInteger(0),1,50); }, this, "KRX alias krx_tastps -> cl_tas_record_speed");
 	Console()->Register("krx_tastickcontrolticks", "i[ticks]", CFGFLAG_CLIENT, ConTasTicks, this, "KRX alias");
 	Console()->Register("krx_tickcontrolstep", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasStep = pResult->GetInteger(0)?1:0; }, this, "KRX alias step");
@@ -676,7 +676,11 @@ void CTas::DoTasMenu(CUIRect MainView)
 	if(Ui()->DoButton_Menu(&s_RewindBtn, m_State == TAS_STATE_REWIND ? "Stop Rewind" : "Rewind (Hold)", 0, &SliderRect))
 	{
 		if(m_State == TAS_STATE_REWIND) StopRewind();
-		else { g_Config.m_ClTasTicksPerPress ? DoRewindTicks(g_Config.m_ClTasTicksPerPress) : StartRewind(); if(!m_StepMode) StartRewind(); }
+		else {
+			if(m_StepMode) DoRewindTicks(1);
+			else if(g_Config.m_ClTasTicksPerPress > 1) DoRewindTicks(g_Config.m_ClTasTicksPerPress);
+			else StartRewind();
+		}
 	}
 	Left.HSplitTop(4.0f, nullptr, &Left);
 	Left.HSplitTop(22.0f, &Row, &Left);
@@ -685,7 +689,11 @@ void CTas::DoTasMenu(CUIRect MainView)
 	if(Ui()->DoButton_Menu(&s_ForwardBtn, m_State == TAS_STATE_FORWARD ? "Stop Forward" : "Forward (Hold)", 0, &ButtonRect))
 	{
 		if(m_State == TAS_STATE_FORWARD) StopForward();
-		else { if(g_Config.m_ClTasTicksPerPress) DoForwardTicks(g_Config.m_ClTasTicksPerPress); if(!m_StepMode) StartForward(); }
+		else {
+			if(m_StepMode) DoForwardTicks(1);
+			else if(g_Config.m_ClTasTicksPerPress > 1) DoForwardTicks(g_Config.m_ClTasTicksPerPress);
+			else StartForward();
+		}
 	}
 	static CButtonContainer s_TurboInfo;
 	Ui()->DoButton_Menu(&s_TurboInfo, m_TurboActive ? "Turbo ON (+tas_turbo)" : "Turbo OFF", 0, &SliderRect);
@@ -719,10 +727,7 @@ void CTas::DoTasMenu(CUIRect MainView)
 	}
 	if(Ui()->DoButton_Menu(&s_ShowAllExecBtn, "Clear Replay (Respawn)", 0, &SliderRect))
 	{
-		m_vFrames.clear();
-		m_CurrentFrame=0;
-		m_LastSafeFrame=0;
-		log_info("tas", "Clear Replay: buffer cleared, respawn at start pos %.0f,%.0f", m_GhostPos.x, m_GhostPos.y);
+		ClearReplay();
 	}
 
 	Left.HSplitTop(6.0f, nullptr, &Left);
@@ -1165,6 +1170,20 @@ void CTas::GetReplayTime(char *pBuf, int Size)
 	str_format(pBuf, Size, "%02d:%06.3f (%d ticks @%d TPS)", Min, Sec, Ticks, g_Config.m_ClTasRecordSpeed);
 	str_copy(m_aLastTime, pBuf, sizeof(m_aLastTime));
 }
+void CTas::ClearReplay()
+{
+	m_vFrames.clear();
+	m_CurrentFrame = 0;
+	m_LastSafeFrame = 0;
+	m_Paused = false;
+	log_info("tas", "Clear Replay: buffer cleared, %d frames remain", (int)m_vFrames.size());
+	// KRX hold respawn: send kill to respawn at start
+	if(Client()->State() == IClient::STATE_ONLINE)
+	{
+		Console()->ExecuteLine("kill");
+	}
+}
+
 
 void CTas::ConTasRecord(IConsole::IResult *pResult, void *pUserData)
 {
