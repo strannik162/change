@@ -602,239 +602,368 @@ void CTas::RenderGhostPreview()
 
 void CTas::DoTasMenu(CUIRect MainView)
 {
-	// This is called from CMenus::RenderTas - KRX-style full menu
-	CUIRect Top, Bottom, Left, Right, ButtonRect, SliderRect;
-	MainView.HSplitTop(30.0f, &Top, &MainView);
-	MainView.HSplitBottom(30.0f, &MainView, &Bottom);
+	// KRX-style dark theme – mimic screenshot 2 (krx)
+	// Background
+	MainView.Draw(ColorRGBA(0.07f, 0.09f, 0.14f, 0.92f), IGraphics::CORNER_ALL, 8.0f);
 
-	Ui()->DoLabel(&Top, "TAS - Tool-Assisted Speedrun (KRX compatible)", 16.0f, TEXTALIGN_MC);
+	CUIRect Title, Content;
+	MainView.HSplitTop(28.0f, &Title, &Content);
+	Title.Draw(ColorRGBA(0.12f, 0.15f, 0.22f, 1.0f), IGraphics::CORNER_ALL, 6.0f);
+	Ui()->DoLabel(&Title, "TAS  \xC2\xB7  Tool-Assisted Speedrun  (KRX compatible)", 13.0f, TEXTALIGN_MC);
+	Content.Margin(8.0f, &Content);
 
-	MainView.VSplitMid(&Left, &Right, 10.0f);
+	// Two columns: left 36% | right 64% (like KRX left Main+Settings+Hotkeys vs middle Replay+Tools)
+	CUIRect Left, Right;
+	Content.VSplitLeft(Content.w * 0.38f, &Left, &Right);
+	Left.VSplitRight(8.0f, &Left, nullptr);
+	Right.VSplitLeft(8.0f, nullptr, &Right);
 
-	// LEFT: Controls
-	CUIRect Section;
-	Left.HSplitTop(16.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Main Controls (KRX: TPS / Record / Playback)", 10.0f, TEXTALIGN_ML);
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasRecordSpeed, &g_Config.m_ClTasRecordSpeed, &SliderRect, "TPS / Record Speed (krx_tastps)", 1, 50);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasRewindSpeed, &g_Config.m_ClTasRewindSpeed, &SliderRect, "Rewind Speed", 1, 50);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasForwardSpeed, &g_Config.m_ClTasForwardSpeed, &SliderRect, "Forward Speed", 1, 50);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasTurboSpeed, &g_Config.m_ClTasTurboSpeed, &SliderRect, "Turbo Multiplier (+tas_turbo)", 1, 10);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasTicksPerPress, &g_Config.m_ClTasTicksPerPress, &SliderRect, "Ticks per press (krx_tastickcontrolticks)", 1, 50);
+	auto DrawPanel = [&](CUIRect &Rect, float HeaderH, const char *pTitle, CUIRect &rHeader, CUIRect &rBody, float Corners = 6.0f) {
+		Rect.Draw(ColorRGBA(0.16f, 0.19f, 0.26f, 0.95f), IGraphics::CORNER_ALL, Corners);
+		Rect.HSplitTop(HeaderH, &rHeader, &rBody);
+		rHeader.Draw(ColorRGBA(0.20f, 0.24f, 0.34f, 1.0f), IGraphics::CORNER_T, Corners);
+		rBody.Margin(6.0f, &rBody);
+		Ui()->DoLabel(&rHeader, pTitle, 11.0f, TEXTALIGN_ML);
+		// small left padding for title
+		CUIRect T = rHeader;
+		T.Margin(8.0f, &T);
+		Ui()->DoLabel(&T, pTitle, 11.0f, TEXTALIGN_ML);
+	};
 
-	Left.HSplitTop(6.0f, nullptr, &Left);
-	Left.HSplitTop(16.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Tools (KRX: Ticks / Step / Auto)", 10.0f, TEXTALIGN_ML);
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	static CButtonContainer s_StepBtn;
-	if(GameClient()->m_Menus.DoButton_CheckBox(&s_StepBtn, "Step: 1 tick per press (krx_tickcontrolstep)", g_Config.m_ClTasStep, &SliderRect))
-		g_Config.m_ClTasStep ^= 1;
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	static CButtonContainer s_AutoRewindBtn;
-	if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoRewindBtn, "Auto Rewind on freeze (krx_tasautorewind)", g_Config.m_ClTasAutoRewind, &SliderRect))
-		g_Config.m_ClTasAutoRewind ^= 1;
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	static CButtonContainer s_AutoForwardBtn;
-	if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoForwardBtn, "Auto Forward through freeze (krx_tasautoforward)", g_Config.m_ClTasAutoForward, &SliderRect))
-		g_Config.m_ClTasAutoForward ^= 1;
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	static CButtonContainer s_AutoPauseBtn;
-	if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoPauseBtn, "Auto Pause after Auto Rewind/Forward (krx_tickcontrolpause)", g_Config.m_ClTasAutoPause, &SliderRect))
-		g_Config.m_ClTasAutoPause ^= 1;
-	Left.HSplitTop(18.0f, &SliderRect, &Left);
-	static CButtonContainer s_ShowAllBtn;
-	if(GameClient()->m_Menus.DoButton_CheckBox(&s_ShowAllBtn, "Ensure showall 1 (KRX prerequisite)", g_Config.m_ClTasShowAllAuto, &SliderRect))
-		g_Config.m_ClTasShowAllAuto ^= 1;
+	// LEFT COLUMN
+	CUIRect Panel, Header, Body, Row, ButtonRect, SliderRect;
 
-	Left.HSplitTop(6.0f, nullptr, &Left);
-
-	// Buttons row 1: Record / Play
-	CUIRect Row;
-	Left.HSplitTop(22.0f, &Row, &Left);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_RecordBtn, s_PlayBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_RecordBtn, m_State == TAS_STATE_RECORDING ? "Stop Record" : "Record (Isolated World)", 0, &ButtonRect))
+	// --- Main ---
+	Left.HSplitTop(108.0f, &Panel, &Left);
+	Left.HSplitTop(8.0f, nullptr, &Left);
+	DrawPanel(Panel, 22.0f, "Main", Header, Body);
 	{
-		if(m_State == TAS_STATE_RECORDING) StopRecord();
-		else StartRecord();
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_PlayBtn, "Playback Replay (Load) - Real World", 0, &SliderRect))
-	{
-		StartPlayback();
-	}
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(22.0f, &Row, &Left);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_PauseBtn, s_RewindBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_PauseBtn, m_Paused ? "Resume" : "Pause", 0, &ButtonRect))
-	{
-		if(m_Paused) ResumeRecord();
-		else PauseRecord();
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_RewindBtn, m_State == TAS_STATE_REWIND ? "Stop Rewind" : "Rewind (Hold)", 0, &SliderRect))
-	{
-		if(m_State == TAS_STATE_REWIND) StopRewind();
-		else {
-			if(m_StepMode) DoRewindTicks(1);
-			else if(g_Config.m_ClTasTicksPerPress > 1) DoRewindTicks(g_Config.m_ClTasTicksPerPress);
-			else StartRewind();
+		CUIRect Slider, BtnRow1, BtnRow2;
+		Body.HSplitTop(18.0f, &Slider, &Body);
+		Ui()->DoScrollbarOption(&g_Config.m_ClTasRecordSpeed, &g_Config.m_ClTasRecordSpeed, &Slider, "TPS", 1, 50);
+		// add numeric label
+		{
+			CUIRect Label;
+			Slider.VSplitRight(28.0f, nullptr, &Label);
+			char aVal[8];
+			str_format(aVal, sizeof(aVal), "%d", g_Config.m_ClTasRecordSpeed);
+			Ui()->DoLabel(&Label, aVal, 9.0f, TEXTALIGN_MC);
+		}
+		Body.HSplitTop(6.0f, nullptr, &Body);
+		Body.HSplitTop(22.0f, &BtnRow1, &Body);
+		BtnRow1.VSplitLeft(BtnRow1.w * 0.22f, &ButtonRect, &BtnRow1);
+		BtnRow1.VSplitRight(0.0f, nullptr, nullptr); // spacer
+		// Play/Pause/Playback like KRX: 3 buttons
+		static CButtonContainer s_BtnPlay, s_BtnPause, s_BtnPlayback;
+		// Play (small)
+		ButtonRect.Margin(1.0f, &ButtonRect);
+		if(GameClient()->m_Menus.DoButton_Menu(&s_BtnPlay, m_State == TAS_STATE_RECORDING ? "■" : "▶", 0, &ButtonRect))
+		{
+			if(m_State == TAS_STATE_RECORDING) StopRecord();
+			else StartRecord();
+		}
+		// Unpause / Pause (red)
+		CUIRect PauseRect, PlaybackRect;
+		BtnRow1.VSplitLeft(BtnRow1.w * 0.42f, &PauseRect, &BtnRow1);
+		PauseRect.Margin(1.0f, &PauseRect);
+		BtnRow1.VSplitLeft(4.0f, nullptr, &BtnRow1);
+		BtnRow1.VSplitLeft(BtnRow1.w, &PlaybackRect, &BtnRow1);
+		PlaybackRect.Margin(1.0f, &PlaybackRect);
+
+		// Determine pause label color via button text
+		const char *pPauseText = m_Paused ? "Unpause" : (m_State == TAS_STATE_RECORDING ? "Pause" : "Pause");
+		if(GameClient()->m_Menus.DoButton_Menu(&s_BtnPause, pPauseText, m_Paused ? 1 : 0, &PauseRect))
+		{
+			if(m_Paused) ResumeRecord();
+			else PauseRecord();
+		}
+		if(GameClient()->m_Menus.DoButton_Menu(&s_BtnPlayback, "Playback replay", 0, &PlaybackRect))
+		{
+			StartPlayback();
+		}
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		Body.HSplitTop(20.0f, &BtnRow2, &Body);
+		static CButtonContainer s_BtnTrash;
+		BtnRow2.Margin(1.0f, &BtnRow2);
+		if(GameClient()->m_Menus.DoButton_Menu(&s_BtnTrash, "Clear (trash)  \xF0\x9F\x97\x91", 0, &BtnRow2))
+		{
+			ClearReplay();
 		}
 	}
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(22.0f, &Row, &Left);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_ForwardBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_ForwardBtn, m_State == TAS_STATE_FORWARD ? "Stop Forward" : "Forward (Hold)", 0, &ButtonRect))
+
+	// --- Settings ---
+	Left.HSplitTop(92.0f, &Panel, &Left);
+	Left.HSplitTop(8.0f, nullptr, &Left);
+	DrawPanel(Panel, 22.0f, "Settings", Header, Body);
 	{
-		if(m_State == TAS_STATE_FORWARD) StopForward();
-		else {
-			if(m_StepMode) DoForwardTicks(1);
-			else if(g_Config.m_ClTasTicksPerPress > 1) DoForwardTicks(g_Config.m_ClTasTicksPerPress);
-			else StartForward();
+		CUIRect Lcol, Rcol;
+		Body.VSplitMid(&Lcol, &Rcol, 6.0f);
+		CUIRect RowL;
+		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
+		static CButtonContainer s_SetSound, s_SetEffects, s_SetAim;
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetSound, "Enable sound", g_Config.m_ClTasShowAllAuto, &RowL))
+			g_Config.m_ClTasShowAllAuto ^= 1;
+		Lcol.HSplitTop(2.0f, nullptr, &Lcol);
+		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetEffects, "Enable effects", g_Config.m_ClTasAutoRewind, &RowL))
+			g_Config.m_ClTasAutoRewind ^= 1;
+		Lcol.HSplitTop(2.0f, nullptr, &Lcol);
+		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetAim, "Show real aim", g_Config.m_ClTasAutoForward, &RowL))
+			g_Config.m_ClTasAutoForward ^= 1;
+
+		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
+		static CButtonContainer s_AutoReplay, s_AutoSave;
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoReplay, "Auto Replay", g_Config.m_ClTasAutoPause, &RowL))
+			g_Config.m_ClTasAutoPause ^= 1;
+		Rcol.HSplitTop(2.0f, nullptr, &Rcol);
+		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoSave, "Auto Save Replay", g_Config.m_ClTasStep, &RowL))
+			g_Config.m_ClTasStep ^= 1;
+		Rcol.HSplitTop(2.0f, nullptr, &Rcol);
+		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
+		// Predict players – informational
+		static CButtonContainer s_Predict;
+		int Pred = 1;
+		GameClient()->m_Menus.DoButton_CheckBox(&s_Predict, "Predict players", Pred, &RowL);
+	}
+
+	// --- Hotkeys ---
+	Left.HSplitTop(152.0f, &Panel, &Left);
+	DrawPanel(Panel, 22.0f, "Hotkeys", Header, Body);
+	{
+		struct SHotkey { const char *pName; const char *pKey; const char *pCmd; };
+		SHotkey aHotkeys[] = {
+			{"Record:", "O", "tas_record"},
+			{"Load:", "L", "tas_load"},
+			{"Clear:", "J", "clear"},
+			{"Pause:", "M", "tas_pause"},
+			{"Rewind:", "V", "tas_rewind"},
+			{"Forward:", "P", "tas_forward"},
+		};
+		for(auto &hk : aHotkeys)
+		{
+			CUIRect RowHK, Label, KeyBox;
+			Body.HSplitTop(20.0f, &RowHK, &Body);
+			Body.HSplitTop(2.0f, nullptr, &Body);
+			RowHK.VSplitLeft(70.0f, &Label, &KeyBox);
+			Ui()->DoLabel(&Label, hk.pName, 10.0f, TEXTALIGN_ML);
+			KeyBox.Draw(ColorRGBA(0.22f, 0.26f, 0.36f, 1.0f), IGraphics::CORNER_ALL, 4.0f);
+			CUIRect Kb = KeyBox;
+			Kb.Margin(2.0f, &Kb);
+			Ui()->DoLabel(&Kb, hk.pKey, 10.0f, TEXTALIGN_MC);
 		}
 	}
-	static CButtonContainer s_TurboInfo;
-	GameClient()->m_Menus.DoButton_Menu(&s_TurboInfo, m_TurboActive ? "Turbo ON (+tas_turbo)" : "Turbo OFF", 0, &SliderRect);
 
-	Left.HSplitTop(6.0f, nullptr, &Left);
-	Left.HSplitTop(22.0f, &Row, &Left);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_ValidateBtn, s_RemoveBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_ValidateBtn, "Validate Replay", 0, &ButtonRect))
+	// RIGHT COLUMN
+	// --- Replay ---
+	Right.HSplitTop(138.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Replay", Header, Body);
 	{
-		char aBuf[256];
-		ValidateReplay(aBuf, sizeof(aBuf));
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_RemoveBtn, "Remove Useless", 0, &SliderRect))
-	{
-		int R = RemoveUselessInputs();
-		char aBuf[128];
-		str_format(aBuf, sizeof(aBuf), "Removed %d useless ticks, %d remain", R, (int)m_vFrames.size());
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
-	}
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(22.0f, &Row, &Left);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_TimeBtn, s_ShowAllExecBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_TimeBtn, "Get Replay Time", 0, &ButtonRect))
-	{
-		char aBuf[64];
-		GetReplayTime(aBuf, sizeof(aBuf));
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_ShowAllExecBtn, "Clear Replay (Respawn)", 0, &SliderRect))
-	{
-		ClearReplay();
-	}
+		CUIRect FileRow, BtnRowA, BtnRowB, SaveRow;
+		Body.HSplitTop(22.0f, &FileRow, &Body);
+		// File dropdown style
+		CUIRect FolderBtn, FileName, RefreshBtn, NextBtn;
+		FileRow.VSplitLeft(22.0f, &FolderBtn, &FileRow);
+		FolderBtn.Draw(ColorRGBA(0.22f, 0.26f, 0.36f, 1.0f), IGraphics::CORNER_ALL, 4.0f);
+		Ui()->DoLabel(&FolderBtn, "\xF0\x9F\x93\x81", 12.0f, TEXTALIGN_MC);
+		FileRow.VSplitLeft(4.0f, nullptr, &FileRow);
+		FileRow.VSplitRight(46.0f, &FileName, &RefreshBtn);
+		RefreshBtn.VSplitLeft(22.0f, &RefreshBtn, &NextBtn);
+		RefreshBtn.Margin(1.0f, &RefreshBtn);
+		NextBtn.Margin(1.0f, &NextBtn);
+		FileName.Draw(ColorRGBA(0.13f, 0.15f, 0.22f, 1.0f), IGraphics::CORNER_ALL, 4.0f);
+		if(m_aSelectedFile[0])
+			Ui()->DoLabel(&FileName, m_aSelectedFile, 9.0f, TEXTALIGN_MC);
+		else if(!m_vTasFiles.empty())
+			Ui()->DoLabel(&FileName, m_vTasFiles[m_SelectedIndex >= 0 ? m_SelectedIndex : 0].c_str(), 9.0f, TEXTALIGN_MC);
+		else
+			Ui()->DoLabel(&FileName, "no file", 9.0f, TEXTALIGN_MC);
 
-	Left.HSplitTop(6.0f, nullptr, &Left);
-	Left.HSplitTop(16.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Save / Load (KRX: replays/ -> tas/)", 10.0f, TEXTALIGN_ML);
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(18.0f, &Row, &Left);
-	Row.VSplitLeft(90.0f, &ButtonRect, &Row);
-	Ui()->DoLabel(&ButtonRect, "File name:", 9.0f, TEXTALIGN_ML);
-	static CLineInput s_SaveInput;
-	s_SaveInput.SetBuffer(m_aSaveName, sizeof(m_aSaveName));
-	Ui()->DoEditBox(&s_SaveInput, &Row, 10.0f);
-
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(22.0f, &Row, &Left);
-	static CButtonContainer s_SaveBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_SaveBtn, "Save Replay (.tas)", 0, &Row))
-	{
-		char aPath[IO_MAX_PATH_LENGTH];
-		str_format(aPath, sizeof(aPath), "%s/%s%s", TAS_FOLDER, m_aSaveName, TAS_EXT);
-		if(SaveToFile(aPath))
+		static CButtonContainer s_Refresh, s_Next;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Refresh, "↻", 0, &RefreshBtn))
 			RefreshFileList();
-	}
-	Left.HSplitTop(4.0f, nullptr, &Left);
-	Left.HSplitTop(14.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "KRX binds: toggle krx_recordreplay -> tas_record | +toggle krx_tasrewind -> tas_rewind", 8.0f, TEXTALIGN_ML);
-	Left.HSplitTop(12.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Ghost visible only for you at start pos (like KRX Draw Start/End)", 8.0f, TEXTALIGN_ML);
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Next, "»", 0, &NextBtn))
+		{
+			if(!m_vTasFiles.empty())
+			{
+				int Next = (m_SelectedIndex + 1) % (int)m_vTasFiles.size();
+				SetSelectedIndex(Next);
+			}
+		}
 
-	// RIGHT: File list + Tools status
-	Right.HSplitTop(16.0f, &Section, &Right);
-	Ui()->DoLabel(&Section, "Saved TAS (tas/ folder, KRX: replays/)", 10.0f, TEXTALIGN_ML);
-	Right.HSplitTop(4.0f, nullptr, &Right);
-	CUIRect FileListRect = Right;
-	FileListRect.HSplitBottom(60.0f, &FileListRect, &ButtonRect);
-
-	static CListBox s_ListBox;
-	s_ListBox.SetActive(!m_vTasFiles.empty());
-	s_ListBox.DoStart(18.0f, m_vTasFiles.size(), 1, 3, m_SelectedIndex, &FileListRect);
-	for(size_t i = 0; i < m_vTasFiles.size(); i++)
-	{
-		const CListboxItem Item = s_ListBox.DoNextItem(&m_vTasFiles[i]);
-		if(!Item.m_Visible)
-			continue;
-		CUIRect Rect = Item.m_Rect;
-		Ui()->DoLabel(&Rect, m_vTasFiles[i].c_str(), 9.0f, TEXTALIGN_ML);
-	}
-	int NewSel = s_ListBox.DoEnd();
-	if(NewSel != m_SelectedIndex)
-	{
-		SetSelectedIndex(NewSel);
-	}
-
-	ButtonRect.HSplitTop(22.0f, &Row, &ButtonRect);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_LoadBtn, s_RefreshBtn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_LoadBtn, "Load Replay Data", 0, &ButtonRect))
-	{
-		if(m_SelectedIndex >= 0)
-			SetSelectedIndex(m_SelectedIndex);
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_RefreshBtn, "Reload List", 0, &SliderRect))
-	{
-		RefreshFileList();
-	}
-	ButtonRect.HSplitTop(4.0f, nullptr, &ButtonRect);
-	ButtonRect.HSplitTop(22.0f, &Row, &ButtonRect);
-	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_OpenFolderBtn, s_Validate2Btn;
-	if(GameClient()->m_Menus.DoButton_Menu(&s_OpenFolderBtn, "Open Folder", 0, &ButtonRect))
-	{
-		char aPath[IO_MAX_PATH_LENGTH];
-		Storage()->GetCompletePath(IStorage::TYPE_SAVE, TAS_FOLDER, aPath, sizeof(aPath));
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aPath);
-	}
-	if(GameClient()->m_Menus.DoButton_Menu(&s_Validate2Btn, "Validate Loaded", 0, &SliderRect))
-	{
-		char aBuf[256];
-		ValidateReplay(aBuf, sizeof(aBuf));
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		Body.HSplitTop(20.0f, &BtnRowA, &Body);
+		BtnRowA.VSplitMid(&ButtonRect, &SliderRect, 6.0f);
+		static CButtonContainer s_Validate, s_GetTime;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Validate, "Validate replay", 0, &ButtonRect))
+		{
+			char aBuf[256];
+			ValidateReplay(aBuf, sizeof(aBuf));
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+		}
+		if(GameClient()->m_Menus.DoButton_Menu(&s_GetTime, "Get replay time", 0, &SliderRect))
+		{
+			char aBuf[64];
+			GetReplayTime(aBuf, sizeof(aBuf));
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+		}
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		Body.HSplitTop(20.0f, &BtnRowB, &Body);
+		static CButtonContainer s_RemoveUseless;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_RemoveUseless, "Remove Useless", 0, &BtnRowB))
+		{
+			int R = RemoveUselessInputs();
+			char aBuf[128];
+			str_format(aBuf, sizeof(aBuf), "Removed %d useless ticks, %d remain", R, (int)m_vFrames.size());
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+		}
+		Body.HSplitTop(6.0f, nullptr, &Body);
+		Body.HSplitTop(22.0f, &SaveRow, &Body);
+		SaveRow.Draw(ColorRGBA(0.55f, 0.68f, 0.32f, 1.0f), IGraphics::CORNER_ALL, 5.0f);
+		static CButtonContainer s_SaveRep;
+		// Override color via Draw, but button text
+		CUIRect SaveBtn = SaveRow;
+		SaveBtn.Margin(1.0f, &SaveBtn);
+		if(GameClient()->m_Menus.DoButton_Menu(&s_SaveRep, "Save replay", 0, &SaveBtn))
+		{
+			char aPath[IO_MAX_PATH_LENGTH];
+			str_format(aPath, sizeof(aPath), "%s/%s%s", TAS_FOLDER, m_aSaveName, TAS_EXT);
+			if(SaveToFile(aPath))
+				RefreshFileList();
+		}
 	}
 
-	// Bottom: status bar with KRX info
-	CUIRect Status = Bottom;
-	if(m_ShowGhost)
+	// --- Replay Vault ---
+	Right.HSplitTop(68.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Replay Vault", Header, Body);
 	{
-		char aGhostInfo[256];
-		str_format(aGhostInfo, sizeof(aGhostInfo), "Ghost at %.0f,%.0f | %s | Validate: %s | Time: %s", m_GhostPos.x, m_GhostPos.y, m_aSelectedFile, m_aValidateResult[0]?m_aValidateResult:"not checked", m_aLastTime[0]?m_aLastTime:"-");
-		Ui()->DoLabel(&Status, aGhostInfo, 9.0f, TEXTALIGN_MC);
+		CUIRect SyncRow;
+		Body.HSplitTop(22.0f, &SyncRow, &Body);
+		SyncRow.VSplitMid(&ButtonRect, &SliderRect, 6.0f);
+		static CButtonContainer s_AutoSync, s_SyncNow;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AutoSync, "Auto Sync", 0, &ButtonRect))
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", "Auto Sync: not yet (vault github.com/krxclient/krx-replays)");
+		if(GameClient()->m_Menus.DoButton_Menu(&s_SyncNow, "Sync now", 0, &SliderRect))
+			RefreshFileList();
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		Ui()->DoLabel(&Body, "Automatically sync with the replay vault from github.com/krxclient/krx-replays", 7.0f, TEXTALIGN_TL);
 	}
-	else if(m_State != TAS_STATE_IDLE)
+
+	// --- Tools ---
+	Right.HSplitTop(84.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Tools", Header, Body);
+	{
+		CUIRect TicksRow, ToolsBtnRow;
+		Body.HSplitTop(18.0f, &TicksRow, &Body);
+		CUIRect TLabel, TSlider, TVal;
+		TicksRow.VSplitLeft(44.0f, &TLabel, &TicksRow);
+		TicksRow.VSplitRight(24.0f, &TSlider, &TVal);
+		Ui()->DoLabel(&TLabel, "Ticks: 1", 10.0f, TEXTALIGN_ML);
+		Ui()->DoScrollbarOption(&g_Config.m_ClTasTicksPerPress, &g_Config.m_ClTasTicksPerPress, &TSlider, "", 1, 50);
+		char aTickVal[8];
+		str_format(aTickVal, sizeof(aTickVal), "%d", g_Config.m_ClTasTicksPerPress);
+		Ui()->DoLabel(&TVal, aTickVal, 10.0f, TEXTALIGN_MC);
+		Body.HSplitTop(6.0f, nullptr, &Body);
+		Body.HSplitTop(20.0f, &ToolsBtnRow, &Body);
+		ToolsBtnRow.VSplitLeft(ToolsBtnRow.w * 0.25f, &ButtonRect, &ToolsBtnRow);
+		ToolsBtnRow.VSplitLeft(4.0f, nullptr, &ToolsBtnRow);
+		ToolsBtnRow.VSplitLeft(ToolsBtnRow.w * 0.33f, &SliderRect, &ToolsBtnRow);
+		ToolsBtnRow.VSplitLeft(4.0f, nullptr, &ToolsBtnRow);
+		CUIRect Btn3, Btn4;
+		ToolsBtnRow.VSplitLeft(ToolsBtnRow.w * 0.5f, &Btn3, &Btn4);
+		Btn3.Margin(1.0f, &Btn3);
+		Btn4.Margin(1.0f, &Btn4);
+		ButtonRect.Margin(1.0f, &ButtonRect);
+		SliderRect.Margin(1.0f, &SliderRect);
+		static CButtonContainer s_AutoRewind, s_AutoForward, s_AutoPause2, s_Step;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AutoRewind, "Auto rewind", g_Config.m_ClTasAutoRewind, &ButtonRect))
+			g_Config.m_ClTasAutoRewind ^= 1;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AutoForward, "Auto forward", g_Config.m_ClTasAutoForward, &SliderRect))
+			g_Config.m_ClTasAutoForward ^= 1;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AutoPause2, "Auto pause", g_Config.m_ClTasAutoPause, &Btn3))
+			g_Config.m_ClTasAutoPause ^= 1;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Step, "Step", g_Config.m_ClTasStep, &Btn4))
+			g_Config.m_ClTasStep ^= 1;
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		// show rewind/forward turbo row
+		CUIRect RFFRow;
+		Body.HSplitTop(20.0f, &RFFRow, &Body);
+		RFFRow.VSplitMid(&ButtonRect, &SliderRect, 6.0f);
+		static CButtonContainer s_Rew, s_Fw;
+		ButtonRect.Margin(1.0f, &ButtonRect);
+		SliderRect.Margin(1.0f, &SliderRect);
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Rew, m_State == TAS_STATE_REWIND ? "Stop Rewind" : "Rewind (Hold)", 0, &ButtonRect))
+		{
+			if(m_State == TAS_STATE_REWIND) StopRewind();
+			else {
+				if(m_StepMode) DoRewindTicks(1);
+				else if(g_Config.m_ClTasTicksPerPress > 1) DoRewindTicks(g_Config.m_ClTasTicksPerPress);
+				else StartRewind();
+			}
+		}
+		if(GameClient()->m_Menus.DoButton_Menu(&s_Fw, m_State == TAS_STATE_FORWARD ? "Stop Forward" : "Forward (Hold)", 0, &SliderRect))
+		{
+			if(m_State == TAS_STATE_FORWARD) StopForward();
+			else {
+				if(m_StepMode) DoForwardTicks(1);
+				else if(g_Config.m_ClTasTicksPerPress > 1) DoForwardTicks(g_Config.m_ClTasTicksPerPress);
+				else StartForward();
+			}
+		}
+	}
+
+	// --- Fake Aim ---
+	Right.HSplitTop(72.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Fake Aim", Header, Body);
+	{
+		CUIRect DropRow, AddRow;
+		Body.HSplitTop(20.0f, &DropRow, &Body);
+		DropRow.Draw(ColorRGBA(0.22f, 0.26f, 0.36f, 1.0f), IGraphics::CORNER_ALL, 4.0f);
+		CUIRect D = DropRow;
+		D.Margin(6.0f, &D);
+		Ui()->DoLabel(&D, "Smooth  \xE2\x96\xBE", 10.0f, TEXTALIGN_MC);
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		Body.HSplitTop(20.0f, &AddRow, &Body);
+		static CButtonContainer s_AddFake;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AddFake, "Add fake aim", 0, &AddRow))
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", "Fake aim: optimized aim for anticheat (stub)");
+	}
+
+	// --- Visuals ---
+	Right.HSplitTop(46.0f, &Panel, &Right);
+	DrawPanel(Panel, 22.0f, "Visuals", Header, Body);
+	{
+		static CButtonContainer s_Vis;
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_Vis, "Draw start/end pos", g_Config.m_ClTasShowAllAuto, &Body))
+			g_Config.m_ClTasShowAllAuto ^= 1;
+	}
+
+	// Bottom status – compact
+	CUIRect Status = Content;
+	Status.HSplitBottom(14.0f, nullptr, &Status);
+	// we already used Content, so draw footer inside MainView bottom
+	CUIRect Footer;
+	MainView.HSplitBottom(14.0f, nullptr, &Footer);
+	Footer.Margin(4.0f, &Footer);
+	if(m_ShowGhost || m_State != TAS_STATE_IDLE)
 	{
 		char aStatus[256];
-		str_format(aStatus, sizeof(aStatus), "State: %s | Frames: %d | TicksPress:%d Step:%s | AutoRW:%s AutoFW:%s | Pos: %.0f,%.0f",
-			m_State == TAS_STATE_RECORDING ? "Recording [TAS WORLD]" : m_State == TAS_STATE_PLAYBACK ? "Playback [REAL]" : m_State == TAS_STATE_REWIND ? "Rewind" : m_State == TAS_STATE_FORWARD ? "Forward" : "Idle",
-			(int)m_vFrames.size(), m_TicksPerPress, m_StepMode?"ON":"OFF", g_Config.m_ClTasAutoRewind?"ON":"OFF", g_Config.m_ClTasAutoForward?"ON":"OFF", m_GhostPos.x, m_GhostPos.y);
-		Ui()->DoLabel(&Status, aStatus, 9.0f, TEXTALIGN_MC);
+		if(m_ShowGhost)
+			str_format(aStatus, sizeof(aStatus), "Ghost at %.0f,%.0f | %s | %s", m_GhostPos.x, m_GhostPos.y, m_aSelectedFile[0]?m_aSelectedFile:"no file", m_aValidateResult[0]?m_aValidateResult:"not checked");
+		else
+			str_format(aStatus, sizeof(aStatus), "State: %s | Frames: %d | TPS:%d Turbo:%s", m_State==TAS_STATE_RECORDING?"Recording":m_State==TAS_STATE_PLAYBACK?"Playback":m_State==TAS_STATE_REWIND?"Rewind":m_State==TAS_STATE_FORWARD?"Forward":"Idle", (int)m_vFrames.size(), m_RecordSpeed, m_TurboActive?"ON":"OFF");
+		Ui()->DoLabel(&Footer, aStatus, 8.0f, TEXTALIGN_MC);
 	}
 	else
 	{
-		Ui()->DoLabel(&Status, "TAS ready. Record=isolated world (only you+dummy). Use showall 1 prerequisite for weapons.", 9.0f, TEXTALIGN_MC);
+		Ui()->DoLabel(&Footer, "TAS ready. Record = isolated world (only you+dummy). Use showall 1 for weapons.", 8.0f, TEXTALIGN_MC);
 	}
 }
-
 
 
 // ----------------------------------------------------------------
