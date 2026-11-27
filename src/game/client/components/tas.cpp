@@ -246,7 +246,9 @@ void CTas::RemoveKeyframe(int Index)
 void CTas::JumpToKeyframe(int Index)
 {
 	if(Index < 0 || Index >= (int)m_vKeyframes.size() || m_vFrames.empty()) return;
-	m_CurrentFrame = std::clamp(m_vKeyframes[Index], 0, (int)m_vFrames.size()-1);
+	int Target = std::clamp(m_vKeyframes[Index], 0, (int)m_vFrames.size()-1);
+	if(Target < 0 || Target >= (int)m_vFrames.size()) return;
+	m_CurrentFrame = Target;
 	m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
 	m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
 	log_info("tas", "Jump to keyframe %d -> frame %d", Index, m_CurrentFrame);
@@ -342,6 +344,7 @@ void CTas::DoRecordTick()
 	}
 
 	m_vFrames.push_back(Frame);
+	m_CurrentFrame = (int)m_vFrames.size() - 1;
 
 	// Update ghost start pos if first frame
 	if(m_vFrames.size() == 1)
@@ -367,8 +370,7 @@ void CTas::DoRewindTick()
 	if(m_CurrentFrame > 0)
 	{
 		m_CurrentFrame--;
-		// Optionally interpolate character back to that frame's position
-		// In real implementation we would set predicted char pos via GameWorld
+		if(m_CurrentFrame < 0 || m_CurrentFrame >= (int)m_vFrames.size()) { m_Paused = true; return; }
 		const CTasFrame &F = m_vFrames[m_CurrentFrame];
 		m_GhostPos = F.m_Pos;
 		m_GhostDummyPos = F.m_DummyPos;
@@ -390,9 +392,10 @@ void CTas::DoForwardTick()
 		return;
 	m_ForwardAccum -= 1.0f;
 
-	if(m_CurrentFrame < (int)m_vFrames.size() - 1)
+	if(m_CurrentFrame + 1 < (int)m_vFrames.size())
 	{
 		m_CurrentFrame++;
+		if(m_CurrentFrame < 0 || m_CurrentFrame >= (int)m_vFrames.size()) { m_Paused = true; return; }
 		const CTasFrame &F = m_vFrames[m_CurrentFrame];
 		m_GhostPos = F.m_Pos;
 		m_GhostDummyPos = F.m_DummyPos;
@@ -421,7 +424,7 @@ void CTas::DoPlaybackTick()
 	}
 	m_PlaybackAccum -= 1.0f;
 
-	if(m_CurrentFrame >= (int)m_vFrames.size())
+	if(m_CurrentFrame < 0 || m_CurrentFrame >= (int)m_vFrames.size())
 	{
 		StopPlayback();
 		return;
@@ -1032,8 +1035,10 @@ void CTas::DoTasMenu(CUIRect MainView)
 			int Max = (int)m_vFrames.size() - 1;
 			if(Max < 0) Max = 0;
 			int Old = m_CurrentFrame;
+			// Clamp current to valid range before scrollbar
+			if(!m_vFrames.empty() && m_CurrentFrame >= (int)m_vFrames.size()) m_CurrentFrame = (int)m_vFrames.size()-1;
 			Ui()->DoScrollbarOption(&m_CurrentFrame, &m_CurrentFrame, &Slider, "", 0, Max);
-			if(Old != m_CurrentFrame && m_CurrentFrame < (int)m_vFrames.size())
+			if(Old != m_CurrentFrame && !m_vFrames.empty() && m_CurrentFrame >=0 && m_CurrentFrame < (int)m_vFrames.size())
 			{
 				m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
 				m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
@@ -1380,11 +1385,11 @@ void CTas::CheckAutoRewindForward()
 		}
 	}
 	m_WasFrozen = NowFrozen;
-	// Update last safe when not frozen
-	if(!NowFrozen && !m_Paused && m_State == TAS_STATE_RECORDING)
-    {
-        m_LastSafeFrame = m_CurrentFrame;
-    }
+	// Update last safe when not frozen – track actually recorded count
+	if(!NowFrozen && !m_Paused && m_State == TAS_STATE_RECORDING && !m_vFrames.empty())
+	{
+		m_LastSafeFrame = (int)m_vFrames.size() - 1;
+	}
 }
 
 void CTas::DoRewindTicks(int Ticks)
@@ -1398,6 +1403,7 @@ void CTas::DoRewindTicks(int Ticks)
 		if(m_CurrentFrame > 0)
 		{
 			m_CurrentFrame--;
+			if(m_CurrentFrame < 0 || m_CurrentFrame >= (int)m_vFrames.size()) { m_Paused = true; break; }
 			m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
 			m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
 		}
@@ -1417,9 +1423,10 @@ void CTas::DoForwardTicks(int Ticks)
 	Step = std::clamp(Step, 1, 50);
 	for(int i=0;i<Step;i++)
 	{
-		if(m_CurrentFrame < (int)m_vFrames.size()-1)
+		if(m_CurrentFrame + 1 < (int)m_vFrames.size())
 		{
 			m_CurrentFrame++;
+			if(m_CurrentFrame < 0 || m_CurrentFrame >= (int)m_vFrames.size()) { m_Paused = true; break; }
 			m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
 			m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
 		}
