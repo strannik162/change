@@ -807,14 +807,12 @@ MACRO_CONFIG_INT(ClTasRewindSpeed, cl_tas_rewind_speed, 20, 1, 50, CFGFLAG_CLIEN
 MACRO_CONFIG_INT(ClTasForwardSpeed, cl_tas_forward_speed, 20, 1, 50, CFGFLAG_CLIENT | CFGFLAG_SAVE, "TAS forward speed (1-50)")
 MACRO_CONFIG_INT(ClTasTurboSpeed, cl_tas_turbo_speed, 3, 1, 10, CFGFLAG_CLIENT | CFGFLAG_SAVE, "TAS turbo multiplier when holding bound key (1-10)")
 MACRO_CONFIG_INT(ClTasIsolated, cl_tas_isolated, 0, 0, 1, CFGFLAG_CLIENT, "TAS isolated world active (only you+dummy visible)")
-MACRO_CONFIG_STR(ClTasBindTurbo, cl_tas_bind_turbo, 20, "", CFGFLAG_CLIENT | CFGFLAG_SAVE, "Key bound to TAS turbo acceleration")
 MACRO_CONFIG_INT(ClTasTicksPerPress, cl_tas_ticks_per_press, 1, 1, 50, CFGFLAG_CLIENT | CFGFLAG_SAVE, "TAS ticks per Rewind/Forward press (krx_tastickcontrolticks) 1..50")
 MACRO_CONFIG_INT(ClTasStep, cl_tas_step, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "TAS step mode - 1 tick per press regardless of Ticks (krx_tickcontrolstep)")
 MACRO_CONFIG_INT(ClTasAutoRewind, cl_tas_auto_rewind, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Auto rewind to last safe tick before freeze (krx_tasautorewind)")
 MACRO_CONFIG_INT(ClTasAutoForward, cl_tas_auto_forward, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Auto forward through freeze to after unfrozen (krx_tasautoforward)")
 MACRO_CONFIG_INT(ClTasAutoPause, cl_tas_auto_pause, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Auto pause after Auto Rewind/Forward (krx_tickcontrolpause)")
 MACRO_CONFIG_INT(ClTasShowAllAuto, cl_tas_showall_auto, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Automatically ensure showall 1 before TAS (KRX prerequisite)")
-MACRO_CONFIG_INT(ClTasValidate, cl_tas_validate, 0, 0, 1, CFGFLAG_CLIENT, "Last validate result")
 
 /*
  * Add config variables for mods below this comment to avoid merge conflicts.
