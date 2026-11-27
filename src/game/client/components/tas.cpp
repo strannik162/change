@@ -11,6 +11,7 @@
 #include <engine/graphics.h>
 #include <engine/shared/config.h>
 #include <engine/storage.h>
+#include <zlib.h>
 #include <engine/textrender.h>
 
 #include <game/client/components/controls.h>
@@ -924,6 +925,36 @@ void CTas::DoTasMenu(CUIRect MainView)
 		}
 	}
 
+	// --- Scrubber (timeline) ---
+	Right.HSplitTop(36.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Timeline", Header, Body);
+	{
+		if(!m_vFrames.empty())
+		{
+			CUIRect Slider;
+			Body.HSplitTop(14.0f, &Slider, &Body);
+			int Max = (int)m_vFrames.size() - 1;
+			if(Max < 0) Max = 0;
+			int Old = m_CurrentFrame;
+			Ui()->DoScrollbarOption(&m_CurrentFrame, &m_CurrentFrame, &Slider, "", 0, Max);
+			if(Old != m_CurrentFrame && m_CurrentFrame < (int)m_vFrames.size())
+			{
+				m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
+				m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
+			}
+			CUIRect Label;
+			Body.HSplitTop(10.0f, &Label, &Body);
+			char aTime[64];
+			GetReplayTime(aTime, sizeof(aTime));
+			char aLabel[128];
+			str_format(aLabel, sizeof(aLabel), "%d / %d frames  %s", m_CurrentFrame, (int)m_vFrames.size(), aTime);
+			Ui()->DoLabel(&Label, aLabel, 8.0f, TEXTALIGN_MC);
+		}
+		else
+			Ui()->DoLabel(&Body, "No replay loaded", 9.0f, TEXTALIGN_MC);
+	}
+
 	// --- Fake Aim ---
 	Right.HSplitTop(72.0f, &Panel, &Right);
 	Right.HSplitTop(8.0f, nullptr, &Right);
@@ -994,20 +1025,40 @@ bool CTas::SaveToFile(const char *pFilename)
 	m_Header.m_StartDummyPos = m_GhostDummyPos;
 	m_Header.m_NumFrames = m_vFrames.size();
 
-	// Write magic + version
-	const char *pMagic = "DDNET_TAS_v1";
-	io_write(File, pMagic, 12);
-	io_write(File, &m_Header, sizeof(m_Header));
+	// Try compressed v2 first (zlib), fallback to v1
+	const char *pMagicV2 = "DDNET_TAS_v2";
+	unsigned long SrcSize = m_vFrames.size() * sizeof(CTasFrame);
+	unsigned long DstSize = compressBound(SrcSize);
+	std::vector<unsigned char> Compressed(DstSize);
+	int ZRes = Z_OK;
+	if(SrcSize > 0)
+		ZRes = compress(Compressed.data(), &DstSize, (const Bytef*)m_vFrames.data(), SrcSize);
 
-	// Write frames
-	for(auto &F : m_vFrames)
+	if(SrcSize == 0 || (ZRes == Z_OK && DstSize < SrcSize * 0.9f))
 	{
-		io_write(File, &F, sizeof(F));
+		// Use v2 compressed – smaller than 90% of original
+		io_write(File, pMagicV2, 12);
+		io_write(File, &m_Header, sizeof(m_Header));
+		uint32_t CompressedSize = (uint32_t)DstSize;
+		uint32_t UncompressedSize = (uint32_t)SrcSize;
+		io_write(File, &CompressedSize, sizeof(CompressedSize));
+		io_write(File, &UncompressedSize, sizeof(UncompressedSize));
+		if(DstSize > 0)
+			io_write(File, Compressed.data(), DstSize);
+	}
+	else
+	{
+		// Fallback v1 uncompressed
+		const char *pMagic = "DDNET_TAS_v1";
+		io_write(File, pMagic, 12);
+		io_write(File, &m_Header, sizeof(m_Header));
+		for(auto &F : m_vFrames)
+			io_write(File, &F, sizeof(F));
 	}
 
 	io_close(File);
 	OptimizeMemory();
-	log_info("tas", "Saved TAS to '%s' frames=%d", pFilename, (int)m_vFrames.size());
+	log_info("tas", "Saved TAS to '%s' frames=%d %s", pFilename, (int)m_vFrames.size(), (ZRes==Z_OK && DstSize < SrcSize*0.9f)?"(compressed v2)":"(v1)");
 
 	// Also save human readable .json alongside for inspection
 	char aJsonPath[IO_MAX_PATH_LENGTH];
@@ -1030,7 +1081,6 @@ bool CTas::LoadFromFile(const char *pFilename)
 	IOHANDLE File = Storage()->OpenFile(pFilename, IOFLAG_READ, IStorage::TYPE_SAVE);
 	if(!File)
 	{
-		// Try absolute
 		File = Storage()->OpenFile(pFilename, IOFLAG_READ, IStorage::TYPE_ALL);
 		if(!File)
 		{
@@ -1040,7 +1090,14 @@ bool CTas::LoadFromFile(const char *pFilename)
 	}
 
 	char aMagic[12];
-	if(io_read(File, aMagic, 12) != 12 || mem_comp(aMagic, "DDNET_TAS_v1", 12) != 0)
+	if(io_read(File, aMagic, 12) != 12)
+	{
+		io_close(File);
+		return false;
+	}
+	bool IsV2 = mem_comp(aMagic, "DDNET_TAS_v2", 12) == 0;
+	bool IsV1 = mem_comp(aMagic, "DDNET_TAS_v1", 12) == 0;
+	if(!IsV1 && !IsV2)
 	{
 		log_info("tas", "Invalid TAS file magic '%s'", pFilename);
 		io_close(File);
@@ -1054,13 +1111,43 @@ bool CTas::LoadFromFile(const char *pFilename)
 	}
 
 	m_vFrames.clear();
-	m_vFrames.resize(m_Header.m_NumFrames);
-	for(int i = 0; i < m_Header.m_NumFrames; i++)
+	m_vFrames.reserve(m_Header.m_NumFrames);
+
+	if(IsV2)
 	{
-		if(io_read(File, &m_vFrames[i], sizeof(CTasFrame)) != sizeof(CTasFrame))
+		uint32_t CompressedSize = 0, UncompressedSize = 0;
+		if(io_read(File, &CompressedSize, sizeof(CompressedSize)) != sizeof(CompressedSize) ||
+		   io_read(File, &UncompressedSize, sizeof(UncompressedSize)) != sizeof(UncompressedSize))
 		{
-			m_vFrames.resize(i);
-			break;
+			io_close(File);
+			return false;
+		}
+		std::vector<unsigned char> Compressed(CompressedSize);
+		if(CompressedSize > 0 && io_read(File, Compressed.data(), CompressedSize) != CompressedSize)
+		{
+			io_close(File);
+			return false;
+		}
+		m_vFrames.resize(m_Header.m_NumFrames);
+		unsigned long Dst = UncompressedSize;
+		int Res = uncompress((Bytef*)m_vFrames.data(), &Dst, Compressed.data(), CompressedSize);
+		if(Res != Z_OK || Dst != UncompressedSize)
+		{
+			log_error("tas", "Failed to decompress TAS '%s' err=%d", pFilename, Res);
+			io_close(File);
+			return false;
+		}
+	}
+	else
+	{
+		m_vFrames.resize(m_Header.m_NumFrames);
+		for(int i = 0; i < m_Header.m_NumFrames; i++)
+		{
+			if(io_read(File, &m_vFrames[i], sizeof(CTasFrame)) != sizeof(CTasFrame))
+			{
+				m_vFrames.resize(i);
+				break;
+			}
 		}
 	}
 
@@ -1069,8 +1156,9 @@ bool CTas::LoadFromFile(const char *pFilename)
 	m_GhostDummyPos = m_Header.m_StartDummyPos;
 	m_CurrentFrame = 0;
 	m_ShowGhost = true;
+	OptimizeMemory();
 
-	log_info("tas", "Loaded TAS '%s' frames=%d start=%.0f,%.0f", pFilename, (int)m_vFrames.size(), m_GhostPos.x, m_GhostPos.y);
+	log_info("tas", "Loaded TAS '%s' v%d frames=%d start=%.0f,%.0f", pFilename, IsV2?2:1, (int)m_vFrames.size(), m_GhostPos.x, m_GhostPos.y);
 	return true;
 }
 
