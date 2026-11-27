@@ -88,7 +88,7 @@ private:
 	char m_aLastTime[64];
 	int m_RemovedCount = 0;
 
-	// Data
+	// Data – optimized: pre-reserve, shrink on save, avoid realloc
 	std::vector<CTasFrame> m_vFrames;
 	CTasHeader m_Header;
 
@@ -106,6 +106,7 @@ private:
 
 	// Internal helpers
 	void UpdateSpeedsFromConfig();
+	void OptimizeMemory(); // shrink + reserve hint
 	void EnsureTasFolder();
 	void RefreshFileList();
 	void GiveAllWeapons();

@@ -199,9 +199,17 @@ void CTas::EnsureTasFolder()
 		Storage()->CreateFolder(TAS_FOLDER, IStorage::TYPE_SAVE);
 }
 
+void CTas::OptimizeMemory()
+{
+	// Keep memory tight: reserve 50*60*5 (5 min) initially, shrink after save/load
+	if(m_vFrames.capacity() > 8192 && m_vFrames.size() < m_vFrames.capacity() / 2)
+		m_vFrames.shrink_to_fit();
+}
+
 void CTas::RefreshFileList()
 {
 	m_vTasFiles.clear();
+	m_vTasFiles.reserve(64);
 	Storage()->ListDirectory(IStorage::TYPE_SAVE, TAS_FOLDER, [](const char *pFilename, int IsDir, int StorageType, void *pUser) {
 		(void)StorageType;
 		CTas *pSelf = (CTas *)pUser;
@@ -217,6 +225,8 @@ void CTas::RefreshFileList()
 
 void CTas::GiveAllWeapons()
 {
+	if(!m_IsolatedWorld || m_State != TAS_STATE_RECORDING)
+		return;
 	// Requirement #6: during TAS recording all weapon types must be pickable.
 	// We emulate by ensuring local character has all weapons.
 	// In real client, weapons are given by server; we fake HUD ammo display.
@@ -237,17 +247,23 @@ void CTas::GiveAllWeapons()
 // Tick logic
 void CTas::DoRecordTick()
 {
-	// KRX TPS: record every Nth server tick. OnUpdate is called each frame, not each tick,
-	// so we track last tick to ensure we only advance once per server tick and use accumulator.
 	int CurTick = Client()->GameTick(g_Config.m_ClDummy);
 	static int s_LastTick = -1;
 	if(CurTick == s_LastTick)
-		return; // already handled this tick
-	s_LastTick = CurTick;
-	m_RecordAccum += (float)m_RecordSpeed / 50.0f;
-	if(m_RecordAccum < 1.0f)
 		return;
-	m_RecordAccum -= 1.0f;
+	s_LastTick = CurTick;
+	// Fast path for 50 TPS (no float)
+	if(m_RecordSpeed == 50)
+	{
+		// fall through to record
+	}
+	else
+	{
+		m_RecordAccum += (float)m_RecordSpeed / 50.0f;
+		if(m_RecordAccum < 1.0f)
+			return;
+		m_RecordAccum -= 1.0f;
+	}
 
 	if(!GameClient()->m_Snap.m_pLocalCharacter)
 		return;
@@ -379,7 +395,7 @@ void CTas::StartRecord()
 	if(m_State == TAS_STATE_RECORDING)
 		return;
 	m_vFrames.clear();
-	m_vFrames.reserve(50 * 60 * 10); // 10 minutes
+	m_vFrames.reserve(50 * 60 * 8); // 8 min @50 TPS ~24000 frames, avoids realloc
 	m_CurrentFrame = 0;
 	m_RecordAccum = 0.0f;
 	m_State = TAS_STATE_RECORDING;
@@ -990,6 +1006,7 @@ bool CTas::SaveToFile(const char *pFilename)
 	}
 
 	io_close(File);
+	OptimizeMemory();
 	log_info("tas", "Saved TAS to '%s' frames=%d", pFilename, (int)m_vFrames.size());
 
 	// Also save human readable .json alongside for inspection
@@ -1237,6 +1254,7 @@ int CTas::RemoveUselessInputs()
 	int Removed = 0;
 	std::vector<CTasFrame> NewFrames;
 	NewFrames.reserve(m_vFrames.size());
+	// Early out: if less than 10 frames, nothing to optimize
 	for(size_t i=0;i<m_vFrames.size();i++)
 	{
 		const CTasFrame &F = m_vFrames[i];
