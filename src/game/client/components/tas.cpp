@@ -224,6 +224,20 @@ void CTas::RefreshFileList()
 	}, this);
 }
 
+void CTas::SaveVaultSnapshot()
+{
+	if(m_vFrames.empty())
+		return;
+	char aTime[32];
+	std::time_t Now = std::time(nullptr);
+	std::strftime(aTime, sizeof(aTime), "%Y%m%d_%H%M%S", std::localtime(&Now));
+	char aPath[IO_MAX_PATH_LENGTH];
+	str_format(aPath, sizeof(aPath), "%s/vault_%s_%s", TAS_FOLDER, GameClient()->Map()->BaseName(), aTime);
+	SaveToFile(aPath);
+	RefreshFileList();
+	log_info("tas", "Vault snapshot: %s frames=%d", aPath, (int)m_vFrames.size());
+}
+
 void CTas::GiveAllWeapons()
 {
 	if(!m_IsolatedWorld || m_State != TAS_STATE_RECORDING)
@@ -249,10 +263,9 @@ void CTas::GiveAllWeapons()
 void CTas::DoRecordTick()
 {
 	int CurTick = Client()->GameTick(g_Config.m_ClDummy);
-	static int s_LastTick = -1;
-	if(CurTick == s_LastTick)
+	if(CurTick == m_LastRecordTick)
 		return;
-	s_LastTick = CurTick;
+	m_LastRecordTick = CurTick;
 	// Fast path for 50 TPS (no float)
 	if(m_RecordSpeed == 50)
 	{
@@ -749,29 +762,30 @@ void CTas::DoTasMenu(CUIRect MainView)
 	Left.HSplitTop(8.0f, nullptr, &Left);
 	DrawPanel(Panel, 22.0f, "Settings", Header, Body);
 	{
+		// KRX-mapped settings (labels keep English to avoid breaking layout, map to correct configs)
 		CUIRect Lcol, Rcol;
 		Body.VSplitMid(&Lcol, &Rcol, 6.0f);
 		CUIRect RowL;
 		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
-		static CButtonContainer s_SetSound, s_SetEffects, s_SetAim;
-		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetSound, "Enable sound", g_Config.m_ClTasShowAllAuto, &RowL))
+		static CButtonContainer s_SetShowAll, s_SetAutoRew, s_SetAutoFwd;
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetShowAll, "ShowAll auto", g_Config.m_ClTasShowAllAuto, &RowL))
 			g_Config.m_ClTasShowAllAuto ^= 1;
 		Lcol.HSplitTop(2.0f, nullptr, &Lcol);
 		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
-		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetEffects, "Enable effects", g_Config.m_ClTasAutoRewind, &RowL))
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetAutoRew, "Auto Rewind", g_Config.m_ClTasAutoRewind, &RowL))
 			g_Config.m_ClTasAutoRewind ^= 1;
 		Lcol.HSplitTop(2.0f, nullptr, &Lcol);
 		Lcol.HSplitTop(16.0f, &RowL, &Lcol);
-		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetAim, "Show real aim", g_Config.m_ClTasAutoForward, &RowL))
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_SetAutoFwd, "Auto Forward", g_Config.m_ClTasAutoForward, &RowL))
 			g_Config.m_ClTasAutoForward ^= 1;
 
 		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
-		static CButtonContainer s_AutoReplay, s_AutoSave;
-		if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoReplay, "Auto Replay", g_Config.m_ClTasAutoPause, &RowL))
+		static CButtonContainer s_AutoPause, s_Step;
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoPause, "Auto Pause", g_Config.m_ClTasAutoPause, &RowL))
 			g_Config.m_ClTasAutoPause ^= 1;
 		Rcol.HSplitTop(2.0f, nullptr, &Rcol);
 		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
-		if(GameClient()->m_Menus.DoButton_CheckBox(&s_AutoSave, "Auto Save Replay", g_Config.m_ClTasStep, &RowL))
+		if(GameClient()->m_Menus.DoButton_CheckBox(&s_Step, "Step mode", g_Config.m_ClTasStep, &RowL))
 			g_Config.m_ClTasStep ^= 1;
 		Rcol.HSplitTop(2.0f, nullptr, &Rcol);
 		Rcol.HSplitTop(16.0f, &RowL, &Rcol);
@@ -900,7 +914,10 @@ void CTas::DoTasMenu(CUIRect MainView)
 		if(GameClient()->m_Menus.DoButton_Menu(&s_AutoSync, "Auto Sync", 0, &ButtonRect))
 			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", "Auto Sync: not yet (vault github.com/krxclient/krx-replays)");
 		if(GameClient()->m_Menus.DoButton_Menu(&s_SyncNow, "Sync now", 0, &SliderRect))
+		{
+			SaveVaultSnapshot();
 			RefreshFileList();
+		}
 		Body.HSplitTop(4.0f, nullptr, &Body);
 		Ui()->DoLabel(&Body, "Automatically sync with the replay vault from github.com/krxclient/krx-replays", 7.0f, TEXTALIGN_TL);
 	}

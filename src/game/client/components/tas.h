@@ -108,6 +108,7 @@ private:
 	void UpdateSpeedsFromConfig();
 	void OptimizeMemory(); // shrink + reserve hint
 	void EnsureTasFolder();
+	void SaveVaultSnapshot();
 	void RefreshFileList();
 	void GiveAllWeapons();
 	bool ShouldHidePlayer(int ClientId);
