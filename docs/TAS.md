@@ -34,6 +34,47 @@ TAS — отдельный изолированный мир внутри кли
 
 ---
 
+## Оптимизации и новые фичи (v2)
+
+### Сжатие сохранений (zlib v2)
+- `SaveToFile` пробует `compress()` в `DDNET_TAS_v2` (магик `DDNET_TAS_v2` + header + `CompressedSize/UncompressedSize` + payload). Если сжатие <90% от оригинала — сохраняет v2, иначе fallback v1.
+- `LoadFromFile` понимает оба формата (v1 прямой dump, v2 `uncompress`). Логирует `v2 frames=N`.
+- Использует `engine/external/zlib/zlib.h` bundled.
+- `OptimizeMemory()` после load/save: `shrink_to_fit` если `capacity >8192 && size < cap/2`.
+
+### Память и тик-путь
+- `RefreshFileList` `reserve(64)`, `StartRecord` `reserve(50*60*8 ≈24000)` избегает realloc на длинных ранах (8 мин).
+- `DoRecordTick` fast-path `TPS==50` без float, иначе `m_RecordAccum += speed/50.0`.
+- `GiveAllWeapons` early-out если не isolated/recording.
+- `m_LastRecordTick` член вместо `static` внутри функции (фиксит ODR/Werror).
+
+### Timeline scrubber
+- Панель Timeline в TAS меню: `DoScrollbarOption` на `m_CurrentFrame` 0..N-1, таскание скруббера обновляет `m_GhostPos/DummyPos` + лейбл `frame / total + GetReplayTime`.
+
+### HUD velocity graph
+- `RenderTasHud` рисует фон, одну строку `TPS/Rew/Fwd/Frames/Turbo` и справа график скорости (последние 60 фреймов, `distance*50/32`, цвет `0.4+0.6*speed` градиент, max label).
+- Показывает `Frame X/N` во время record/playback.
+
+### Ghost trail
+- `players.cpp`: кроме стартового ghost (alpha 0.45) рендерит последние 20 фреймов как faded trail alpha 0.08..0.2, `ScreenRect.Inside` чек.
+
+### Vault snapshot
+- `SaveVaultSnapshot()` — timestamp `vault_<map>_<YYYYMMDD_HHMMSS>` через `SaveToFile` + `RefreshFileList`, кнопка Sync now.
+
+### Keyframes / Bookmarks + Smooth playback
+- `m_vKeyframes: vector<int>` bookmarked frames, `AddKeyframe()` dedup+sort, `JumpToKeyframe()` clamp, `ClearReplay` чистит и их.
+- Консоль: `tas_bookmark`, `tas_bookmark_jump i[idx]`, `tas_smooth i[on/off]` (лерп ghost между фреймами через `mix()` когда `m_PlaybackAccum<1`).
+- Панель Bookmarks: Add bookmark / Jump last, список первых 4 фреймов.
+
+### Настройки
+- Settings панель теперь корректно мапит: ShowAll auto / Auto Rewind / Auto Forward / Auto Pause / Step mode (раньше были Enable sound/effects).
+
+### Рендер/изо
+- `ShouldHideOtherPlayers` via `m_aLocalIds[0]/[1]` + `PredictDummy()` + `DummyConnected()`.
+- `OnUpdate` turbo не трогает RECORD тик (KRX spec), `CheckAutoRewindForward` остаётся.
+
+---
+
 ## Требования выполнены
 
 1. **Отдельный мир TAS**  
@@ -73,12 +114,27 @@ TAS — отдельный изолированный мир внутри кли
 ## Конфиги
 
 ```
-cl_tas_record_speed 20      // 1..50 тиков/сек записи
-cl_tas_rewind_speed 20     // 1..50 скорость отмотки
-cl_tas_forward_speed 20    // 1..50 скорость форварда
-cl_tas_turbo_speed 3       // 1..10 множитель ускорения при удержании бинда
-cl_tas_isolated 0          // флаг изолированного мира (только чтение)
-cl_tas_bind_turbo ""       // информационное поле для бинда
+cl_tas_record_speed 20      // 1..50 TPS записи (KRX krx_tastps)
+cl_tas_rewind_speed 20      // 1..50 отмотка (tas_rewind / krx_tasrewind)
+cl_tas_forward_speed 20     // 1..50 форвард (tas_forward)
+cl_tas_turbo_speed 3        // 1..10 турбо множитель (hold)
+cl_tas_isolated 0           // флаг изо-мира
+cl_tas_ticks_per_press 1    // 1..50 (KRX krx_tastickcontrolticks)
+cl_tas_step 0               // step mode 0/1 (KRX krx_tickcontrolstep)
+cl_tas_auto_rewind 0        // auto rewind 0/1 (KRX krx_tasautorewind)
+cl_tas_auto_forward 0       // auto forward 0/1
+cl_tas_auto_pause 0         // auto pause 0/1 (KRX krx_tickcontrolpause)
+cl_tas_showall_auto 1       // auto ensure showall 1
+```
+
+### Новые команды
+```
+tas_bookmark              // добавить закладку на текущем фрейме
+tas_bookmark_jump <idx>   // прыгнуть к закладке
+tas_smooth 0/1            // плавный ghost lerp при playback
+tas_validate              // Validate replay (max jump, mismatches)
+tas_remove_useless        // Remove useless inputs (clean aim/hook)
+tas_ticks <1..50>         // krx_tastickcontrolticks alias
 ```
 
 ## Команды
