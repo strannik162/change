@@ -5,7 +5,10 @@
 #include <base/io.h>
 #include <base/types.h>
 #include <base/vmath.h>
+#include <base/mem.h>
 #include <generated/protocol.h>
+#include <engine/console.h>
+#include <game/client/ui_rect.h>
 
 #include <vector>
 #include <string>

@@ -2,6 +2,7 @@
 
 #include <base/log.h>
 #include <base/io.h>
+#include <base/mem.h>
 #include <generated/protocol.h>
 #include <base/types.h>
 #include <engine/client.h>
@@ -75,7 +76,6 @@ void CTas::OnConsoleInit()
 	// Bindable turbo: users can bind any key to +tas_turbo
 	Console()->Chain("cl_tas_record_speed", [](IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData) {
 		pfnCallback(pResult, pCallbackUserData);
-		if(pResult->GetResultType() == IConsole::RESULT_STRING) {} // dummy
 	},
 		nullptr);
 }
@@ -485,6 +485,8 @@ void CTas::StopForward()
 
 // ----------------------------------------------------------------
 // Ghost visibility
+bool CTas::ShouldHidePlayer(int ClientId) { return ShouldHideOtherPlayers(ClientId); }
+
 bool CTas::ShouldHideOtherPlayers(int ClientId) const
 {
 	if(!m_IsolatedWorld)
@@ -502,7 +504,7 @@ bool CTas::ShouldHideOtherPlayers(int ClientId) const
 	// Use engine check: if ClientId == GameClient()->m_DummyId? fallback
 	// For now allow any id where pInfo is dummy-named? We approximate: hide everyone except local
 	// But spec says dummy should remain visible -> we try to detect dummy by name
-	if(GameClient()->m_Snap.m_paPlayerInfos[ClientId])
+	if(GameClient()->m_Snap.m_apPlayerInfos[ClientId])
 	{
 		const char *pName = GameClient()->m_aClients[ClientId].m_aName;
 		// Compare to dummy name config
@@ -590,7 +592,7 @@ void CTas::RenderGhostPreview()
 	// Simplified marker
 	TextRender()->TextColor(1, 1, 1, 0.5f);
 	char aBuf[128];
-	str_format(aBuf, sizeof(aBuf), "TAS START (ghost visible only for you)");
+	str_copy(aBuf, "TAS START (ghost visible only for you)");
 	// Project world pos to screen via Camera? approximate
 	// We use Hud rendering; actual tee rendering done in players.cpp with alpha
 	// Here just HUD text near ghost pos? For now not drawing world ghost, but logic is there
@@ -950,7 +952,7 @@ void CTas::EnsureShowAll()
 	{
 		char aBuf[128];
 		str_format(aBuf, sizeof(aBuf), "say /showall 1");
-		Console()->ExecuteLine(aBuf);
+		Console()->ExecuteLine(aBuf, IConsole::CLIENT_ID_GAME);
 		log_info("tas", "KRX: ensured showall 1 for TAS entities (weapons/pickups)");
 	}
 	// Also ensure cl_run_on_join contains showall for next join
@@ -1180,7 +1182,7 @@ void CTas::ClearReplay()
 	// KRX hold respawn: send kill to respawn at start
 	if(Client()->State() == IClient::STATE_ONLINE)
 	{
-		Console()->ExecuteLine("kill");
+		Console()->ExecuteLine("kill", IConsole::CLIENT_ID_GAME);
 	}
 }
 
