@@ -810,6 +810,9 @@ if(TARGET_OS STREQUAL "windows")
   list(APPEND PLATFORM_LIBS shell32.lib)
   list(APPEND PLATFORM_LIBS ntdll.lib) # https://github.com/ddnet/ddnet/issues/6725
   list(APPEND PLATFORM_LIBS uuid.lib) # FOLDERID_RoamingAppData
+  if(MINGW)
+    list(APPEND PLATFORM_LIBS synchronization.lib) # Rust std WaitOnAddress/WakeByAddress
+  endif() # FOLDERID_RoamingAppData
 elseif(TARGET_OS STREQUAL "mac")
   if(NOT CMAKE_VERSION VERSION_LESS 3.16)
     if(NOT CMAKE_OBJCXX_COMPILER)
@@ -4222,8 +4225,8 @@ foreach(target ${TARGETS_OWN})
     target_compile_definitions(${target} PRIVATE NOGDI) # wingdi.h shouldn't define the name ERROR
     # 0x0501 (Windows XP) is required for mingw to get getaddrinfo to work
     # 0x0600 (Windows Vista) is required to use RegGetValueW and RegDeleteTreeW
-    target_compile_definitions(${target} PRIVATE NTDDI_VERSION=0x06000000) # Minimum OS version (new macro, since Vista)
-    target_compile_definitions(${target} PRIVATE _WIN32_WINNT=0x0600) # Minimum OS version (old macro, both must be defined)
+    target_compile_definitions(${target} PRIVATE NTDDI_VERSION=0x0A00000B) # Minimum OS version – Rust 1.85 needs WaitOnAddress
+    target_compile_definitions(${target} PRIVATE _WIN32_WINNT=0x0A00) # Minimum OS version – Rust 1.85 needs WaitOnAddress
     target_compile_definitions(${target} PRIVATE UNICODE) # Windows headers
     target_compile_definitions(${target} PRIVATE _UNICODE) # C-runtime
   endif()
