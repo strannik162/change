@@ -11,7 +11,7 @@
 #include <engine/graphics.h>
 #include <engine/shared/config.h>
 #include <engine/storage.h>
-#include <zlib.h>
+#include <engine/external/zlib/zlib.h>
 #include <engine/textrender.h>
 #include <ctime>
 

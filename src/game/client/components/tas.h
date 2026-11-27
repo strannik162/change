@@ -69,7 +69,8 @@ private:
 	int m_ForwardSpeed = 20;
 	int m_TicksPerPress = 1; // KRX: krx_tastickcontrolticks
 	bool m_StepMode = false;
-	bool m_SmoothPlayback = true; // public for console lambda // interpolate ghost during playback // KRX: krx_tickcontrolstep - 1 tick per press
+	bool m_SmoothPlayback = true;
+	int m_LastRecordTick = -1;
 
 	// Playback
 	int m_CurrentFrame = 0;
