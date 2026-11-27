@@ -68,7 +68,8 @@ private:
 	int m_RewindSpeed = 20;
 	int m_ForwardSpeed = 20;
 	int m_TicksPerPress = 1; // KRX: krx_tastickcontrolticks
-	bool m_StepMode = false; // KRX: krx_tickcontrolstep - 1 tick per press
+	bool m_StepMode = false;
+	bool m_SmoothPlayback = true; // public for console lambda // interpolate ghost during playback // KRX: krx_tickcontrolstep - 1 tick per press
 
 	// Playback
 	int m_CurrentFrame = 0;
@@ -91,6 +92,7 @@ private:
 	// Data – optimized: pre-reserve, shrink on save, avoid realloc
 	std::vector<CTasFrame> m_vFrames;
 	CTasHeader m_Header;
+	std::vector<int> m_vKeyframes; // bookmarked frames for quick jump
 
 	// Ghost preview
 	bool m_ShowGhost = false;
@@ -138,6 +140,8 @@ private:
 	static void ConTasValidate(IConsole::IResult *pResult, void *pUserData);
 	static void ConTasRemoveUseless(IConsole::IResult *pResult, void *pUserData);
 	static void ConTasShowAll(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasBookmark(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasBookmarkJump(IConsole::IResult *pResult, void *pUserData);
 
 public:
 	int Sizeof() const override { return sizeof(*this); }
@@ -174,6 +178,7 @@ public:
 	void StartForward();
 	void StopForward();
 	void SetTurbo(bool Active) { m_TurboActive = Active; }
+	void SetSmooth(bool Smooth) { m_SmoothPlayback = Smooth; }
 
 	// File I/O
 	bool SaveToFile(const char *pFilename);
@@ -192,6 +197,10 @@ public:
 	bool ValidateReplay(char *pOut, int OutSize); // Tick-by-tick position check
 	int RemoveUselessInputs(); // Remove hook/jump not needed + aim optimize
 	void GetReplayTime(char *pBuf, int Size);
+	void AddKeyframe(); // bookmark current frame
+	void RemoveKeyframe(int Index);
+	void JumpToKeyframe(int Index);
+	const std::vector<int> &GetKeyframes() const { return m_vKeyframes; }
 	void ClearReplay(); // KRX: clear buffer and respawn
 	void EnsureShowAllOnJoin(); // auto add cl_run_on_join showall 1
 

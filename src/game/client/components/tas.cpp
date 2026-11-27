@@ -13,6 +13,7 @@
 #include <engine/storage.h>
 #include <zlib.h>
 #include <engine/textrender.h>
+#include <ctime>
 
 #include <game/client/components/controls.h>
 #include <game/client/components/menus.h>
@@ -60,6 +61,9 @@ void CTas::OnConsoleInit()
 	Console()->Register("tas_validate", "", CFGFLAG_CLIENT, ConTasValidate, this, "Validate current TAS replay tick-by-tick");
 	Console()->Register("tas_remove_useless", "", CFGFLAG_CLIENT, ConTasRemoveUseless, this, "Remove useless inputs (no hook/jump, optimize aim)");
 	Console()->Register("tas_showall", "", CFGFLAG_CLIENT, ConTasShowAll, this, "Ensure showall 1 (KRX prerequisite)");
+	Console()->Register("tas_bookmark", "", CFGFLAG_CLIENT, ConTasBookmark, this, "Add TAS bookmark at current frame");
+	Console()->Register("tas_bookmark_jump", "i[index]", CFGFLAG_CLIENT, ConTasBookmarkJump, this, "Jump to bookmark");
+	Console()->Register("tas_smooth", "i[on/off]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ CTas *pSelf=(CTas*)pUserData; pSelf->SetSmooth(pResult->GetInteger(0)!=0); }, this, "Toggle smooth ghost interpolation during playback");
 	// KRX compatibility aliases (so KRX binds work 1:1)
 	Console()->Register("krx_recordreplay", "", CFGFLAG_CLIENT, ConTasRecord, this, "KRX alias: toggle record");
 	Console()->Register("krx_loadreplay", "", CFGFLAG_CLIENT, ConTasPlay, this, "KRX alias: toggle load/playback");
@@ -224,6 +228,30 @@ void CTas::RefreshFileList()
 	}, this);
 }
 
+void CTas::AddKeyframe()
+{
+	if(m_vFrames.empty()) return;
+	int Frame = m_CurrentFrame;
+	if(m_State == TAS_STATE_RECORDING) Frame = (int)m_vFrames.size() - 1;
+	if(std::find(m_vKeyframes.begin(), m_vKeyframes.end(), Frame) != m_vKeyframes.end()) return;
+	m_vKeyframes.push_back(Frame);
+	sort(m_vKeyframes.begin(), m_vKeyframes.end());
+	log_info("tas", "Keyframe added at frame %d", Frame);
+}
+void CTas::RemoveKeyframe(int Index)
+{
+	if(Index < 0 || Index >= (int)m_vKeyframes.size()) return;
+	m_vKeyframes.erase(m_vKeyframes.begin() + Index);
+}
+void CTas::JumpToKeyframe(int Index)
+{
+	if(Index < 0 || Index >= (int)m_vKeyframes.size() || m_vFrames.empty()) return;
+	m_CurrentFrame = std::clamp(m_vKeyframes[Index], 0, (int)m_vFrames.size()-1);
+	m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
+	m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
+	log_info("tas", "Jump to keyframe %d -> frame %d", Index, m_CurrentFrame);
+}
+
 void CTas::SaveVaultSnapshot()
 {
 	if(m_vFrames.empty())
@@ -379,11 +407,18 @@ void CTas::DoPlaybackTick()
 {
 	if(m_vFrames.empty())
 		return;
-	// Playback in real world with other players - use forward speed? Actually playback uses record speed but can be turbo'd
-	// Use record speed as playback tick rate
 	m_PlaybackAccum += (float)m_RecordSpeed / 50.0f;
 	if(m_PlaybackAccum < 1.0f)
+	{
+		if(m_SmoothPlayback && m_CurrentFrame + 1 < (int)m_vFrames.size())
+		{
+			const CTasFrame &A = m_vFrames[m_CurrentFrame];
+			const CTasFrame &B = m_vFrames[m_CurrentFrame + 1];
+			m_GhostPos = mix(A.m_Pos, B.m_Pos, m_PlaybackAccum);
+			m_GhostDummyPos = mix(A.m_DummyPos, B.m_DummyPos, m_PlaybackAccum);
+		}
 		return;
+	}
 	m_PlaybackAccum -= 1.0f;
 
 	if(m_CurrentFrame >= (int)m_vFrames.size())
@@ -392,11 +427,10 @@ void CTas::DoPlaybackTick()
 		return;
 	}
 	const CTasFrame &F = m_vFrames[m_CurrentFrame];
-	// Inject input
 	GameClient()->m_Controls.m_aInputData[g_Config.m_ClDummy] = F.m_Input;
 	GameClient()->m_Controls.m_aInputData[!g_Config.m_ClDummy] = F.m_DummyInput;
-	// For ghost visibility, update predicted position (visual only)
 	m_GhostPos = F.m_Pos;
+	m_GhostDummyPos = F.m_DummyPos;
 
 	m_CurrentFrame++;
 	m_PlaybackTick++;
@@ -1016,7 +1050,38 @@ void CTas::DoTasMenu(CUIRect MainView)
 			Ui()->DoLabel(&Body, "No replay loaded", 9.0f, TEXTALIGN_MC);
 	}
 
+	// --- Bookmarks (keyframes) ---
+	Right.HSplitTop(48.0f, &Panel, &Right);
+	Right.HSplitTop(8.0f, nullptr, &Right);
+	DrawPanel(Panel, 22.0f, "Bookmarks", Header, Body);
+	{
+		CUIRect Row;
+		Body.HSplitTop(20.0f, &Row, &Body);
+		Row.VSplitMid(&ButtonRect, &SliderRect, 6.0f);
+		ButtonRect.Margin(1.0f, &ButtonRect);
+		SliderRect.Margin(1.0f, &SliderRect);
+		static CButtonContainer s_AddKm, s_JumpKm;
+		if(GameClient()->m_Menus.DoButton_Menu(&s_AddKm, "Add bookmark", 0, &ButtonRect))
+			AddKeyframe();
+		char aKm[32];
+		str_format(aKm, sizeof(aKm), "Jump (%d)", (int)m_vKeyframes.size());
+		if(GameClient()->m_Menus.DoButton_Menu(&s_JumpKm, aKm, 0, &SliderRect))
+			if(!m_vKeyframes.empty()) JumpToKeyframe((int)m_vKeyframes.size()-1);
+		Body.HSplitTop(4.0f, nullptr, &Body);
+		if(!m_vKeyframes.empty())
+		{
+			CUIRect KmRow;
+			Body.HSplitTop(14.0f, &KmRow, &Body);
+			char aList[128]; aList[0]='\0';
+			for(int i=0;i<(int)m_vKeyframes.size()&&i<4;i++) { char tmp[16]; str_format(tmp,sizeof(tmp),"%d ", m_vKeyframes[i]); str_append(aList, tmp); }
+			if((int)m_vKeyframes.size()>4) str_append(aList, "...");
+			Ui()->DoLabel(&KmRow, aList, 7.0f, TEXTALIGN_ML);
+		}
+		else Ui()->DoLabel(&Body, "No bookmarks", 8.0f, TEXTALIGN_MC);
+	}
+
 	// --- Fake Aim ---
+
 	Right.HSplitTop(72.0f, &Panel, &Right);
 	Right.HSplitTop(8.0f, nullptr, &Right);
 	DrawPanel(Panel, 22.0f, "Fake Aim", Header, Body);
@@ -1561,6 +1626,18 @@ void CTas::ConTasTurbo(IConsole::IResult *pResult, void *pUserData)
 	CTas *pSelf = (CTas *)pUserData;
 	int On = pResult->GetInteger(0);
 	pSelf->SetTurbo(On != 0);
+}
+
+void CTas::ConTasBookmark(IConsole::IResult *pResult, void *pUserData)
+{
+	(void)pResult;
+	CTas *pSelf = (CTas *)pUserData;
+	pSelf->AddKeyframe();
+}
+void CTas::ConTasBookmarkJump(IConsole::IResult *pResult, void *pUserData)
+{
+	CTas *pSelf = (CTas *)pUserData;
+	pSelf->JumpToKeyframe(pResult->GetInteger(0));
 }
 
 void CTas::ConTasTicks(IConsole::IResult *pResult, void *pUserData)
