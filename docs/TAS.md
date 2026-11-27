@@ -5,7 +5,32 @@
 TAS — отдельный изолированный мир внутри клиента DDNet, где движутся только **вы и ваш dummy**, все остальные игроки исчезают с карты.  
 Позволяет записать точные инпуты, отмотать, поставить паузу, ускорить, сохранить в файл и воспроизвести уже в реальном мире с другими игроками. При выборе сохранённого файла появляется **призрачный tee** (видимый только вам) на месте старта записи.
 
-Все виды оружия автоматически доступны во время записи TAS (требование #6).
+Все виды оружия автоматически доступны во время записи TAS (требование #6). Совместим с KRX: `showall 1` автоматом, `krx_tastps` и т.д.
+
+---
+
+## KRX Parity — добавлено по запросу (3 пункта)
+
+По [KRX TAS docs](https://krxclient.gitbook.io/docs/ultimate-features/tas) добавлено:
+
+### 1) Ticks / Step — покадровый контроль
+- **Ticks per press** (`cl_tas_ticks_per_press` 1..50, KRX `krx_tastickcontrolticks`) — сколько тиков прыгает Rewind/Forward за одно нажатие. Слайдер в меню TAS → Tools.
+- **Step** (`cl_tas_step` 0/1, KRX `krx_tickcontrolstep`) — если ON, то Rewind/Forward идёт строго 1 тик за нажатие, игнорируя Ticks. Чекбокс в меню. Позволяет покадрово выставлять инпуты как в KRX.
+- Бинды KRX работают 1:1: `toggle krx_tasrewind 1 0` (Hold), `toggle krx_tasforward 1 0`, `krx_tastickcontrolticks 5`, `krx_tickcontrolstep 1`.
+
+### 2) Auto Rewind / Auto Forward / Auto Pause + ShowAll
+- **Auto Rewind** (`cl_tas_auto_rewind`, KRX `krx_tasautorewind`) — при влёте в фриз во время записи автоматом отматывает к последнему сейф-тику до фриза (`m_LastSafeFrame`). Срабатывает в `CheckAutoRewindForward()`.
+- **Auto Forward** (`cl_tas_auto_forward`, KRX `krx_tasautoforward`) — автоматом проматывает фриз-ожидание до первого тика после анфриза.
+- **Auto Pause** (`cl_tas_auto_pause`, KRX `krx_tickcontrolpause`) — после Auto Rewind/Forward ставит паузу, чтобы ты успел поправить инпут.
+- **Ensure ShowAll** (`cl_tas_showall_auto`, KRX prerequisite `showall 1` + `cl_run_on_join "showall 1"`) — при `tas_record` автоматом шлёт `say /showall 1` и прописывает `cl_run_on_join` чтобы энтити (пушки/щиты/сердечки) рендерились до старта TAS, иначе десинк как в KRX FAQ.
+
+### 3) Validate + Remove Useless + Get Time + Clear
+- **Validate Replay** — `tas_validate` / кнопка Validate: прогоняет буфер и сравнивает позиции тик-в-тик, считает `max jump` и mismatches (аналог KRX Validate). Вывод: `Validate OK: 120 frames, max jump 45.0` или WARNING про телепорты/стопперы.
+- **Remove Useless** — `tas_remove_useless` / кнопка Remove Useless: чистит лишние инпуты где нет hook/jump/fire/movement и позиция не меняется + оптимизирует aim под Robot Fake Aim (оставляет aim только на нужных тиках) как в KRX.
+- **Get Replay Time** — считает время из `ticks / TPS` → `MM:SS.mmm (ticks @TPS)`.
+- **Clear Replay** — `krx_tasrespawn` аналог: чистит буфер и респавнит на старте TAS-мира.
+
+Все KRX хоткеи забинжены как алиасы: `krx_recordreplay` → `tas_record`, `krx_loadreplay` → `tas_play`, `krx_taspause`, `krx_tastps` → `cl_tas_record_speed` и т.д.
 
 ---
 

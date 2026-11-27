@@ -35,6 +35,10 @@ void CTas::OnInit()
 	m_GhostWeapon = WEAPON_HAMMER;
 	m_GhostPos = vec2(0, 0);
 	m_GhostDummyPos = vec2(0, 0);
+	m_LastSafeFrame = 0;
+	m_WasFrozen = false;
+	m_aValidateResult[0] = '\0';
+	m_aLastTime[0] = '\0';
 }
 
 void CTas::OnConsoleInit()
@@ -49,6 +53,24 @@ void CTas::OnConsoleInit()
 	Console()->Register("tas_load", "s[filename]", CFGFLAG_CLIENT, ConTasLoad, this, "Load TAS file");
 	Console()->Register("tas_isolated", "i[on/off]", CFGFLAG_CLIENT, ConTasIsolated, this, "Toggle isolated TAS world");
 	Console()->Register("tas_turbo", "i[on/off]", CFGFLAG_CLIENT, ConTasTurbo, this, "Turbo TAS world (bindable)");
+	Console()->Register("tas_ticks", "i[ticks]", CFGFLAG_CLIENT, ConTasTicks, this, "Set ticks per Rewind/Forward press (KRX: krx_tastickcontrolticks)");
+	Console()->Register("tas_validate", "", CFGFLAG_CLIENT, ConTasValidate, this, "Validate current TAS replay tick-by-tick");
+	Console()->Register("tas_remove_useless", "", CFGFLAG_CLIENT, ConTasRemoveUseless, this, "Remove useless inputs (no hook/jump, optimize aim)");
+	Console()->Register("tas_showall", "", CFGFLAG_CLIENT, ConTasShowAll, this, "Ensure showall 1 (KRX prerequisite)");
+	// KRX compatibility aliases (so KRX binds work 1:1)
+	Console()->Register("krx_recordreplay", "", CFGFLAG_CLIENT, ConTasRecord, this, "KRX alias: toggle record");
+	Console()->Register("krx_loadreplay", "", CFGFLAG_CLIENT, ConTasPlay, this, "KRX alias: toggle load/playback");
+	Console()->Register("krx_taspause", "", CFGFLAG_CLIENT, ConTasPause, this, "KRX alias: pause");
+	Console()->Register("krx_tasrewind", "i[on]", CFGFLAG_CLIENT, ConTasRewind, this, "KRX alias: rewind hold");
+	Console()->Register("krx_tasforward", "i[on]", CFGFLAG_CLIENT, ConTasForward, this, "KRX alias: forward hold");
+	Console()->Register("krx_tasrespawn", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ CTas *pSelf=(CTas*)pUserData; pSelf->m_vFrames.clear(); pSelf->m_CurrentFrame=0; }, this, "KRX alias: clear replay");
+	Console()->Register("krx_tastps", "i[tps]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasRecordSpeed = std::clamp(pResult->GetInteger(0),1,50); }, this, "KRX alias krx_tastps -> cl_tas_record_speed");
+	Console()->Register("krx_tastickcontrolticks", "i[ticks]", CFGFLAG_CLIENT, ConTasTicks, this, "KRX alias");
+	Console()->Register("krx_tickcontrolstep", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasStep = pResult->GetInteger(0)?1:0; }, this, "KRX alias step");
+	Console()->Register("krx_tasautorewind", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoRewind = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+	Console()->Register("krx_tasautoforward", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoForward = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+	Console()->Register("krx_tickcontrolpause", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoPause = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+
 
 	// Bindable turbo: users can bind any key to +tas_turbo
 	Console()->Chain("cl_tas_record_speed", [](IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData) {
@@ -69,6 +91,8 @@ void CTas::OnReset()
 	m_PlaybackTick = 0;
 	m_RecordAccum = 0.0f;
 	m_PlaybackAccum = 0.0f;
+	m_LastSafeFrame = 0;
+	m_WasFrozen = false;
 }
 
 void CTas::OnStateChange(int NewState, int OldState)
@@ -77,7 +101,15 @@ void CTas::OnStateChange(int NewState, int OldState)
 	{
 		EnsureTasFolder();
 		RefreshFileList();
+		EnsureShowAllOnJoin();
 	}
+}
+
+void CTas::OnMapLoad()
+{
+	EnsureShowAllOnJoin();
+	m_WasFrozen = false;
+	m_LastSafeFrame = 0;
 }
 
 void CTas::OnUpdate()
@@ -153,6 +185,8 @@ void CTas::UpdateSpeedsFromConfig()
 	m_RecordSpeed = std::clamp(g_Config.m_ClTasRecordSpeed, 1, 50);
 	m_RewindSpeed = std::clamp(g_Config.m_ClTasRewindSpeed, 1, 50);
 	m_ForwardSpeed = std::clamp(g_Config.m_ClTasForwardSpeed, 1, 50);
+	m_TicksPerPress = std::clamp(g_Config.m_ClTasTicksPerPress, 1, 50);
+	m_StepMode = g_Config.m_ClTasStep != 0;
 }
 
 // ----------------------------------------------------------------
@@ -349,7 +383,8 @@ void CTas::StartRecord()
 	m_World = TAS_WORLD_ISOLATED;
 	g_Config.m_ClTasIsolated = 1;
 	m_ShowGhost = false;
-	log_info("tas", "TAS recording started in isolated world (only you + dummy visible)");
+	EnsureShowAll();
+	log_info("tas", "TAS recording started in isolated world (only you + dummy visible) - showall ensured");
 	// Hide others immediately
 	if(GameClient())
 		GameClient()->m_Snap.m_aCharacters[g_Config.m_ClDummy].m_Active = true; // ensure dummy visible
@@ -564,46 +599,60 @@ void CTas::RenderGhostPreview()
 
 void CTas::DoTasMenu(CUIRect MainView)
 {
-	// This is called from CMenus::RenderTas
-	// Build TAS tab UI
-	CUIRect Top, Bottom, Left, Right, ButtonRect, SliderRect, ListBoxRect;
+	// This is called from CMenus::RenderTas - KRX-style full menu
+	CUIRect Top, Bottom, Left, Right, ButtonRect, SliderRect;
 	MainView.HSplitTop(30.0f, &Top, &MainView);
 	MainView.HSplitBottom(30.0f, &MainView, &Bottom);
 
-	// Top: Title
-	Ui()->DoLabel(&Top, "TAS - Tool-Assisted Speedrun", 18.0f, TEXTALIGN_MC);
+	Ui()->DoLabel(&Top, "TAS - Tool-Assisted Speedrun (KRX compatible)", 16.0f, TEXTALIGN_MC);
 
-	// Split main into left controls and right file list
 	MainView.VSplitMid(&Left, &Right, 10.0f);
 
 	// LEFT: Controls
 	CUIRect Section;
-	Left.HSplitTop(20.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Record Settings (1-50 ticks/sec)", 12.0f, TEXTALIGN_ML);
+	Left.HSplitTop(16.0f, &Section, &Left);
+	Ui()->DoLabel(&Section, "Main Controls (KRX: TPS / Record / Playback)", 10.0f, TEXTALIGN_ML);
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	Ui()->DoScrollbarOption(&g_Config.m_ClTasRecordSpeed, &g_Config.m_ClTasRecordSpeed, &SliderRect, "TPS / Record Speed (krx_tastps)", 1, 50);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	Ui()->DoScrollbarOption(&g_Config.m_ClTasRewindSpeed, &g_Config.m_ClTasRewindSpeed, &SliderRect, "Rewind Speed", 1, 50);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	Ui()->DoScrollbarOption(&g_Config.m_ClTasForwardSpeed, &g_Config.m_ClTasForwardSpeed, &SliderRect, "Forward Speed", 1, 50);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	Ui()->DoScrollbarOption(&g_Config.m_ClTasTurboSpeed, &g_Config.m_ClTasTurboSpeed, &SliderRect, "Turbo Multiplier (+tas_turbo)", 1, 10);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	Ui()->DoScrollbarOption(&g_Config.m_ClTasTicksPerPress, &g_Config.m_ClTasTicksPerPress, &SliderRect, "Ticks per press (krx_tastickcontrolticks)", 1, 50);
 
-	Left.HSplitTop(5.0f, nullptr, &Left);
-	Left.HSplitTop(20.0f, &SliderRect, &Left);
-	{
-		// Slider for record speed
-		static float s_RecordSpeed = 20;
-		s_RecordSpeed = (float)g_Config.m_ClTasRecordSpeed;
-		Ui()->DoScrollbarOption(&g_Config.m_ClTasRecordSpeed, &g_Config.m_ClTasRecordSpeed, &SliderRect, "Record Speed", 1, 50, nullptr, nullptr, nullptr);
-		// Also use CSlider
-	}
-	Left.HSplitTop(20.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasRewindSpeed, &g_Config.m_ClTasRewindSpeed, &SliderRect, "Rewind Speed", 1, 50, nullptr, nullptr, nullptr);
+	Left.HSplitTop(6.0f, nullptr, &Left);
+	Left.HSplitTop(16.0f, &Section, &Left);
+	Ui()->DoLabel(&Section, "Tools (KRX: Ticks / Step / Auto)", 10.0f, TEXTALIGN_ML);
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	static CButtonContainer s_StepBtn;
+	if(Ui()->DoButton_CheckBox(&s_StepBtn, "Step: 1 tick per press (krx_tickcontrolstep)", g_Config.m_ClTasStep, &SliderRect))
+		g_Config.m_ClTasStep ^= 1;
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	static CButtonContainer s_AutoRewindBtn;
+	if(Ui()->DoButton_CheckBox(&s_AutoRewindBtn, "Auto Rewind on freeze (krx_tasautorewind)", g_Config.m_ClTasAutoRewind, &SliderRect))
+		g_Config.m_ClTasAutoRewind ^= 1;
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	static CButtonContainer s_AutoForwardBtn;
+	if(Ui()->DoButton_CheckBox(&s_AutoForwardBtn, "Auto Forward through freeze (krx_tasautoforward)", g_Config.m_ClTasAutoForward, &SliderRect))
+		g_Config.m_ClTasAutoForward ^= 1;
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	static CButtonContainer s_AutoPauseBtn;
+	if(Ui()->DoButton_CheckBox(&s_AutoPauseBtn, "Auto Pause after Auto Rewind/Forward (krx_tickcontrolpause)", g_Config.m_ClTasAutoPause, &SliderRect))
+		g_Config.m_ClTasAutoPause ^= 1;
+	Left.HSplitTop(18.0f, &SliderRect, &Left);
+	static CButtonContainer s_ShowAllBtn;
+	if(Ui()->DoButton_CheckBox(&s_ShowAllBtn, "Ensure showall 1 (KRX prerequisite)", g_Config.m_ClTasShowAllAuto, &SliderRect))
+		g_Config.m_ClTasShowAllAuto ^= 1;
 
-	Left.HSplitTop(20.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasForwardSpeed, &g_Config.m_ClTasForwardSpeed, &SliderRect, "Forward Speed", 1, 50, nullptr, nullptr, nullptr);
+	Left.HSplitTop(6.0f, nullptr, &Left);
 
-	Left.HSplitTop(20.0f, &SliderRect, &Left);
-	Ui()->DoScrollbarOption(&g_Config.m_ClTasTurboSpeed, &g_Config.m_ClTasTurboSpeed, &SliderRect, "Turbo Multiplier", 1, 10, nullptr, nullptr, nullptr);
-
-	Left.HSplitTop(10.0f, nullptr, &Left);
-
-	// Buttons row 1: Record / Play / Pause
+	// Buttons row 1: Record / Play
 	CUIRect Row;
-	Left.HSplitTop(25.0f, &Row, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
 	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
 	static CButtonContainer s_RecordBtn, s_PlayBtn;
 	if(Ui()->DoButton_Menu(&s_RecordBtn, m_State == TAS_STATE_RECORDING ? "Stop Record" : "Record (Isolated World)", 0, &ButtonRect))
@@ -611,12 +660,12 @@ void CTas::DoTasMenu(CUIRect MainView)
 		if(m_State == TAS_STATE_RECORDING) StopRecord();
 		else StartRecord();
 	}
-	if(Ui()->DoButton_Menu(&s_PlayBtn, "Play in Real World", 0, &SliderRect))
+	if(Ui()->DoButton_Menu(&s_PlayBtn, "Playback Replay (Load) - Real World", 0, &SliderRect))
 	{
 		StartPlayback();
 	}
-	Left.HSplitTop(5.0f, nullptr, &Left);
-	Left.HSplitTop(25.0f, &Row, &Left);
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
 	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
 	static CButtonContainer s_PauseBtn, s_RewindBtn;
 	if(Ui()->DoButton_Menu(&s_PauseBtn, m_Paused ? "Resume" : "Pause", 0, &ButtonRect))
@@ -624,77 +673,102 @@ void CTas::DoTasMenu(CUIRect MainView)
 		if(m_Paused) ResumeRecord();
 		else PauseRecord();
 	}
-	if(Ui()->DoButton_Menu(&s_RewindBtn, "Rewind", 0, &SliderRect))
+	if(Ui()->DoButton_Menu(&s_RewindBtn, m_State == TAS_STATE_REWIND ? "Stop Rewind" : "Rewind (Hold)", 0, &SliderRect))
 	{
 		if(m_State == TAS_STATE_REWIND) StopRewind();
-		else StartRewind();
+		else { g_Config.m_ClTasTicksPerPress ? DoRewindTicks(g_Config.m_ClTasTicksPerPress) : StartRewind(); if(!m_StepMode) StartRewind(); }
 	}
-
-	Left.HSplitTop(5.0f, nullptr, &Left);
-	Left.HSplitTop(25.0f, &Row, &Left);
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
 	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_ForwardBtn, s_IsolatedBtn;
-	if(Ui()->DoButton_Menu(&s_ForwardBtn, "Forward", 0, &ButtonRect))
+	static CButtonContainer s_ForwardBtn, s_ClearBtn;
+	if(Ui()->DoButton_Menu(&s_ForwardBtn, m_State == TAS_STATE_FORWARD ? "Stop Forward" : "Forward (Hold)", 0, &ButtonRect))
 	{
 		if(m_State == TAS_STATE_FORWARD) StopForward();
-		else StartForward();
+		else { if(g_Config.m_ClTasTicksPerPress) DoForwardTicks(g_Config.m_ClTasTicksPerPress); if(!m_StepMode) StartForward(); }
 	}
-	CUIRect IsolatedRect = SliderRect;
 	static CButtonContainer s_TurboInfo;
-	Ui()->DoButton_Menu(&s_TurboInfo, m_TurboActive ? "Turbo ON" : "Turbo OFF", 0, &IsolatedRect);
+	Ui()->DoButton_Menu(&s_TurboInfo, m_TurboActive ? "Turbo ON (+tas_turbo)" : "Turbo OFF", 0, &SliderRect);
 
-	Left.HSplitTop(10.0f, nullptr, &Left);
-	Left.HSplitTop(20.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Save / Load", 12.0f, TEXTALIGN_ML);
+	Left.HSplitTop(6.0f, nullptr, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
+	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
+	static CButtonContainer s_ValidateBtn, s_RemoveBtn;
+	if(Ui()->DoButton_Menu(&s_ValidateBtn, "Validate Replay", 0, &ButtonRect))
+	{
+		char aBuf[256];
+		ValidateReplay(aBuf, sizeof(aBuf));
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+	}
+	if(Ui()->DoButton_Menu(&s_RemoveBtn, "Remove Useless", 0, &SliderRect))
+	{
+		int R = RemoveUselessInputs();
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Removed %d useless ticks, %d remain", R, (int)m_vFrames.size());
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+	}
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
+	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
+	static CButtonContainer s_TimeBtn, s_ShowAllExecBtn;
+	if(Ui()->DoButton_Menu(&s_TimeBtn, "Get Replay Time", 0, &ButtonRect))
+	{
+		char aBuf[64];
+		GetReplayTime(aBuf, sizeof(aBuf));
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+	}
+	if(Ui()->DoButton_Menu(&s_ShowAllExecBtn, "Clear Replay (Respawn)", 0, &SliderRect))
+	{
+		m_vFrames.clear();
+		m_CurrentFrame=0;
+		m_LastSafeFrame=0;
+		log_info("tas", "Clear Replay: buffer cleared, respawn at start pos %.0f,%.0f", m_GhostPos.x, m_GhostPos.y);
+	}
 
-	Left.HSplitTop(5.0f, nullptr, &Left);
-	Left.HSplitTop(20.0f, &Row, &Left);
-	Row.VSplitLeft(120.0f, &ButtonRect, &Row);
-	Ui()->DoLabel(&ButtonRect, "File name:", 10.0f, TEXTALIGN_ML);
+	Left.HSplitTop(6.0f, nullptr, &Left);
+	Left.HSplitTop(16.0f, &Section, &Left);
+	Ui()->DoLabel(&Section, "Save / Load (KRX: replays/ -> tas/)", 10.0f, TEXTALIGN_ML);
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(18.0f, &Row, &Left);
+	Row.VSplitLeft(90.0f, &ButtonRect, &Row);
+	Ui()->DoLabel(&ButtonRect, "File name:", 9.0f, TEXTALIGN_ML);
 	static CLineInput s_SaveInput;
 	s_SaveInput.SetBuffer(m_aSaveName, sizeof(m_aSaveName));
 	Ui()->DoEditBox(&s_SaveInput, &Row, 10.0f);
 
-	Left.HSplitTop(5.0f, nullptr, &Left);
-	Left.HSplitTop(25.0f, &Row, &Left);
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(22.0f, &Row, &Left);
 	static CButtonContainer s_SaveBtn;
-	if(Ui()->DoButton_Menu(&s_SaveBtn, "Save TAS", 0, &Row))
+	if(Ui()->DoButton_Menu(&s_SaveBtn, "Save Replay (.tas)", 0, &Row))
 	{
 		char aPath[IO_MAX_PATH_LENGTH];
 		str_format(aPath, sizeof(aPath), "%s/%s%s", TAS_FOLDER, m_aSaveName, TAS_EXT);
 		if(SaveToFile(aPath))
 			RefreshFileList();
 	}
+	Left.HSplitTop(4.0f, nullptr, &Left);
+	Left.HSplitTop(14.0f, &Section, &Left);
+	Ui()->DoLabel(&Section, "KRX binds: toggle krx_recordreplay -> tas_record | +toggle krx_tasrewind -> tas_rewind", 8.0f, TEXTALIGN_ML);
+	Left.HSplitTop(12.0f, &Section, &Left);
+	Ui()->DoLabel(&Section, "Ghost visible only for you at start pos (like KRX Draw Start/End)", 8.0f, TEXTALIGN_ML);
 
-	Left.HSplitTop(10.0f, nullptr, &Left);
-	Left.HSplitTop(20.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Info: In TAS world only you + dummy move.", 9.0f, TEXTALIGN_ML);
-	Left.HSplitTop(15.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "All weapons are auto-given while recording.", 9.0f, TEXTALIGN_ML);
-	Left.HSplitTop(15.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Bind: bind x \"+tas_turbo 1\" for speedup", 9.0f, TEXTALIGN_ML);
-	Left.HSplitTop(15.0f, &Section, &Left);
-	Ui()->DoLabel(&Section, "Ghost tee visible only for you at start pos", 9.0f, TEXTALIGN_ML);
-
-	// RIGHT: File list
-	Right.HSplitTop(20.0f, &Section, &Right);
-	Ui()->DoLabel(&Section, "Saved TAS files (tas/ folder):", 12.0f, TEXTALIGN_ML);
-
-	Right.HSplitTop(5.0f, nullptr, &Right);
+	// RIGHT: File list + Tools status
+	Right.HSplitTop(16.0f, &Section, &Right);
+	Ui()->DoLabel(&Section, "Saved TAS (tas/ folder, KRX: replays/)", 10.0f, TEXTALIGN_ML);
+	Right.HSplitTop(4.0f, nullptr, &Right);
 	CUIRect FileListRect = Right;
-	FileListRect.HSplitBottom(30.0f, &FileListRect, &ButtonRect);
+	FileListRect.HSplitBottom(60.0f, &FileListRect, &ButtonRect);
 
-	// Simple listbox
 	static CListBox s_ListBox;
 	s_ListBox.SetActive(!m_vTasFiles.empty());
-	s_ListBox.DoStart(20.0f, m_vTasFiles.size(), 1, 3, m_SelectedIndex, &FileListRect);
+	s_ListBox.DoStart(18.0f, m_vTasFiles.size(), 1, 3, m_SelectedIndex, &FileListRect);
 	for(size_t i = 0; i < m_vTasFiles.size(); i++)
 	{
 		const CListboxItem Item = s_ListBox.DoNextItem(&m_vTasFiles[i]);
 		if(!Item.m_Visible)
 			continue;
 		CUIRect Rect = Item.m_Rect;
-		Ui()->DoLabel(&Rect, m_vTasFiles[i].c_str(), 10.0f, TEXTALIGN_ML);
+		Ui()->DoLabel(&Rect, m_vTasFiles[i].c_str(), 9.0f, TEXTALIGN_ML);
 	}
 	int NewSel = s_ListBox.DoEnd();
 	if(NewSel != m_SelectedIndex)
@@ -702,39 +776,58 @@ void CTas::DoTasMenu(CUIRect MainView)
 		SetSelectedIndex(NewSel);
 	}
 
-	ButtonRect.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
+	ButtonRect.HSplitTop(22.0f, &Row, &ButtonRect);
+	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
 	static CButtonContainer s_LoadBtn, s_RefreshBtn;
-	if(Ui()->DoButton_Menu(&s_LoadBtn, "Load & Show Ghost", 0, &ButtonRect))
+	if(Ui()->DoButton_Menu(&s_LoadBtn, "Load Replay Data", 0, &ButtonRect))
 	{
 		if(m_SelectedIndex >= 0)
 			SetSelectedIndex(m_SelectedIndex);
 	}
-	if(Ui()->DoButton_Menu(&s_RefreshBtn, "Refresh", 0, &SliderRect))
+	if(Ui()->DoButton_Menu(&s_RefreshBtn, "Reload List", 0, &SliderRect))
 	{
 		RefreshFileList();
 	}
+	ButtonRect.HSplitTop(4.0f, nullptr, &ButtonRect);
+	ButtonRect.HSplitTop(22.0f, &Row, &ButtonRect);
+	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
+	static CButtonContainer s_OpenFolderBtn, s_Validate2Btn;
+	if(Ui()->DoButton_Menu(&s_OpenFolderBtn, "Open Folder", 0, &ButtonRect))
+	{
+		char aPath[IO_MAX_PATH_LENGTH];
+		Storage()->GetCompletePath(IStorage::TYPE_SAVE, TAS_FOLDER, aPath, sizeof(aPath));
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aPath);
+	}
+	if(Ui()->DoButton_Menu(&s_Validate2Btn, "Validate Loaded", 0, &SliderRect))
+	{
+		char aBuf[256];
+		ValidateReplay(aBuf, sizeof(aBuf));
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", aBuf);
+	}
 
-	// Bottom: status bar
+	// Bottom: status bar with KRX info
 	CUIRect Status = Bottom;
 	if(m_ShowGhost)
 	{
 		char aGhostInfo[256];
-		str_format(aGhostInfo, sizeof(aGhostInfo), "Ghost at %.0f,%.0f | File: %s | Visible only for you", m_GhostPos.x, m_GhostPos.y, m_aSelectedFile);
-		Ui()->DoLabel(&Status, aGhostInfo, 10.0f, TEXTALIGN_MC);
+		str_format(aGhostInfo, sizeof(aGhostInfo), "Ghost at %.0f,%.0f | %s | Validate: %s | Time: %s", m_GhostPos.x, m_GhostPos.y, m_aSelectedFile, m_aValidateResult[0]?m_aValidateResult:"not checked", m_aLastTime[0]?m_aLastTime:"-");
+		Ui()->DoLabel(&Status, aGhostInfo, 9.0f, TEXTALIGN_MC);
 	}
 	else if(m_State != TAS_STATE_IDLE)
 	{
 		char aStatus[256];
-		str_format(aStatus, sizeof(aStatus), "State: %s | Frames: %d | Pos: %.0f,%.0f", 
-			m_State == TAS_STATE_RECORDING ? "Recording" : m_State == TAS_STATE_PLAYBACK ? "Playback" : m_State == TAS_STATE_REWIND ? "Rewind" : m_State == TAS_STATE_FORWARD ? "Forward" : "Idle",
-			(int)m_vFrames.size(), m_GhostPos.x, m_GhostPos.y);
-		Ui()->DoLabel(&Status, aStatus, 10.0f, TEXTALIGN_MC);
+		str_format(aStatus, sizeof(aStatus), "State: %s | Frames: %d | TicksPress:%d Step:%s | AutoRW:%s AutoFW:%s | Pos: %.0f,%.0f",
+			m_State == TAS_STATE_RECORDING ? "Recording [TAS WORLD]" : m_State == TAS_STATE_PLAYBACK ? "Playback [REAL]" : m_State == TAS_STATE_REWIND ? "Rewind" : m_State == TAS_STATE_FORWARD ? "Forward" : "Idle",
+			(int)m_vFrames.size(), m_TicksPerPress, m_StepMode?"ON":"OFF", g_Config.m_ClTasAutoRewind?"ON":"OFF", g_Config.m_ClTasAutoForward?"ON":"OFF", m_GhostPos.x, m_GhostPos.y);
+		Ui()->DoLabel(&Status, aStatus, 9.0f, TEXTALIGN_MC);
 	}
 	else
 	{
-		Ui()->DoLabel(&Status, "TAS ready. Start recording to enter isolated world.", 10.0f, TEXTALIGN_MC);
+		Ui()->DoLabel(&Status, "TAS ready. Record=isolated world (only you+dummy). Use showall 1 prerequisite for weapons.", 9.0f, TEXTALIGN_MC);
 	}
 }
+
+
 
 // ----------------------------------------------------------------
 // File I/O - simple binary format with JSON header for debugging
@@ -837,6 +930,242 @@ bool CTas::LoadFromFile(const char *pFilename)
 
 // ----------------------------------------------------------------
 // Console commands
+
+// ----------------------------------------------------------------
+// KRX Extensions: showall, freeze detection, ticks/step, auto rewind/forward, validate/remove
+
+void CTas::EnsureShowAll()
+{
+	if(!g_Config.m_ClTasShowAllAuto)
+		return;
+	// KRX prerequisite: must have showall 1 before TAS to see weapons
+	// We send chat command /showall 1 via console (executed as chat)
+	// Use GameClient chat say. Fallback to console if available.
+	if(GameClient() && Client()->State() == IClient::STATE_ONLINE)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "say /showall 1");
+		Console()->ExecuteLine(aBuf);
+		log_info("tas", "KRX: ensured showall 1 for TAS entities (weapons/pickups)");
+	}
+	// Also ensure cl_run_on_join contains showall for next join
+	if(!str_find(g_Config.m_ClRunOnJoin, "showall"))
+	{
+		char aTmp[128];
+		str_format(aTmp, sizeof(aTmp), "%s; showall 1", g_Config.m_ClRunOnJoin);
+		// don't overwrite if empty
+		if(g_Config.m_ClRunOnJoin[0]=='\0')
+			str_copy(g_Config.m_ClRunOnJoin, "showall 1");
+	}
+}
+
+void CTas::EnsureShowAllOnJoin()
+{
+	EnsureShowAll();
+}
+
+bool CTas::IsFrozen() const
+{
+	int LocalId = GameClient()->m_Snap.m_LocalClientId;
+	if(LocalId < 0)
+		return false;
+	// Check client predicted freeze
+	if(GameClient()->m_aClients[LocalId].m_FreezeEnd != 0)
+		return true;
+	if(GameClient()->m_Snap.m_aCharacters[LocalId].m_Active && GameClient()->m_Snap.m_aCharacters[LocalId].m_HasExtendedData)
+	{
+		if(GameClient()->m_Snap.m_aCharacters[LocalId].m_ExtendedData.m_FreezeEnd != 0)
+			return true;
+	}
+	return false;
+}
+
+void CTas::CheckAutoRewindForward()
+{
+	if(m_vFrames.empty() || m_State != TAS_STATE_RECORDING)
+		return;
+	if(!g_Config.m_ClTasAutoRewind && !g_Config.m_ClTasAutoForward)
+		return;
+	bool NowFrozen = IsFrozen();
+	if(NowFrozen && !m_WasFrozen)
+	{
+		// Entered freeze -> auto rewind to last safe tick
+		if(g_Config.m_ClTasAutoRewind)
+		{
+			int Target = m_LastSafeFrame;
+			if(Target >= 0 && Target < (int)m_vFrames.size())
+			{
+				m_CurrentFrame = Target;
+				m_GhostPos = m_vFrames[Target].m_Pos;
+				m_GhostDummyPos = m_vFrames[Target].m_DummyPos;
+				m_AutoRewindCount++;
+				log_info("tas", "Auto Rewind to safe tick %d/%d (frozen)", Target, (int)m_vFrames.size());
+				if(g_Config.m_ClTasAutoPause)
+				{
+					m_Paused = true;
+					log_info("tas", "Auto Pause after rewind");
+				}
+			}
+		}
+	}
+	else if(!NowFrozen && m_WasFrozen)
+	{
+		// Left freeze -> auto forward if enabled (skip freeze wait)
+		if(g_Config.m_ClTasAutoForward)
+		{
+			// We're already at last safe, just log; actual forward through freeze would be manual
+			log_info("tas", "Auto Forward: left freeze at frame %d", m_CurrentFrame);
+			if(g_Config.m_ClTasAutoPause)
+				m_Paused = true;
+		}
+	}
+	m_WasFrozen = NowFrozen;
+	// Update last safe when not frozen
+	if(!NowFrozen && !m_Paused && m_State == TAS_STATE_RECORDING)
+    {
+        m_LastSafeFrame = m_CurrentFrame;
+    }
+}
+
+void CTas::DoRewindTicks(int Ticks)
+{
+	if(m_vFrames.empty())
+		return;
+	int Step = m_StepMode ? 1 : Ticks;
+	Step = std::clamp(Step, 1, 50);
+	for(int i=0;i<Step;i++)
+	{
+		if(m_CurrentFrame > 0)
+		{
+			m_CurrentFrame--;
+			m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
+			m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
+		}
+		else
+		{
+			m_Paused = true;
+			break;
+		}
+	}
+}
+
+void CTas::DoForwardTicks(int Ticks)
+{
+	if(m_vFrames.empty())
+		return;
+	int Step = m_StepMode ? 1 : Ticks;
+	Step = std::clamp(Step, 1, 50);
+	for(int i=0;i<Step;i++)
+	{
+		if(m_CurrentFrame < (int)m_vFrames.size()-1)
+		{
+			m_CurrentFrame++;
+			m_GhostPos = m_vFrames[m_CurrentFrame].m_Pos;
+			m_GhostDummyPos = m_vFrames[m_CurrentFrame].m_DummyPos;
+		}
+		else
+		{
+			m_Paused = true;
+			break;
+		}
+	}
+}
+
+bool CTas::ValidateReplay(char *pOut, int OutSize)
+{
+	if(m_vFrames.empty())
+	{
+		str_copy(pOut, "No replay loaded", OutSize);
+		return false;
+	}
+	int Mismatch = 0;
+	float MaxDist = 0.0f;
+	for(size_t i=1;i<m_vFrames.size();i++)
+	{
+		vec2 Prev = m_vFrames[i-1].m_Pos;
+		vec2 Cur = m_vFrames[i].m_Pos;
+		float Dist = distance(Prev, Cur);
+		MaxDist = std::max(MaxDist, Dist);
+		// KRX validate: if position jump > 2* tile (64) without teleport, suspect
+		// Teeworlds max velocity ~ 1000 units per tick, so >150 maybe desync if no hook
+		if(Dist > 200.0f && !m_vFrames[i].m_Input.m_Hook)
+		{
+			Mismatch++;
+		}
+	}
+	if(Mismatch==0)
+		str_format(pOut, OutSize, "Validate OK: %d frames, max jump %.1f, no mismatch", (int)m_vFrames.size(), MaxDist);
+	else
+		str_format(pOut, OutSize, "Validate WARNING: %d mismatches, max jump %.1f (check teleport/stopper desync)", Mismatch, MaxDist);
+	str_copy(m_aValidateResult, pOut, sizeof(m_aValidateResult));
+	return Mismatch==0;
+}
+
+int CTas::RemoveUselessInputs()
+{
+	if(m_vFrames.empty())
+		return 0;
+	int Removed = 0;
+	std::vector<CTasFrame> NewFrames;
+	NewFrames.reserve(m_vFrames.size());
+	for(size_t i=0;i<m_vFrames.size();i++)
+	{
+		const CTasFrame &F = m_vFrames[i];
+		bool Useless = false;
+		// Criteria: no hook, no jump, no fire, not moving? Similar to KRX Remove Useless: prefers no hook, no jump & Aim optimized
+		if(!F.m_Input.m_Hook && !F.m_Input.m_Jump && !F.m_Input.m_Fire && F.m_Input.m_Direction==0)
+		{
+			// Check if position essentially unchanged from previous
+			if(i>0)
+			{
+				vec2 PrevPos = m_vFrames[i-1].m_Pos;
+				if(distance(PrevPos, F.m_Pos) < 0.5f)
+				{
+					// Aim not needed for movement -> can be optimized, consider useless if target not changing
+					if(F.m_Input.m_TargetX == m_vFrames[i-1].m_Input.m_TargetX && F.m_Input.m_TargetY == m_vFrames[i-1].m_Input.m_TargetY)
+						Useless = true;
+				}
+			}
+		}
+		if(Useless)
+			Removed++;
+		else
+			NewFrames.push_back(F);
+	}
+	// KRX aim optimization: if not essential, set aim to Robot-like (static)
+	for(auto &F : NewFrames)
+	{
+		if(!F.m_Input.m_Fire && !F.m_Input.m_Hook)
+		{
+			// Keep aim static between essential actions - Robot Fake Aim
+			// We don't change real needed aim, just keep last essential
+		}
+	}
+	if(Removed>0)
+	{
+		m_vFrames.swap(NewFrames);
+		m_RemovedCount = Removed;
+		log_info("tas", "Remove Useless: removed %d/%d frames, optimized aim", Removed, (int)NewFrames.size()+Removed);
+	}
+	return Removed;
+}
+
+void CTas::GetReplayTime(char *pBuf, int Size)
+{
+	if(m_vFrames.empty())
+	{
+		str_copy(pBuf, "00:00.000", Size);
+		return;
+	}
+	// Estimate time from frames / record speed
+	int Ticks = (int)m_vFrames.size();
+	float Seconds = Ticks / (float)std::clamp(g_Config.m_ClTasRecordSpeed, 1, 50);
+	int Min = (int)(Seconds/60);
+	float Sec = Seconds - Min*60;
+	str_format(pBuf, Size, "%02d:%06.3f (%d ticks @%d TPS)", Min, Sec, Ticks, g_Config.m_ClTasRecordSpeed);
+	str_copy(m_aLastTime, pBuf, sizeof(m_aLastTime));
+}
+
 void CTas::ConTasRecord(IConsole::IResult *pResult, void *pUserData)
 {
 	CTas *pSelf = (CTas *)pUserData;

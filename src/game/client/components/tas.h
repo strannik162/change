@@ -64,6 +64,8 @@ private:
 	int m_RecordSpeed = 20; // ticks per second
 	int m_RewindSpeed = 20;
 	int m_ForwardSpeed = 20;
+	int m_TicksPerPress = 1; // KRX: krx_tastickcontrolticks
+	bool m_StepMode = false; // KRX: krx_tickcontrolstep - 1 tick per press
 
 	// Playback
 	int m_CurrentFrame = 0;
@@ -72,6 +74,16 @@ private:
 	float m_PlaybackAccum = 0.0f;
 	float m_RewindAccum = 0.0f;
 	float m_ForwardAccum = 0.0f;
+
+	// Auto tools - KRX style
+	int m_LastSafeFrame = 0; // last non-frozen frame
+	bool m_WasFrozen = false;
+	int m_AutoRewindCount = 0;
+
+	// Validate / Remove useless
+	char m_aValidateResult[256];
+	char m_aLastTime[64];
+	int m_RemovedCount = 0;
 
 	// Data
 	std::vector<CTasFrame> m_vFrames;
@@ -95,6 +107,11 @@ private:
 	void RefreshFileList();
 	void GiveAllWeapons();
 	bool ShouldHidePlayer(int ClientId);
+	void EnsureShowAll(); // KRX prerequisite: showall 1
+	bool IsFrozen() const;
+	void CheckAutoRewindForward(); // KRX: krx_tasautorewind / autoforward / autopause
+	void DoRewindTicks(int Ticks);
+	void DoForwardTicks(int Ticks);
 
 	// Tick logic
 	void DoRecordTick();
@@ -112,6 +129,10 @@ private:
 	static void ConTasLoad(IConsole::IResult *pResult, void *pUserData);
 	static void ConTasIsolated(IConsole::IResult *pResult, void *pUserData);
 	static void ConTasTurbo(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasTicks(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasValidate(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasRemoveUseless(IConsole::IResult *pResult, void *pUserData);
+	static void ConTasShowAll(IConsole::IResult *pResult, void *pUserData);
 
 public:
 	int Sizeof() const override { return sizeof(*this); }
@@ -123,6 +144,7 @@ public:
 	void OnRender() override;
 	bool OnInput(const IInput::CEvent &Event) override;
 	void OnStateChange(int NewState, int OldState) override;
+	void OnMapLoad() override;
 	void OnNewSnapshot() override;
 
 	// API for other components
@@ -158,6 +180,12 @@ public:
 	const char *GetSelectedFile() const { return m_aSelectedFile; }
 	vec2 GetGhostPos() const { return m_GhostPos; }
 	bool IsGhostVisible() const { return m_ShowGhost; }
+
+	// KRX Tools
+	bool ValidateReplay(char *pOut, int OutSize); // Tick-by-tick position check
+	int RemoveUselessInputs(); // Remove hook/jump not needed + aim optimize
+	void GetReplayTime(char *pBuf, int Size);
+	void EnsureShowAllOnJoin(); // auto add cl_run_on_join showall 1
 
 	// UI helpers
 	void RenderTasHud();
