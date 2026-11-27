@@ -688,7 +688,7 @@ void CTas::DoTasMenu(CUIRect MainView)
 	Left.HSplitTop(4.0f, nullptr, &Left);
 	Left.HSplitTop(22.0f, &Row, &Left);
 	Row.VSplitMid(&ButtonRect, &SliderRect, 5.0f);
-	static CButtonContainer s_ForwardBtn, s_ClearBtn;
+	static CButtonContainer s_ForwardBtn;
 	if(GameClient()->m_Menus.DoButton_Menu(&s_ForwardBtn, m_State == TAS_STATE_FORWARD ? "Stop Forward" : "Forward (Hold)", 0, &ButtonRect))
 	{
 		if(m_State == TAS_STATE_FORWARD) StopForward();
