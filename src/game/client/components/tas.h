@@ -184,6 +184,8 @@ public:
 	const char *GetSelectedFile() const { return m_aSelectedFile; }
 	vec2 GetGhostPos() const { return m_GhostPos; }
 	bool IsGhostVisible() const { return m_ShowGhost; }
+	int GetCurrentFrame() const { return m_CurrentFrame; }
+	const std::vector<CTasFrame> &GetFrames() const { return m_vFrames; }
 
 	// KRX Tools
 	bool ValidateReplay(char *pOut, int OutSize); // Tick-by-tick position check

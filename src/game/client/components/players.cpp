@@ -1063,17 +1063,25 @@ void CPlayers::OnRender()
 		RenderPlayer(ScreenRect, &GameClient()->m_aClients[ClientId].m_RenderPrev, &GameClient()->m_aClients[ClientId].m_RenderCur, &aRenderInfo[ClientId], ClientId);
 	}
 
-	// TAS ghost tee: visible only for me at start position (req #5)
+	// TAS ghost tee: visible only for me at start position (req #5) + trail
 	if(GameClient()->m_Tas.IsGhostVisible())
 	{
 		vec2 GhostPos = GameClient()->m_Tas.GetGhostPos();
-		// Render translucent ghost tee at start pos
 		CTeeRenderInfo GhostRenderInfo = aRenderInfo[LocalClientId >= 0 ? LocalClientId : 0];
-		// Make ghost translucent: we render with alpha via RenderTools if available, else simple
-		// Use RenderTee with alpha 0.5
 		if(ScreenRect.Inside(GhostPos))
 		{
-			RenderTools()->RenderTee(CAnimState::GetIdle(), &GhostRenderInfo, EMOTE_NORMAL, vec2(1, 0), GhostPos, 0.4f);
+			RenderTools()->RenderTee(CAnimState::GetIdle(), &GhostRenderInfo, EMOTE_NORMAL, vec2(1, 0), GhostPos, 0.45f);
+		}
+		// Trail: last 20 frames as faded ghosts (optimization: skip if >30 frames away)
+		const auto &Frames = GameClient()->m_Tas.GetFrames();
+		int Start = std::max(0, (int)Frames.size() - 20);
+		for(int i = Start; i < (int)Frames.size(); ++i)
+		{
+			if(i == GameClient()->m_Tas.GetCurrentFrame()) continue;
+			vec2 Pos = Frames[i].m_Pos;
+			if(!ScreenRect.Inside(Pos)) continue;
+			float Alpha = 0.08f + 0.12f * (float)(i - Start) / 20.0f;
+			RenderTools()->RenderTee(CAnimState::GetIdle(), &GhostRenderInfo, EMOTE_BLINK, vec2(1, 0), Pos, Alpha);
 		}
 	}
 	if(RenderLastId != -1 && IsPlayerInfoAvailable(RenderLastId))
