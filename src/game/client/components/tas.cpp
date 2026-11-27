@@ -65,18 +65,18 @@ void CTas::OnConsoleInit()
 	Console()->Register("krx_taspause", "", CFGFLAG_CLIENT, ConTasPause, this, "KRX alias: pause");
 	Console()->Register("krx_tasrewind", "i[on]", CFGFLAG_CLIENT, ConTasRewind, this, "KRX alias: rewind hold");
 	Console()->Register("krx_tasforward", "i[on]", CFGFLAG_CLIENT, ConTasForward, this, "KRX alias: forward hold");
-	Console()->Register("krx_tasrespawn", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ CTas *pSelf=(CTas*)pUserData; pSelf->ClearReplay(); }, this, "KRX alias: clear replay");
-	Console()->Register("krx_tastps", "i[tps]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasRecordSpeed = std::clamp(pResult->GetInteger(0),1,50); }, this, "KRX alias krx_tastps -> cl_tas_record_speed");
+	Console()->Register("krx_tasrespawn", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pResult; CTas *pSelf=(CTas*)pUserData; pSelf->ClearReplay(); }, this, "KRX alias: clear replay");
+	Console()->Register("krx_tastps", "i[tps]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pUserData; g_Config.m_ClTasRecordSpeed = std::clamp(pResult->GetInteger(0),1,50); }, this, "KRX alias krx_tastps -> cl_tas_record_speed");
 	Console()->Register("krx_tastickcontrolticks", "i[ticks]", CFGFLAG_CLIENT, ConTasTicks, this, "KRX alias");
-	Console()->Register("krx_tickcontrolstep", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasStep = pResult->GetInteger(0)?1:0; }, this, "KRX alias step");
-	Console()->Register("krx_tasautorewind", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoRewind = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
-	Console()->Register("krx_tasautoforward", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoForward = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
-	Console()->Register("krx_tickcontrolpause", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ g_Config.m_ClTasAutoPause = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+	Console()->Register("krx_tickcontrolstep", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pUserData; g_Config.m_ClTasStep = pResult->GetInteger(0)?1:0; }, this, "KRX alias step");
+	Console()->Register("krx_tasautorewind", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pUserData; g_Config.m_ClTasAutoRewind = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+	Console()->Register("krx_tasautoforward", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pUserData; g_Config.m_ClTasAutoForward = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
+	Console()->Register("krx_tickcontrolpause", "i[on]", CFGFLAG_CLIENT, [](IConsole::IResult *pResult, void *pUserData){ (void)pUserData; g_Config.m_ClTasAutoPause = pResult->GetInteger(0)?1:0; }, this, "KRX alias");
 
 
 	// Bindable turbo: users can bind any key to +tas_turbo
 	Console()->Chain("cl_tas_record_speed", [](IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData) {
-		pfnCallback(pResult, pCallbackUserData);
+		(void)pUserData; pfnCallback(pResult, pCallbackUserData);
 	},
 		nullptr);
 }
@@ -98,6 +98,7 @@ void CTas::OnReset()
 
 void CTas::OnStateChange(int NewState, int OldState)
 {
+	(void)OldState;
 	if(NewState == IClient::STATE_ONLINE)
 	{
 		EnsureTasFolder();
@@ -160,6 +161,7 @@ void CTas::OnRender()
 
 bool CTas::OnInput(const IInput::CEvent &Event)
 {
+	(void)Event;
 	if(Event.m_Flags & IInput::FLAG_PRESS)
 	{
 		// Check if turbo bind is pressed - we allow user to configure via cl_tas_bind_turbo
@@ -201,6 +203,7 @@ void CTas::RefreshFileList()
 {
 	m_vTasFiles.clear();
 	Storage()->ListDirectory(IStorage::TYPE_SAVE, TAS_FOLDER, [](const char *pFilename, int IsDir, int StorageType, void *pUser) {
+		(void)StorageType;
 		CTas *pSelf = (CTas *)pUser;
 		if(!IsDir)
 		{
@@ -620,7 +623,7 @@ void CTas::DoTasMenu(CUIRect MainView)
 	};
 
 	// LEFT COLUMN
-	CUIRect Panel, Header, Body, Row, ButtonRect, SliderRect;
+	CUIRect Panel, Header, Body, ButtonRect, SliderRect;
 
 	// --- Main ---
 	Left.HSplitTop(108.0f, &Panel, &Left);
@@ -1308,18 +1311,21 @@ void CTas::ClearReplay()
 
 void CTas::ConTasRecord(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	pSelf->StartRecord();
 }
 
 void CTas::ConTasPlay(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	pSelf->StartPlayback();
 }
 
 void CTas::ConTasPause(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	if(pSelf->m_Paused) pSelf->ResumeRecord();
 	else pSelf->PauseRecord();
@@ -1327,6 +1333,7 @@ void CTas::ConTasPause(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasStop(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	if(pSelf->m_State == TAS_STATE_PLAYBACK) pSelf->StopPlayback();
 	else pSelf->StopRecord();
@@ -1334,6 +1341,7 @@ void CTas::ConTasStop(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasRewind(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	if(pSelf->m_State == TAS_STATE_REWIND) pSelf->StopRewind();
 	else pSelf->StartRewind();
@@ -1341,6 +1349,7 @@ void CTas::ConTasRewind(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasForward(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	if(pSelf->m_State == TAS_STATE_FORWARD) pSelf->StopForward();
 	else pSelf->StartForward();
@@ -1398,6 +1407,7 @@ void CTas::ConTasTicks(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasValidate(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	char aBuf[256];
 	pSelf->ValidateReplay(aBuf, sizeof(aBuf));
@@ -1406,6 +1416,7 @@ void CTas::ConTasValidate(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasRemoveUseless(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	int Removed = pSelf->RemoveUselessInputs();
 	char aBuf[128];
@@ -1415,6 +1426,7 @@ void CTas::ConTasRemoveUseless(IConsole::IResult *pResult, void *pUserData)
 
 void CTas::ConTasShowAll(IConsole::IResult *pResult, void *pUserData)
 {
+	(void)pResult;
 	CTas *pSelf = (CTas *)pUserData;
 	pSelf->EnsureShowAll();
 	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "tas", "showall 1 ensured");
