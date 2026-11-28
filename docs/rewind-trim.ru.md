@@ -162,7 +162,10 @@ void interaction_trim_recording_snippet(timeline_state_t *ts, bool only_controll
 ## 7. Патч
 
 Готовая заплатка для чистого апстрима лежит в
-`patches/0001-timeline-rewind-cuts-recording.patch`:
+`patches/0001-timeline-rewind-cuts-recording.patch`. Сделана по master `8afb79c`
+(20.11.2026); на последнем релизе `v0.7.5-alpha` (`b19b5c2`) файл
+`timeline_interaction.c` идентичен, поэтому патч ложится и туда — проверено
+`git apply --check`:
 
 ```bash
 git apply patches/0001-timeline-rewind-cuts-recording.patch   # или git am < ...
