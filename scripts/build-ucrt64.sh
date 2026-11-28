@@ -8,7 +8,8 @@
 #   SRC=/c/dev/frametee      каталог с исходниками (по умолчанию — каталог, откуда запущен скрипт)
 #   REPO=<url>               откуда клонировать, если исходников ещё нет
 #   BUILD=$SRC/build         каталог сборки
-#   PATCH=/path/to/x.patch   применить патч (по умолчанию — все *.patch из $SRC/patches, если есть)
+#   PATCH=/path/to/x.patch   применить только этот патч
+#   NO_PATCH=1               не применять патчи вовсе (чистая сборка апстрима)
 #   DEPS=0                   не ставить пакеты pacman'ом
 #   TMUF=OFF                 не собирать модуль TrackMania
 #   FFMPEG=0                 не требовать FFmpeg (MP4-экспорт отключится)
@@ -97,7 +98,9 @@ fi
 
 step "3/6 патчи"
 PATCHES=()
-if [ -n "${PATCH:-}" ]; then
+if [ "${NO_PATCH:-0}" = "1" ]; then
+  :
+elif [ -n "${PATCH:-}" ]; then
   PATCHES=("$(winpath "$PATCH")")
 else
   # Патчи берём и из дерева исходников, и из этого репозитория: так скрипт
