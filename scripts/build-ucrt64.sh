@@ -161,5 +161,7 @@ else
 fi
 
 printf '\n[готово] %s\n' "$EXE"
-printf 'Запуск из этого терминала:  "%s" --list-games\n' "$EXE"
+printf 'Запуск — из каталога сборки: движок открывает data/shaders/*.spv относительно cwd,\n'
+printf 'иначе в логе будут ошибки "Failed to open file: data/shaders/...":\n'
+printf '  cd "%s" && ./frametee.exe\n' "$BUILD"
 printf 'Из Проводника нужен C:\\msys64\\ucrt64\\bin в PATH, либо сборка с INSTALL=1.\n'

@@ -219,9 +219,17 @@ build/data/...
 находятся `vulkan-1.dll`, `libcurl`, `freetype`, FFmpeg):
 
 ```bash
-cd /c/dev/frametee
-./build/frametee.exe
+cd /c/dev/frametee/build
+./frametee.exe
 ```
+
+> **Важно: запускать из каталога сборки.** Шейдеры открываются по относительному
+> пути `data/shaders/*.spv` (`renderer.c`), то есть относительно текущего каталога,
+> а играм и плагинам запасного поиска рядом с exe нет. Если запустить
+> `./build/frametee.exe` из корня дерева, редактор стартует, но засыплет лог
+> `[ERROR] [Renderer] Failed to open file: data/shaders/atlas.vert.spv` и ничего
+> не нарисует, а плагины отрапортуют
+> `'plugins\<имя>' holds no library named after it; skipping it`.
 
 Из Проводника / двойным щелчком `frametee.exe` в `build/` — Windows не знает,
 где DLL из UCRT64, поэтому либо добавьте `C:\msys64\ucrt64\bin` в `PATH`, либо
