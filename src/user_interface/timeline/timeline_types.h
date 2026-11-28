@@ -302,6 +302,7 @@ struct timeline_state {
   bool recording;
   int recording_start_tick; // where the playhead was when the recording started, for discarding it
   bool is_reversing;
+  bool resume_after_rewind; // playback went on after the rewind key is let go, it was playing before it
   bool linked_copy_input;
 
   // Data Model

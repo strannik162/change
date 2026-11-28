@@ -278,8 +278,15 @@ void interaction_handle_playback_and_shortcuts(timeline_state_t *ts) {
   bool reverse_down =
       keybinds_is_action_down(&ts->ui->keybinds, ACTION_REWIND_HOLD) || keybinds_is_action_pressed(&ts->ui->keybinds, ACTION_REWIND_HOLD, false);
 
-  if (reverse_down && !ts->is_reversing) ts->last_update_time = igGetTime();
-  if (!reverse_down && ts->is_reversing) ts->last_update_time = igGetTime();
+  if (reverse_down && !ts->is_reversing) {
+    ts->last_update_time = igGetTime();
+    // Rewinding is no pause: whatever was playing plays on once the key is let go.
+    ts->resume_after_rewind = ts->is_playing;
+  } else if (!reverse_down && ts->is_reversing) {
+    ts->last_update_time = igGetTime();
+    if (ts->resume_after_rewind) ts->is_playing = true;
+    ts->resume_after_rewind = false;
+  }
 
   ts->is_reversing = reverse_down;
   if (ts->is_reversing) ts->is_playing = false;
