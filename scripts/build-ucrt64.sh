@@ -20,6 +20,9 @@ die() { printf '\n[ошибка] %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
+# Каталог этого репозитория (в нём лежат scripts/ и patches/):
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Windows-путь (C:\dev\frametee) → MSYS-путь (/c/dev/frametee)
 winpath() { case "$1" in [A-Za-z]:[\\/]*) cygpath -u "$1" ;; *) printf '%s' "$1" ;; esac; }
 
@@ -66,7 +69,11 @@ step "2/6 исходники"
 GIT_URL_FIX=(-c url."https://github.com/".insteadOf="git@github.com:")
 if [ -f "$SRC/CMakeLists.txt" ]; then
   note "дерево уже есть: $SRC"
-  if [ -d "$SRC/.git" ] && git -C "$SRC" submodule status --recursive 2>/dev/null | grep -q '^-'; then
+  SUBMODULES=""
+  [ -d "$SRC/.git" ] && SUBMODULES="$(git -C "$SRC" submodule status --recursive 2>/dev/null || true)"
+  if [ -z "$SUBMODULES" ]; then
+    note "в дереве нет зарегистрированных сабмодулей"
+  elif printf '%s\n' "$SUBMODULES" | grep -q '^-'; then
     note "подтягиваю сабмодули (git@github.com → https)…"
     git "${GIT_URL_FIX[@]}" -C "$SRC" submodule update --init --recursive ||
       die "сабмодули не скачались. Попробуй ещё раз, либо:
@@ -80,17 +87,31 @@ else
   git "${GIT_URL_FIX[@]}" clone --recursive "$REPO" "$SRC" ||
     die "клон не удался (нет сети/доступа к github.com?)"
 fi
-[ -f "$SRC/libs/cimgui/cimgui.h" ] || die "нет сабмодулей ($SRC/libs/cimgui пуст/отсутствует).
-    Склонируй апстрим целиком:  git -c url.\"https://github.com/\".insteadOf=\"git@github.com:\" clone --recursive $REPO \"$SRC\"
-    (или в существующем клоне: git -c url.\"https://github.com/\".insteadOf=\"git@github.com:\" -C \"$SRC\" submodule update --init --recursive)"
+[ -f "$SRC/libs/cimgui/cimgui.h" ] || die "нет сабмодулей: $SRC/libs/cimgui пуст или отсутствует.
+    Так выглядит зеркало без сабмодулей — собирай полный клон в стороне:
+      git -c url.\"https://github.com/\".insteadOf=\"git@github.com:\" clone --recursive $REPO /c/dev/frametee
+      SRC=/c/dev/frametee ./scripts/build-ucrt64.sh
+    (патчи из patches/ этого репозитория подхватятся сами)
+    Если дерево своё и просто без сабмодулей:
+      git -c url.\"https://github.com/\".insteadOf=\"git@github.com:\" -C \"$SRC\" submodule update --init --recursive"
 
 step "3/6 патчи"
+PATCHES=()
 if [ -n "${PATCH:-}" ]; then
   PATCHES=("$(winpath "$PATCH")")
-elif compgen -G "$SRC/patches/*.patch" >/dev/null; then
-  PATCHES=("$SRC"/patches/*.patch)
 else
-  PATCHES=()
+  # Патчи берём и из дерева исходников, и из этого репозитория: так скрипт
+  # работает, когда рядом с ним лежит зеркало, а сборка идёт в отдельном клоне.
+  shopt -s nullglob
+  for cand in "$SRC"/patches/*.patch "$SCRIPT_ROOT"/patches/*.patch; do
+    [ -f "$cand" ] || continue
+    skip=0
+    for have in ${PATCHES+"${PATCHES[@]}"}; do
+      [ "$(basename "$have")" = "$(basename "$cand")" ] && skip=1 && break
+    done
+    [ "$skip" = 1 ] || PATCHES+=("$cand")
+  done
+  shopt -u nullglob
 fi
 if [ ${#PATCHES[@]} -eq 0 ]; then
   note "патчей нет — собираю как есть"
