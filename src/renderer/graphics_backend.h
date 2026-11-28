@@ -1,0 +1,200 @@
+#ifndef GRAPHICS_H
+#define GRAPHICS_H
+#include "renderer.h"
+#include <engine/game_host.h>
+#include <types.h>
+#include <user_interface/user_interface.h>
+#include <vulkan/vulkan_core.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+
+// These have to be in this order
+#include <system/include_cimgui.h>
+// -------------
+// we are doing this so we dont get redefinition of structs errors. they are illegal in C99
+#define GLFWwindow INVALID_TYPE_DONT_EVER_USE_WINDOW
+#define GLFWmonitor INVALID_TYPE_DONT_EVER_USE_MONITOR
+#include <cimgui_impl.h>
+#undef GLFWwindow
+#undef GLFWmonitor
+
+static inline void destroy_imgui_texture_ref(struct ImTextureRef_c **tex_ref_ptr) {
+  if (tex_ref_ptr && *tex_ref_ptr) {
+    ImTextureID tex_id = ImTextureRef_GetTexID(*tex_ref_ptr);
+    if (tex_id) {
+      ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)tex_id);
+    }
+    ImTextureRef_destroy(*tex_ref_ptr);
+    *tex_ref_ptr = NULL;
+  }
+}
+
+#define GLFW_INCLUDE_NONE
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+
+enum { FRAME_OK = 0,
+       FRAME_SKIP,
+       FRAME_EXIT };
+
+// public api
+// `name` is what the level is called; NULL or empty leaves it unnamed.
+void on_level_load_memory(gfx_handler_t *handler, const unsigned char *level_buffer, size_t size, const char *name);
+// Swaps the project's level for another one while keeping its timeline: every group is rebuilt on
+// the new level with the tracks and snippets it had. `name` becomes the level's name.
+bool gfx_replace_level(gfx_handler_t *handler, const unsigned char *level_buffer, size_t size, const char *name);
+void on_level_load_path(gfx_handler_t *handler, const char *level_path);
+// Starts a clean project under another game. All objects owned by the old
+// module are destroyed before it is deactivated.
+bool gfx_activate_game(gfx_handler_t *handler, int game_index);
+int init_gfx_handler(gfx_handler_t *handler);
+int gfx_begin_frame(gfx_handler_t *handler);
+bool gfx_end_frame(gfx_handler_t *handler);
+void gfx_cleanup(gfx_handler_t *handler);
+void gfx_toggle_fullscreen(gfx_handler_t *handler);
+// The interface's scale: the automatic one, worked out from the monitor, times the size the user
+// chose (1 for as worked out).
+float gfx_get_ui_scale(void);
+float gfx_get_auto_ui_scale(void);
+#define GFX_UI_SIZE_MIN 0.5f
+#define GFX_UI_SIZE_MAX 3.0f
+float gfx_get_ui_size(void);
+// The style and text follow once the user interface rebuilds them.
+void gfx_set_ui_size(float size);
+void gfx_retire_imgui_texture(gfx_handler_t *handler, uint64_t texture_id);
+
+// Render one game frame at an output resolution independent of the editor
+// viewport. The callback records the same game passes used by the preview.
+// `pixels` receives tightly packed 8-bit RGBA bytes, or BGRA when
+// gfx_export_is_bgra(), and must hold width*height*4.
+bool gfx_render_export_frame(gfx_handler_t *handler, uint32_t width, uint32_t height,
+                             void (*draw)(gfx_handler_t *, float), float alpha, uint8_t *pixels);
+bool gfx_export_is_bgra(const gfx_handler_t *handler);
+
+struct gfx_handler_t {
+  // Backend Stuffs
+  GLFWwindow *window;
+  VkAllocationCallbacks *g_allocator;
+  VkInstance g_instance;
+  VkPhysicalDevice g_physical_device;
+  VkDevice g_device;
+  uint32_t g_queue_family;
+  VkQueue g_queue;
+  VkDebugReportCallbackEXT g_debug_report;
+  VkDebugUtilsMessengerEXT g_debug_messenger;
+  VkPipelineCache g_pipeline_cache;
+  VkDescriptorPool g_descriptor_pool; // For ImGui
+  struct ImGui_ImplVulkanH_Window g_main_window_data;
+  uint32_t g_min_image_count;
+  bool g_swap_chain_rebuild;
+  // The viewport is the whole frame and ImGui draws nothing (a benchmark): the
+  // game draws straight into the window's image, or, where the two differ in
+  // size, the viewport is copied there. Takes effect with the next swapchain,
+  // which then also takes transfers.
+  bool present_viewport_only;
+  // The viewport has to be left in the offscreen target even so, to be read
+  // back (--screenshot).
+  bool keep_viewport_offscreen;
+
+  // Per-frame data
+  VkCommandBuffer current_frame_command_buffer;
+
+  // App Stuffs
+  ui_handler_t user_interface;
+  renderer_state_t renderer;
+  // The active game. Everything game-specific (physics, level format, how a
+  // world looks) lives behind this and never in the engine.
+  game_host_t game_host;
+  // The level the project is built on, owned by the game module. NULL until one
+  // is opened.
+  ft_level *level;
+
+  // Extent of the playfield in world units, taken from the active game's level.
+  // The renderer normalizes every world coordinate by this, which is the only
+  // thing it needs to know about a level, so nothing in the render path has to
+  // understand any particular game's level format.
+  float world_width;
+  float world_height;
+
+  vec2 viewport; // width,height
+
+  // The unit quad every instanced technique is laid over.
+  mesh_t *quad_mesh;
+
+  // Retirement is keyed by a monotonic serial, not the swapchain image index
+  // (which wraps between 0 and ImageCount - 1).
+  uint64_t frame_serial;
+  // The frame in flight being recorded (renderer.h, MAX_FRAMES_IN_FLIGHT), and
+  // for each, the fence and serial of the last frame submitted from it: its
+  // buffers are free again once that fence is.
+  uint32_t frame_slot;
+  VkFence slot_fences[MAX_FRAMES_IN_FLIGHT];
+  uint64_t slot_serials[MAX_FRAMES_IN_FLIGHT];
+  struct {
+    VkImage image;
+    VkImageView image_view;
+    VkSampler sampler;
+    VkDeviceMemory memory;
+    uint64_t frame_serial;
+  } retire_textures[256];
+  uint32_t retire_count;
+  struct {
+    VkDescriptorSet descriptor_set;
+    uint64_t frame_serial;
+  } retire_imgui_textures[256];
+  uint32_t retire_imgui_count;
+
+  // Offscreen rendering (for ImGui game view)
+  VkImage offscreen_image;
+  VkDeviceMemory offscreen_memory;
+  VkImageView offscreen_image_view;
+  VkSampler offscreen_sampler;
+  VkFramebuffer offscreen_framebuffer;
+  VkRenderPass offscreen_render_pass;
+  // ImGui texture id returned by ImGui_ImplVulkan_AddTexture
+  ImTextureRef *offscreen_texture;
+  // Depth for the offscreen pass. A 2D game never touches it (its draws are
+  // ordered by the z the game supplies) but a 3D game's geometry has to be
+  // resolved by depth, so the attachment always exists and 2D pipelines simply
+  // leave the test off.
+  VkImage offscreen_depth_image;
+  VkDeviceMemory offscreen_depth_memory;
+  VkImageView offscreen_depth_view;
+  VkFormat offscreen_depth_format;
+  uint32_t offscreen_width;
+  uint32_t offscreen_height;
+  bool offscreen_initialized;
+  // A pass has given the depth its layout since it was made, so a pass may keep it.
+  bool offscreen_depth_written;
+
+  // The passes a frame's game drawing goes into, all compatible with
+  // offscreen_render_pass (the pipelines are built for that one), indexed
+  // [into the window's image][keep the depth]: the window's image for a frame
+  // that is nothing but the viewport, and the depth kept as it is rather than
+  // cleared for a 2D game, which never tests it. [0][0] is offscreen_render_pass.
+  VkRenderPass game_passes[2][2];
+  // The window's images as targets of those passes, with the offscreen depth.
+  VkFramebuffer window_framebuffers[8];
+  uint32_t window_framebuffer_count;
+  // This frame draws straight into the window's image.
+  bool frame_into_window;
+
+  // Dedicated video target; its extent never follows the editor viewport.
+  VkImage export_image;
+  VkDeviceMemory export_memory;
+  VkImageView export_view;
+  VkImage export_depth_image;
+  VkDeviceMemory export_depth_memory;
+  VkImageView export_depth_view;
+  VkFramebuffer export_framebuffer;
+  VkBuffer export_readback;
+  VkDeviceMemory export_readback_memory;
+  void *export_readback_mapped;
+  bool export_readback_coherent;
+  VkCommandPool export_command_pool;
+  VkCommandBuffer export_command_buffer;
+  uint32_t export_width, export_height;
+};
+
+#endif // GRAPHICS_H

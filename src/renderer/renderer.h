@@ -1,0 +1,723 @@
+#ifndef RENDERER_H
+#define RENDERER_H
+
+#define CGLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <cglm/cglm.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <types.h>
+#include <frametee/game_abi.h>
+#include <vulkan/vulkan_core.h>
+
+#define MAX_SHADERS 16
+// Runtime textures include game-owned thumbnail atlas pages. Handles are
+// stable and never evicted, so leave ample room beside texture-heavy levels.
+#define MAX_TEXTURES 512
+#define MAX_MESHES 64
+#define MAX_TEXTURES_PER_DRAW 8
+#define MAX_UBOS_PER_DRAW 2
+// Where the primitive buffers start, not how far they go: a frame that asks for
+// more room than it has gets a larger allocation, and the one it outgrew is
+// retired until the frames still reading it are done. Nothing here is a ceiling
+// on how much a game or a plugin may draw. See ensure_primitive_space.
+//
+// Sized so that ordinary frames never grow at all, since growing costs an
+// allocation and a copy in the frame that does it.
+#define INITIAL_PRIMITIVE_VERTICES 100000
+#define INITIAL_PRIMITIVE_INDICES 200000
+// A 3D game submits its world one triangle at a time and there is no retained
+// mesh path for it, so a whole track's worth of geometry comes through here
+// every frame. The buffer costs twenty-eight bytes a vertex, and this much of
+// it up front saves several doublings on the first frame of a real track.
+#define INITIAL_PRIMITIVE3D_VERTICES 1200000
+// Where the z-sorted command queue starts. Like the primitive buffers it is not
+// a ceiling: the queue grows with what a frame submits. See queue_reserve_one.
+#define INITIAL_RENDER_COMMANDS 65536
+#define MAX_ATLAS_INSTANCES 1000000
+// Resources a game module may create at runtime, on top of the engine's own.
+#define MAX_CUSTOM_VERTEX_ATTRS 24
+#define MAX_CUSTOM_PIPELINES 16
+#define MAX_DYNAMIC_ATLASES 32
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <malloc.h>
+#define VLA(T, name, n) T *name = (T *)_malloca(sizeof(T) * (n))
+#define VLA_FREE(name) _freea(name)
+#else
+#define VLA(T, name, n) T name[(n)]
+#define VLA_FREE(name) (void)0
+#endif
+
+struct buffer_t {
+  VkBuffer buffer;
+  VkDeviceMemory memory;
+  VkDeviceSize size;
+  void *mapped_memory;
+};
+
+// An allocation a primitive path has outgrown. Freeing one at the moment of the
+// swap would pull it out from under command buffers already recorded against
+// it, so it waits here until the frame that outgrew it has completed.
+struct retired_buffer_t {
+  buffer_t buffer;
+  uint64_t serial; // gfx_handler_t.frame_serial of that frame
+};
+
+// How many frames may be in flight at once: while the GPU draws one, the CPU
+// records the next. Whatever a frame writes for the GPU to read (uniforms,
+// primitives, instances) exists once per frame in flight, so the frame being
+// recorded never writes what the one being drawn reads.
+#define MAX_FRAMES_IN_FLIGHT 2
+
+// One frame in flight's uniforms and primitive streams (see renderer_state_t).
+typedef struct frame_buffers_t {
+  buffer_t ubo;
+  void *ubo_ptr;
+  buffer_t vertices, indices;
+  primitive_vertex_t *vertex_ptr;
+  uint32_t *index_ptr;
+  uint32_t vertex_capacity, index_capacity;
+  buffer_t vertices3d;
+  primitive3d_vertex_t *vertex3d_ptr;
+  uint32_t vertex3d_capacity;
+} frame_buffers_t;
+
+struct texture_t {
+  uint32_t id;
+  bool active;
+  VkImage image;
+  VkDeviceMemory memory;
+  VkImageView image_view;
+  VkSampler sampler;
+  uint32_t width;
+  uint32_t height;
+  uint32_t mip_levels;
+  uint32_t layer_count;
+  VkFormat format;
+  char path[256];
+  uint32_t last_used_frame;
+  // Built on first draw_texture and reused after, so drawing a live image does
+  // not rebuild its sampling setup every frame.
+  struct atlas_renderer_t *alias_atlas;
+  // Set when a game module renders into this image with its own renderer. The
+  // engine then stops owning the contents: it parks the image in
+  // VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL for the module to draw into and
+  // transitions it for sampling around its own pass, every frame.
+  bool external;
+};
+
+struct mesh_t {
+  uint32_t id;
+  bool active;
+  buffer_t vertex_buffer;
+  buffer_t index_buffer;
+  uint32_t vertex_count;
+  uint32_t index_count;
+};
+
+// Vertex input a shader expects. Built-in shaders leave this empty and are
+// matched to one of the renderer's fixed layouts by identity; shaders created
+// by a game module carry their own, which is what lets a game add a render
+// technique the engine has never heard of.
+struct vertex_layout_t {
+  VkVertexInputBindingDescription bindings[2];
+  uint32_t binding_count;
+  VkVertexInputAttributeDescription attrs[MAX_CUSTOM_VERTEX_ATTRS];
+  uint32_t attr_count;
+  bool alpha_blend;
+  bool straight_alpha; /* see ft_pipeline_desc */
+  bool depth_test;     /* a 3D mesh pipeline: depth-tested against the world pass */
+};
+
+struct shader_t {
+  uint32_t id;
+  bool active;
+  VkShaderModule vert_shader_module;
+  VkShaderModule frag_shader_module;
+  char vert_path[256];
+  char frag_path[256];
+  // NULL for the built-in shaders.
+  vertex_layout_t *layout;
+};
+
+// An instanced draw technique owned by a game module: its own shader pair plus
+// a ring of instance data. Instances are laid over the engine's unit quad, so a
+// module supplies attribute locations 1 and up while location 0 stays the quad
+// corner the engine provides.
+struct custom_pipeline_t {
+  bool active;
+  shader_t *shader;
+  vertex_layout_t layout;
+  uint32_t instance_stride;
+  uint32_t max_instances;
+  uint32_t texture_count;
+  // Room for max_instances per frame in flight; instance_ptr is the current
+  // frame's, starting at instance instance_first of the buffer.
+  buffer_t instance_buffer;
+  uint8_t *instance_mapped;
+  uint8_t *instance_ptr;
+  uint32_t instance_first;
+  uint32_t instance_count;
+};
+
+typedef struct renderer_texture_layer_update_t {
+  texture_t *texture;
+  uint32_t layer;
+  const void *pixels;
+  uint32_t width;
+  uint32_t height;
+} renderer_texture_layer_update_t;
+
+struct vertex_t {
+  vec2 pos;
+  vec3 color;
+  vec2 tex_coord;
+};
+
+struct primitive_vertex_t {
+  vec2 pos;
+  vec4 color;
+};
+
+// The same thing in a volume. Kept separate from primitive_vertex_t so a 2D
+// game pays nothing for the third component.
+//
+// `layer` selects a page of the bound texture array, and is negative on a
+// triangle that has no texture. Textured and untextured 3D geometry therefore
+// share one vertex stream and one draw, which is what lets a game draw an
+// untextured marker over a textured world and have the depth buffer resolve the
+// two against each other.
+struct primitive3d_vertex_t {
+  vec3 pos;
+  vec4 color;
+  vec2 uv;
+  float layer;
+};
+
+struct primitive_ubo_t {
+  vec2 camPos; // normalized [0..1] camera center
+  float zoom;
+  float aspect;
+  float maxMapSize;
+  float _pad[3];
+  mat4 proj;
+  vec2 mapSize; // width, height
+  float lod_bias;
+  float _pad2;
+  // View-projection for the 3D primitive path. Identity for a 2D game, which
+  // never binds a shader that reads it.
+  mat4 view_proj;
+};
+
+// A point of a stroke (renderer_submit_stroke). Its colour is the colour of the
+// segment from it to the next point.
+typedef struct stroke_point_t {
+  vec2 pos;
+  vec4 color;
+} stroke_point_t;
+
+struct map_buffer_object_t {
+  vec3 transform; // x, y, zoom
+  float aspect;
+  float lod_bias;
+};
+
+struct pipeline_cache_entry_t {
+  bool initialized;
+  VkPipeline pipeline;
+  VkPipelineLayout pipeline_layout;
+  VkDescriptorSetLayout descriptor_set_layout;
+  VkRenderPass render_pass;
+  uint32_t ubo_count;
+  uint32_t texture_count;
+};
+
+// What the 3D camera's zoom controls may reach, shared by the orbit's distance
+// and the plan view's extent so the same wheel behaves the same way in both.
+#define CAMERA3_MIN_EXTENT 1.f
+#define CAMERA3_MAX_EXTENT 100000.f
+// How far a perspective mode may pitch, stopping just short of the poles: at
+// exactly straight up or down the world-up the view is built from becomes
+// ambiguous and the image flips.
+#define CAMERA3_MAX_PITCH 1.5f
+// The far plane the perspective modes start from. A reversed depth buffer is at
+// its most exact where an ordinary one is worst, so a plane this distant costs
+// nothing, and it has to clear a sky: a sky is drawn on a dome tens of
+// kilometres across, and clipping it ends the world in the clear colour.
+#define CAMERA3_FAR_Z 200000.f
+// The shallowest slab the plan view will keep. A level small enough for the
+// span-derived depth to fall under this is small enough that a generous slab
+// costs nothing.
+#define CAMERA3_MIN_DEPTH 1000.f
+
+// How the viewport is pointed at a 3D world. Which of these is active is
+// derived from the game's camera mode list every frame, never toggled directly:
+// the mode the user picked is the single source of truth.
+typedef enum camera3_mode_t {
+  CAMERA3_ORBIT = 0, // circles a target the game supplies, or the engine's own
+  CAMERA3_FREECAM,   // flown by the user
+  CAMERA3_TOP_DOWN,  // locked orthographic plan view
+} camera3_mode_t;
+
+// The viewport camera for a game that declared FT_DIMENSIONS_3D.
+//
+// Each mode owns a complete description of itself and reads none of the others'
+// fields while it runs, so a plan view can never end up framed or clipped by
+// where a freecam happened to be left. The modes meet in exactly one place,
+// renderer_camera3_set_mode(), and only over where the user was looking, so
+// that the image does not jump. What decides how a mode is projected (its zoom,
+// its clipping, the height it looks from) is its own or the level's, never
+// something it picked up from the mode before it.
+struct camera3_t {
+  camera3_mode_t mode;
+
+  // Orbit: a point, and where the eye sits on the sphere around it. A
+  // game-driven mode writes all three every frame; a free one leaves them to
+  // the mouse.
+  vec3 orbit_target;
+  float orbit_yaw;
+  float orbit_pitch;
+  float orbit_distance;
+  bool directed_camera_valid;
+  ft_camera directed_camera;
+
+  // Freecam: an eye and where it looks, in the same angle convention as the
+  // orbit so the two agree at the moment of a switch.
+  vec3 free_eye;
+  float free_yaw;
+  float free_pitch;
+  // World units per second at full tilt, scaled from the level so the same
+  // controls suit an arena and a landscape.
+  float free_speed;
+
+  // Top-down: a plan view, looking straight down at an orthographic slab of
+  // world. `center` is the point under the middle of the viewport; panning
+  // moves it in X and Z only, and its height is the level's framing height, so
+  // the slab stays put no matter what the other modes are doing. `extent` is
+  // half the world height the viewport shows, which is what the wheel changes,
+  // and `depth` is how far above and below `center` the slab reaches: it is the
+  // near and far clipping of this mode, and it has to clear the level, because
+  // the engine is told how wide a level is but never how tall.
+  vec3 top_down_center;
+  float top_down_extent;
+  float top_down_depth;
+
+  // The lens the two perspective modes share. The plan view is orthographic and
+  // uses none of it: it derives its own extent and clipping from the fields
+  // above.
+  float fov_y;
+  float near_z;
+  float far_z;
+
+  // A right-drag that began over the viewport: turning the perspective modes,
+  // panning the plan view. Held so a drag that wanders off the viewport keeps
+  // working until the button comes up.
+  bool dragging;
+};
+
+struct camera_t {
+  vec2 pos;
+  vec2 drag_start_pos;
+  float zoom;
+  float zoom_wanted;
+  bool is_dragging;
+  // Index into the active game's camera mode list. Which modes exist, and where
+  // each one points, is the game's decision; the engine only owns panning,
+  // zooming and the projection.
+  uint32_t mode;
+};
+
+struct sprite_definition_t {
+  uint32_t x, y, w, h;
+};
+
+struct atlas_instance_t {
+  vec2 pos;         // World-space center position
+  vec2 size;        // World-space size (width, height)
+  float rotation;   // Rotation in radians
+  int sprite_index; // Sprite index in the texture array
+  vec2 uv_scale;    // Scaling factor (sprite size / layer size)
+  vec2 uv_offset;   // Offset (padding / layer size)
+  vec2 tiling;      // Texture repetition factor
+  vec4 color;       // Instance color
+};
+
+#define MAX_ATLAS_SPRITES 512
+struct atlas_renderer_t {
+  shader_t *shader;
+  texture_t *atlas_texture;
+  VkSampler sampler;
+  sprite_definition_t *sprite_definitions;
+  uint32_t sprite_count;
+  // As in custom_pipeline_t: max_instances per frame in flight.
+  buffer_t instance_buffer;
+  atlas_instance_t *instance_mapped;
+  atlas_instance_t *instance_ptr;
+  uint32_t instance_first;
+  uint32_t instance_count;
+  uint32_t max_instances;
+  uint32_t layer_width;  // Max width of a sprite, used for UV scaling
+  uint32_t layer_height; // Max height of a sprite, used for UV scaling
+  // Set when this atlas samples someone else's image instead of owning a copy
+  // of it. A normal atlas blits its sprites into a private array texture once,
+  // which is right for a sprite sheet and wrong for anything that changes every
+  // frame (a game module rendering its own frame, above all). An aliased atlas
+  // borrows the image, so it has no padding and must never free it.
+  bool aliased;
+};
+
+typedef enum {
+  RENDER_CMD_ATLAS_BATCH,
+  RENDER_CMD_RECT_FILLED,
+  RENDER_CMD_RECT_ROUNDED,
+  RENDER_CMD_CIRCLE_FILLED,
+  RENDER_CMD_TRIANGLE_FILLED,
+  RENDER_CMD_LINE,
+  RENDER_CMD_STROKE,
+  RENDER_CMD_POLYLINE,
+  RENDER_CMD_POLYGON,
+  RENDER_CMD_INSTANCES,
+  RENDER_CMD_MESH
+} render_cmd_type_t;
+
+// Uniform payload carried inline with a queued mesh draw: a mesh technique's
+// per-draw constants. Anything larger, up to MAX_MESH_UNIFORM_BYTES (a draw
+// carrying an entry per quad it covers), is copied to the frame's transient
+// memory instead.
+#define MAX_QUEUED_UNIFORM_BYTES 256
+#define MAX_MESH_UNIFORM_BYTES (16 * 1024)
+
+struct render_command_t {
+  render_cmd_type_t type;
+  float z; // Depth: lower is further back
+  // Submission index, used as the final sort key. Without it the queue sort leaves commands that
+  // compare equal (same z, type and atlas) in an arbitrary order that changes between frames, so
+  // overlapping sprites such as particles swap places at random.
+  uint32_t seq;
+  union {
+    struct {
+      atlas_renderer_t *ar;
+      const atlas_instance_t *instances;
+      uint32_t count;
+      bool screen_space;
+    } atlas_batch;
+    struct {
+      vec2 p1;
+      vec2 p2;
+      vec2 p3;
+      vec4 color;
+      float thickness;
+      uint32_t segments;
+    } prim;
+    // A stroke: its points are in transient memory.
+    struct {
+      stroke_point_t *points;
+      uint32_t count;
+      float width_px;
+      bool closed;
+    } stroke;
+    // A smooth polyline or convex polygon: its points are in transient memory.
+    struct {
+      vec2 *points;
+      uint32_t count;
+      vec4 color;
+      float thickness;
+      bool closed;
+    } path;
+    struct {
+      custom_pipeline_t *pipeline;
+      const void *instances;
+      uint32_t count;
+      texture_t *textures[MAX_TEXTURES_PER_DRAW];
+      uint32_t texture_count;
+    } instances;
+    struct {
+      custom_pipeline_t *pipeline;
+      mesh_t *mesh;
+      texture_t *textures[MAX_TEXTURES_PER_DRAW];
+      uint32_t texture_count;
+      uint8_t uniforms[MAX_QUEUED_UNIFORM_BYTES];
+      const uint8_t *large_uniforms; // in transient memory when larger than the above, else NULL
+      uint32_t uniform_size;
+      uint32_t first_index, index_count;
+      // Drawn only inside clip (normalized device coordinates x0, y0, x1, y1), as a scissor.
+      bool clipped;
+      float clip[4];
+    } mesh_draw;
+  } data;
+};
+
+struct render_queue_t {
+  render_command_t *commands;
+  render_command_t **sort_ptrs;
+  uint32_t count;
+  // How many it holds now. A frame that submits more gets a bigger array.
+  uint32_t capacity;
+};
+
+struct renderer_state_t {
+  shader_t shaders[MAX_SHADERS];
+  uint32_t shader_count;
+
+  texture_t textures[MAX_TEXTURES];
+  mesh_t meshes[MAX_MESHES];
+  uint32_t mesh_count;
+
+  // One entry per shader and render pass: the swapchain, the offscreen target,
+  // and the thumbnail preview pass.
+  pipeline_cache_entry_t pipeline_cache[MAX_SHADERS][3];
+
+  // A load/store pass for drawing RGBA preview tiles into thumbnail atlases.
+  VkRenderPass preview_render_pass;
+  VkFormat preview_render_format;
+
+  // One per frame in flight, reset when its frame begins.
+  VkDescriptorPool frame_descriptor_pools[MAX_FRAMES_IN_FLIGHT];
+  // The frame in flight being recorded (gfx_handler_t.frame_slot when it began).
+  uint32_t frame_slot;
+  // Each frame in flight's uniforms and primitive streams. The fields below that
+  // they mirror (dynamic_ubo_buffer, dynamic_vertex_buffer and the rest) are those
+  // of the frame being recorded: renderer_begin_frame swaps them.
+  frame_buffers_t frame_buffers[MAX_FRAMES_IN_FLIGHT];
+  // Textures a game renders into itself (renderer_mark_texture_external).
+  uint32_t external_texture_count;
+  VkCommandPool transfer_command_pool;
+
+  shader_t *primitive_shader;
+  // 3D primitives are not sorted: the depth buffer resolves them, so they need
+  // no index buffer and no queue, just a vertex stream flushed once per frame.
+  shader_t *primitive3d_shader;
+  buffer_t dynamic_vertex_buffer3d;
+  primitive3d_vertex_t *vertex3d_buffer_ptr;
+  uint32_t primitive3d_vertex_count;
+  // How much the allocation currently holds. Grows with what is drawn.
+  uint32_t primitive3d_vertex_capacity;
+  // The texture array the 3D path samples this frame. A game sets it once and
+  // then addresses pages of it per triangle. NULL means nothing textured was
+  // drawn, and the fallback below is bound so the descriptor is still complete.
+  texture_t *primitive3d_texture;
+  texture_t *primitive3d_fallback_texture;
+  // World surfaces repeat their texture across a face, which every other
+  // sampler in the engine deliberately does not, so the 3D path brings its own
+  // rather than depending on how a game happened to create its texture.
+  VkSampler primitive3d_sampler;
+
+  buffer_t dynamic_vertex_buffer;
+  buffer_t dynamic_index_buffer;
+  primitive_vertex_t *vertex_buffer_ptr;
+  uint32_t *index_buffer_ptr;
+  uint32_t primitive_vertex_count;
+  uint32_t primitive_index_count;
+  uint32_t primitive_index_offset_drawn;
+  // As above: what the pair holds now, not what it is allowed to hold.
+  uint32_t primitive_vertex_capacity;
+  uint32_t primitive_index_capacity;
+  VkCommandBuffer current_command_buffer;
+
+  // Allocations replaced by larger ones, freed once the preceding submission
+  // has completed.
+  retired_buffer_t *retired_buffers;
+  int retired_buffer_count;
+  int retired_buffer_capacity;
+
+  buffer_t dynamic_ubo_buffer;
+  void *ubo_buffer_ptr;
+  uint32_t ubo_buffer_offset;
+  VkDeviceSize min_ubo_alignment;
+  uint32_t max_ubo_range;
+  // The largest image the device takes; a larger one is refused, not created.
+  uint32_t max_image_dimension_2d, max_image_array_layers;
+
+  camera_t camera;
+  // Viewport camera for a 3D game: an orbit around a point, which is what an
+  // editor wants for inspecting a run from the outside.
+  camera3_t camera3;
+  float lod_bias;
+  texture_t *default_texture;
+  gfx_handler_t *gfx;
+
+  // Resources created at runtime by the active game module. They live beside
+  // the engine's own so the queue can batch and reset them the same way.
+  atlas_renderer_t *dynamic_atlases[MAX_DYNAMIC_ATLASES];
+  uint32_t dynamic_atlas_count;
+  custom_pipeline_t custom_pipelines[MAX_CUSTOM_PIPELINES];
+  uint32_t custom_pipeline_count;
+
+  uint8_t *transient_memory;
+  size_t transient_offset;
+  size_t transient_capacity;
+
+  render_queue_t queue; // The new Render Queue
+};
+
+void check_vk_result(VkResult err);
+int renderer_init(gfx_handler_t *handler);
+void renderer_cleanup(gfx_handler_t *handler);
+// Every frame up to `serial` has completed on the GPU (UINT64_MAX: all of them,
+// after a wait for the whole device). Dynamic allocations those frames outgrew
+// are released.
+void renderer_frames_completed(gfx_handler_t *handler, uint64_t serial);
+
+shader_t *renderer_load_shader(gfx_handler_t *handler, const char *vert_path, const char *frag_path);
+texture_t *renderer_load_texture(gfx_handler_t *handler, const char *image_path);
+texture_t *renderer_load_texture_from_array(gfx_handler_t *handler, const uint8_t *pixel_array, uint32_t width, uint32_t height);
+texture_t *renderer_load_compact_texture_from_array(gfx_handler_t *handler, const uint8_t **pixel_array, uint32_t width, uint32_t height);
+texture_t *renderer_create_texture_from_rgba(gfx_handler_t *handler, const unsigned char *pixels, int width, int height);
+
+void renderer_destroy_texture(gfx_handler_t *handler, texture_t *tex);
+mesh_t *renderer_create_mesh(gfx_handler_t *handler, vertex_t *vertices, uint32_t vertex_count, uint32_t *indices, uint32_t index_count);
+// The same for vertices of any layout, `vertex_stride` bytes each.
+mesh_t *renderer_create_mesh_raw(gfx_handler_t *handler, const void *vertices, uint32_t vertex_count, uint32_t vertex_stride,
+                                 const uint32_t *indices, uint32_t index_count);
+
+void renderer_begin_frame(gfx_handler_t *handler, VkCommandBuffer command_buffer);
+void renderer_draw_mesh(gfx_handler_t *handler, VkCommandBuffer command_buffer, mesh_t *mesh, shader_t *shader, texture_t **textures, uint32_t texture_count, void **ubos, VkDeviceSize *ubo_sizes, uint32_t ubo_count, uint32_t first_index, uint32_t index_count);
+void renderer_end_frame(gfx_handler_t *handler, VkCommandBuffer command_buffer);
+
+texture_t *renderer_create_texture_array_from_atlas(gfx_handler_t *handler, texture_t *atlas, uint32_t tile_width, uint32_t tile_height, uint32_t num_tiles_x, uint32_t num_tiles_y);
+void screen_to_world(gfx_handler_t *handler, float screen_x, float screen_y, float *world_x, float *world_y);
+// What the 2D projection scales an offset from the camera by, in the level's widths and heights: the
+// game's view at the camera's zoom across the viewport (game_view_size).
+float renderer_projection_scale(gfx_handler_t *h);
+void world_to_screen(gfx_handler_t *h, float wx, float wy, float *sx, float *sy);
+
+// thread synchronization
+void renderer_lock(void);
+void renderer_unlock(void);
+
+void create_image(gfx_handler_t *handler, uint32_t width, uint32_t height, uint32_t mip_levels, uint32_t array_layers, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *image, VkDeviceMemory *image_memory);
+VkImageView create_image_view_aspect(gfx_handler_t *handler, VkImage image, VkFormat format, VkImageViewType view_type, uint32_t mip_levels,
+                                     uint32_t layer_count, VkImageAspectFlags aspect);
+VkImageView create_image_view(gfx_handler_t *handler, VkImage image, VkFormat format, VkImageViewType view_type, uint32_t mip_levels, uint32_t layer_count);
+VkSampler create_texture_sampler(gfx_handler_t *handler, uint32_t mip_levels, VkFilter filter);
+// The same, with the wrap mode spelled out. World textures repeat across a
+// surface; UI and sprite sheets clamp. `anisotropic` is for a surface seen
+// along its length (a 3D road); a texture facing the screen gains nothing from
+// it and pays for every extra probe.
+VkSampler create_texture_sampler_wrapped(gfx_handler_t *handler, uint32_t mip_levels, VkFilter filter,
+                                         VkSamplerAddressMode address_mode, bool anisotropic);
+
+void renderer_submit_atlas_batch(gfx_handler_t *h, atlas_renderer_t *ar, float z, const atlas_instance_t *instances, uint32_t count, bool screen_space);
+void renderer_calculate_atlas_uvs(atlas_renderer_t *ar, uint32_t sprite_index, atlas_instance_t *out_inst);
+void renderer_submit_rect_filled(gfx_handler_t *h, float z, vec2 pos, vec2 size, vec4 color);
+// segments is the subdivision of one quarter-circle corner; the radius is
+// clamped to half the shorter side, and a radius of zero draws a plain rect.
+void renderer_submit_rect_rounded(gfx_handler_t *h, float z, vec2 pos, vec2 size, float radius, vec4 color,
+                                  uint32_t segments);
+void renderer_submit_circle_filled(gfx_handler_t *h, float z, vec2 center, float radius, vec4 color, uint32_t segments);
+void renderer_submit_triangle_filled(gfx_handler_t *h, float z, vec2 p1, vec2 p2, vec2 p3, vec4 color);
+void renderer_submit_line(gfx_handler_t *h, float z, vec2 p1, vec2 p2, vec4 color, float thickness);
+// Anti-aliased, unlike the shapes above: their edges fade out over one pixel of the target. A
+// polyline mitres its corners, and `closed` adds the segment from the last point back to the
+// first; a line thinner than a pixel keeps the pixel and fades instead. A polygon must be convex.
+void renderer_submit_polyline(gfx_handler_t *h, float z, const vec2 *points, uint32_t count, vec4 color, float thickness,
+                              bool closed);
+void renderer_submit_polygon(gfx_handler_t *h, float z, const vec2 *points, uint32_t count, vec4 color);
+// Anti-aliased like a polyline, but width_px pixels wide on screen at every zoom, coloured by segment
+// (see stroke_point_t; the colour changes sharply at a corner), and with the ends of an open stroke
+// faded too. Points closer than a pixel are merged.
+void renderer_submit_stroke(gfx_handler_t *h, float z, const stroke_point_t *points, uint32_t count, float width_px,
+                            bool closed);
+// How far one pixel of the target reaches in the 2D world, where `at` is.
+float renderer_world_per_pixel(gfx_handler_t *h, const float *at);
+void renderer_flush_queue(gfx_handler_t *h, VkCommandBuffer cmd);
+
+// --- resources a game module creates at runtime -------------------------------
+// The engine owns the graphics API; a game owns what goes through it. These are
+// the entry points behind the ft_engine_api draw services.
+// `format` is a VkFormat; game modules reach this through ft_texture_format.
+texture_t *renderer_create_texture_layered(gfx_handler_t *h, const unsigned char *pixels, uint32_t width, uint32_t height, uint32_t layers,
+                                           VkFormat format, bool mipmaps, bool linear_filter);
+atlas_renderer_t *renderer_create_atlas(gfx_handler_t *h, texture_t *source, const sprite_definition_t *sprites, uint32_t sprite_count,
+                                        uint32_t max_instances);
+void renderer_destroy_atlas(gfx_handler_t *h, atlas_renderer_t *ar);
+bool renderer_update_texture_layer(gfx_handler_t *h, texture_t *tex, uint32_t layer, const void *pixels, uint32_t width, uint32_t height);
+
+// Hands a texture's contents to a game module that renders with its own
+// renderer on this device, and parks it in the layout that module draws into.
+// 3D primitives. World-space, depth-tested, no z argument: submit order does
+// not matter because the depth buffer decides what is in front.
+void renderer_submit_line3(gfx_handler_t *h, vec3 a, vec3 b, vec4 color, float thickness);
+// As renderer_submit_line3, but width_px wide on screen wherever it is: the
+// world width is worked out at each end from the camera.
+void renderer_submit_line3_px(gfx_handler_t *h, vec3 a, vec3 b, vec4 color, float width_px);
+void renderer_submit_triangle3(gfx_handler_t *h, vec3 a, vec3 b, vec3 c, vec4 color);
+// The same triangle with a texture on it. `layer` indexes the array set by
+// renderer_set_texture3(); the coordinates are taken as authored and wrap.
+void renderer_submit_triangle3_textured(gfx_handler_t *h, vec3 a, vec3 b, vec3 c, vec2 uv_a, vec2 uv_b, vec2 uv_c,
+                                        uint32_t layer, vec4 tint);
+// The texture array every textured 3D triangle this frame samples from. Set it
+// before drawing; passing NULL goes back to untextured.
+void renderer_set_texture3(gfx_handler_t *h, texture_t *texture);
+void renderer_submit_box3(gfx_handler_t *h, vec3 center, vec3 size, vec4 color, bool wire);
+// Builds the view-projection the 3D paths render with, in whichever mode the
+// 3D camera is in: a perspective frustum for the orbit and the freecam, an
+// orthographic slab for the plan view.
+void renderer_camera3_view_proj(gfx_handler_t *h, mat4 out);
+// The world-space ray under a viewport-local screen position, for picking in a
+// 3D level. Returns false when the projection cannot be inverted, which is what
+// an uninitialised camera looks like.
+bool screen_ray3(gfx_handler_t *h, float sx, float sy, vec3 out_origin, vec3 out_dir);
+void renderer_camera3_eye(gfx_handler_t *h, vec3 out);
+// Where the camera is looking, as a unit vector. Movement and the view both
+// derive from it, so the two can never disagree.
+void renderer_camera3_forward(gfx_handler_t *h, vec3 out);
+// The world point the view is aimed at: the orbit's pivot, the ground under the
+// middle of the plan view, a point one unit along a freecam's heading. Only its
+// direction from the eye is defined for the freecam, which has no pivot.
+void renderer_camera3_target(gfx_handler_t *h, vec3 out);
+// Selects a 3D camera mode, seeding the one being entered from the one being
+// left so the image does not jump. Does nothing if that mode is already active,
+// so it is safe to call every frame.
+void renderer_camera3_set_mode(gfx_handler_t *h, camera3_mode_t mode);
+// Frames the 3D camera on a level that spans `span` world units around
+// `center`, giving every mode a starting shape derived from the level rather
+// than from whatever the last one was.
+void renderer_camera3_frame_level(gfx_handler_t *h, vec3 center, float span);
+
+bool renderer_mark_texture_external(gfx_handler_t *h, texture_t *tex);
+// An atlas that samples `src` live rather than copying it, for drawing an image
+// whose contents change after creation.
+atlas_renderer_t *renderer_create_texture_atlas(gfx_handler_t *h, texture_t *src);
+// Records the layout transitions the externally rendered textures need around
+// the engine's own pass: to sampled before it, back to colour attachment after.
+void renderer_sync_external_textures(gfx_handler_t *h, VkCommandBuffer cmd, bool for_sampling);
+shader_t *renderer_create_shader_spirv(gfx_handler_t *h, const void *vert_spirv, size_t vert_size, const void *frag_spirv, size_t frag_size,
+                                       const vertex_layout_t *layout);
+// Instance attribute locations start at 1; location 0 is the unit-quad corner
+// the engine binds. attr_formats uses the ft_vertex_format enumeration.
+custom_pipeline_t *renderer_create_custom_pipeline(gfx_handler_t *h, const void *vert_spirv, size_t vert_size, const void *frag_spirv,
+                                                   size_t frag_size, const uint32_t *attr_locations, const uint32_t *attr_offsets,
+                                                   const int *attr_formats, uint32_t attr_count, uint32_t instance_stride,
+                                                   uint32_t max_instances, uint32_t texture_count, bool alpha_blend,
+                                                   bool straight_alpha, uint32_t vertex_stride, bool depth_test);
+void renderer_destroy_custom_pipeline(gfx_handler_t *h, custom_pipeline_t *pipe);
+void renderer_submit_instances(gfx_handler_t *h, custom_pipeline_t *pipe, float z, texture_t *const *textures, uint32_t texture_count,
+                               const void *instances, uint32_t count);
+// Immediately renders module instances with their normal pipeline into a
+// standalone sampled texture or a region of an existing destination. Preview
+// coordinates are centred at the origin; a unit quad at scale 1 fills the tile.
+texture_t *renderer_render_instances_preview(gfx_handler_t *h, custom_pipeline_t *pipe, texture_t *const *textures,
+                                             uint32_t texture_count, const void *instances, uint32_t count, uint32_t width,
+                                             uint32_t height, const vec4 clear_color,
+                                             const renderer_texture_layer_update_t *updates, uint32_t update_count,
+                                             texture_t *destination, uint32_t destination_x, uint32_t destination_y);
+// Queues a mesh draw so it sorts with everything else. A game's level pass goes
+// through here, which is what lets it sit above or below the entities by z.
+void renderer_submit_mesh(gfx_handler_t *h, custom_pipeline_t *pipe, float z, mesh_t *mesh, texture_t *const *textures,
+                          uint32_t texture_count, const void *uniforms, size_t uniform_size);
+// `clip`, when not NULL, keeps the draw inside that rectangle of normalized device coordinates (x0, y0,
+// x1, y1) with a scissor; its edges are meant to fall on pixels.
+void renderer_submit_mesh_range(gfx_handler_t *h, custom_pipeline_t *pipe, float z, mesh_t *mesh,
+                                uint32_t first_index, uint32_t index_count, texture_t *const *textures,
+                                uint32_t texture_count, const void *uniforms, size_t uniform_size, const float *clip);
+void renderer_destroy_mesh(gfx_handler_t *h, mesh_t *mesh);
+void renderer_cleanup_atlas_renderer(gfx_handler_t *h, atlas_renderer_t *ar);
+texture_t *renderer_create_texture_2d_array(gfx_handler_t *handler, uint32_t width, uint32_t height, uint32_t layer_count, VkFormat format);
+
+// Write the viewport -- the offscreen colour target, without any editor
+// chrome -- to a binary PPM. Returns 0 on success. Meant for --screenshot and
+// for checking a render from a script rather than by eye.
+int renderer_capture_offscreen_ppm(gfx_handler_t *handler, const char *path);
+
+#endif // RENDERER_H

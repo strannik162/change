@@ -1,0 +1,1875 @@
+#include "timeline_recordings.h"
+#include "timeline_model.h"
+#include <audio/audio.h>
+#include <engine/engine_api.h>
+#include <engine/game_host.h>
+#include <engine/input_record.h>
+#include <GLFW/glfw3.h>
+#include <engine/int_math.h>
+#include <limits.h>
+#include <math.h>
+#include <renderer/graphics_backend.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <user_interface/input_effects.h>
+#include <user_interface/render/render_profile.h>
+#include <user_interface/timeline_events.h>
+#include <user_interface/user_interface.h>
+
+#define DEFAULT_TRACK_HEIGHT 60.f
+
+// Forward Declarations for Static Helpers
+static void v_init(timeline_state_t *ts, physics_v_t *t, int world_index);
+static void v_destroy(timeline_state_t *ts, physics_v_t *t);
+static void v_push(timeline_state_t *ts, physics_v_t *t, const ft_world *world, int world_index);
+static void snapshots_reset(timeline_group_t *group);
+static void group_start_world(timeline_state_t *ts, int group_index, ft_world *world);
+
+// The host the timeline simulates through. Every world in here belongs to the
+// active game; the engine only creates, copies and destroys them.
+static game_host_t *model_host(const timeline_state_t *ts) {
+  return (ts && ts->ui && ts->ui->gfx_handler) ? &ts->ui->gfx_handler->game_host : NULL;
+}
+
+// New sorting helper for the compaction algorithm
+static int compare_snippets_by_start_tick_p(const void *a, const void *b) {
+  const input_snippet_t *snip_a = *(const input_snippet_t **)a;
+  const input_snippet_t *snip_b = *(const input_snippet_t **)b;
+  return snip_a->start_tick - snip_b->start_tick;
+}
+
+static const float s_group_colors[][4] = {
+    {0.25f, 0.55f, 0.95f, 1.0f},
+    {0.95f, 0.72f, 0.10f, 1.0f},
+    {0.45f, 0.82f, 0.28f, 1.0f},
+    {0.88f, 0.35f, 0.70f, 1.0f},
+    {0.20f, 0.80f, 0.78f, 1.0f},
+    {0.95f, 0.38f, 0.25f, 1.0f},
+};
+
+// Revisions come from one counter, so no two states of any groups share one: a
+// cache filed under a world's index (DDNet's race splits) also notices another
+// group moving into that place.
+static uint64_t s_physics_revision;
+static void physics_changed(timeline_group_t *group) { group->physics_revision = ++s_physics_revision; }
+
+static void group_runtime_init(timeline_state_t *ts, timeline_group_t *group, int world_index) {
+  game_host_t *host = model_host(ts);
+  const ft_level *level = ts->ui->gfx_handler->level;
+  v_init(ts, &group->vec, world_index);
+  snapshots_reset(group);
+  group->initial_world = gh_world_create(host, level, 0, world_index);
+  group->previous_world = gh_world_create(host, level, 0, world_index);
+  group->prev_world_cached = gh_world_create(host, level, 0, world_index);
+  group->world_cached = gh_world_create(host, level, 0, world_index);
+  group->audio_world = gh_world_create(host, level, 0, world_index);
+  group->audio_world_tick = -1;
+  group->cached_tick = -1;
+  group->presentation_tick = 0;
+}
+
+// A world under another index, with the same contents.
+static ft_world *world_moved(timeline_state_t *ts, ft_world *world, int world_index) {
+  if (!world) return NULL;
+  game_host_t *host = model_host(ts);
+  ft_world *moved = gh_world_create(host, ts->ui->gfx_handler->level, 0, world_index);
+  if (!moved) return world;
+  gh_world_copy(host, moved, world);
+  gh_world_destroy(host, world);
+  return moved;
+}
+
+// A group that moves up the list takes its worlds along. A game files what a
+// world reports (DDNet's particles and events) under the index it was made
+// with, and a copy keeps the destination's, so each is made again under the new
+// one; the snapshots are copied rather than simulated again.
+static void group_runtime_move(timeline_state_t *ts, timeline_group_t *group, int world_index) {
+  group->initial_world = world_moved(ts, group->initial_world, world_index);
+  group->previous_world = world_moved(ts, group->previous_world, world_index);
+  group->prev_world_cached = world_moved(ts, group->prev_world_cached, world_index);
+  group->world_cached = world_moved(ts, group->world_cached, world_index);
+  group->audio_world = world_moved(ts, group->audio_world, world_index);
+  for (uint32_t i = 0; i < group->vec.max_size; ++i)
+    group->vec.data[i] = world_moved(ts, group->vec.data[i], world_index);
+  // (what was worked out from it under the old index is not for the new one)
+  physics_changed(group);
+}
+
+static void group_runtime_cleanup(timeline_state_t *ts, timeline_group_t *group) {
+  if (!group) return;
+  game_host_t *host = model_host(ts);
+  prediction_group_cleanup(ts, group);
+  v_destroy(ts, &group->vec);
+  gh_world_destroy(host, group->initial_world);
+  gh_world_destroy(host, group->previous_world);
+  gh_world_destroy(host, group->prev_world_cached);
+  gh_world_destroy(host, group->world_cached);
+  gh_world_destroy(host, group->audio_world);
+  audio_track_free(group->audio);
+  group->audio = NULL;
+  group->initial_world = group->previous_world = group->prev_world_cached = group->world_cached = NULL;
+  group->audio_world = NULL;
+}
+
+timeline_group_t *model_add_group(timeline_state_t *ts, const char *name) {
+  if (!ts) return NULL;
+  timeline_group_t *group = calloc(1, sizeof(*group));
+  if (!group) return NULL;
+
+  int index = ts->group_count;
+  snprintf(group->name, sizeof(group->name), "%s", name && name[0] ? name : "Group");
+  memcpy(group->color, s_group_colors[index % (int)(sizeof(s_group_colors) / sizeof(s_group_colors[0]))], sizeof(group->color));
+  group->visible = true;
+  group->video_visible = true;
+  group->opacity = group->video_opacity = 1.f;
+  group->volume = group->video_volume = 1.f;
+  group->export_enabled = true;
+  group->prediction_enabled = true;
+  group_runtime_init(ts, group, index);
+
+  timeline_group_t **groups = realloc(ts->groups, sizeof(*groups) * (size_t)(index + 1));
+  if (!groups) {
+    group_runtime_cleanup(ts, group);
+    free(group);
+    return NULL;
+  }
+  ts->groups = groups;
+  ts->groups[index] = group;
+  ts->group_count++;
+
+  return group;
+}
+
+int model_track_group_index(const timeline_state_t *ts, int track_index) {
+  if (!ts || track_index < 0 || track_index >= ts->player_track_count) return -1;
+  int group = ts->player_tracks[track_index].group_index;
+  return group >= 0 && group < ts->group_count ? group : -1;
+}
+
+int model_group_track_count(const timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return 0;
+  int count = 0;
+  for (int i = 0; i < ts->player_track_count; ++i)
+    if (ts->player_tracks[i].group_index == group_index) ++count;
+  return count;
+}
+
+int model_group_track_index(const timeline_state_t *ts, int group_index, int local_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count || local_index < 0) return -1;
+  for (int i = 0, local = 0; i < ts->player_track_count; ++i) {
+    if (ts->player_tracks[i].group_index != group_index) continue;
+    if (local++ == local_index) return i;
+  }
+  return -1;
+}
+
+int model_linked_source_track(const timeline_state_t *ts, int track_index) {
+  if (!ts || track_index < 0 || track_index >= ts->player_track_count) return -1;
+  const player_track_t *track = &ts->player_tracks[track_index];
+  const int pinned = track->linked_source_player >= 0 ? model_group_track_index(ts, track->group_index, track->linked_source_player) : -1;
+  if (pinned >= 0 && pinned != track_index) return pinned;
+  const int controlled = ts->selected_player_track_index;
+  if (controlled >= 0 && controlled != track_index && controlled < ts->player_track_count &&
+      ts->player_tracks[controlled].group_index == track->group_index)
+    return controlled;
+  return -1;
+}
+
+void model_group_tracks(const timeline_state_t *ts, int group_index, int *out, int count) {
+  int local = 0;
+  for (int i = 0; ts && i < ts->player_track_count && local < count; ++i)
+    if (ts->player_tracks[i].group_index == group_index) out[local++] = i;
+  for (; local < count; ++local)
+    out[local] = -1;
+}
+
+int model_group_local_track_index(const timeline_state_t *ts, int track_index) {
+  int group_index = model_track_group_index(ts, track_index);
+  if (group_index < 0) return -1;
+  int local = 0;
+  for (int i = 0; i < track_index; ++i)
+    if (ts->player_tracks[i].group_index == group_index) ++local;
+  return local;
+}
+
+int model_group_playhead_tick(const timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return 0;
+  return imax(0, ts->current_tick - ts->groups[group_index]->start_offset);
+}
+
+int model_get_min_global_tick(const timeline_state_t *ts) {
+  if (!ts) return 0;
+  int min_tick = 0;
+  for (int group_index = 0; group_index < ts->group_count; ++group_index)
+    min_tick = imin(min_tick, ts->groups[group_index]->start_offset);
+  return min_tick;
+}
+
+int model_clamp_global_tick_for_group(const timeline_state_t *ts, int group_index, int tick) {
+  int min_tick = ts && group_index >= 0 && group_index < ts->group_count ? ts->groups[group_index]->start_offset : 0;
+  return imax(tick, min_tick);
+}
+
+void model_set_active_group(timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+  if (ts->recording && group_index != ts->active_group_index) return;
+  ts->active_group_index = group_index;
+  // The selected track is one of the active group's: what plays, records and what plugins search is
+  // that group's, so a track of another group is selected no more.
+  if (ts->selected_player_track_index >= 0 && model_track_group_index(ts, ts->selected_player_track_index) != group_index)
+    ts->selected_player_track_index = -1;
+}
+
+void model_set_group_start_offset(timeline_state_t *ts, int group_index, int offset) {
+  if (!ts || group_index <= 0 || group_index >= ts->group_count) return;
+  ts->groups[group_index]->start_offset = offset;
+  ts->current_tick = imax(ts->current_tick, model_get_min_global_tick(ts));
+  // Worlds, effects and events all use local ticks. Their contents are unchanged.
+}
+
+void model_reset_groups_for_level(timeline_state_t *ts) {
+  if (!ts || !ts->ui || !ts->ui->gfx_handler) return;
+  game_host_t *host = model_host(ts);
+  const ft_level *level = ts->ui->gfx_handler->level;
+  if (!level) return;
+
+  // A new level invalidates every world in the project, so each group is given
+  // a fresh set built from it, sized to the tracks that group already owns.
+  for (int i = 0; i < ts->group_count; ++i) {
+    timeline_group_t *group = ts->groups[i];
+    const int players = model_group_track_count(ts, i);
+
+    group_runtime_cleanup(ts, group);
+    group_runtime_init(ts, group, i);
+    physics_changed(group);
+
+    // A fixed-cast game has already created its required players. Dynamic
+    // games start lower and need only the difference represented by tracks.
+    const int existing = gh_world_player_count(host, group->initial_world);
+    for (int p = existing; p < players; ++p)
+      gh_world_add_player(host, group->initial_world, -1, NULL);
+    group_start_world(ts, i, group->previous_world);
+    if (group->vec.data && group->vec.data[0]) gh_world_copy(host, group->vec.data[0], group->previous_world);
+    snapshots_reset(group);
+    group->cached_tick = -1;
+    group->presentation_tick = -1;
+  }
+}
+
+// Initialization and Cleanup
+
+void model_init(timeline_state_t *ts, ui_handler_t *ui) {
+  ts->ui = ui;
+
+  if (ui && ui->configured_prediction.line_count > 0)
+    ts->prediction = ui->configured_prediction;
+  else
+    prediction_settings_default(&ts->prediction);
+
+  int tps = (ui && ui->gfx_handler) ? game_ticks_per_second(&ui->gfx_handler->game_host) : 50;
+  if (tps <= 0) tps = 50;
+  ts->gui_playback_speed = tps;
+  ts->playback_speed = tps;
+  ts->zoom = 1.0f;
+  ts->track_height = DEFAULT_TRACK_HEIGHT;
+  ts->selected_player_track_index = -1;
+  ts->context_menu_snippet_id = -1;
+  ts->active_snippet_id = -1;
+  ts->pending_single_select_id = -1;
+  ts->header_drag_group_index = -1;
+  ts->next_snippet_id = 1;
+  ts->active_group_index = 0;
+
+  ts->drag_state.drag_infos = NULL;
+  ts->drag_state.initial_mouse_pos = (ImVec2){0, 0};
+
+  ts->events = NULL;
+  ts->event_count = 0;
+  ++ts->event_revision;
+  ts->event_capacity = 0;
+
+  snippet_id_vector_init(&ts->selected_snippets);
+  model_add_group(ts, "Group 1");
+  model_sync_tracks_to_world(ts, 0);
+}
+
+void model_cleanup(timeline_state_t *ts) {
+  recordings_clear(ts);
+  for (int i = 0; i < ts->player_track_count; ++i) {
+    player_track_t *track = &ts->player_tracks[i];
+    for (int j = 0; j < track->snippet_count; ++j) {
+      model_free_snippet_inputs(&track->snippets[j]);
+    }
+    for (int j = 0; j < track->recording_snippet_count; ++j) {
+      model_free_snippet_inputs(&track->recording_snippets[j]);
+    }
+    free(track->snippets);
+    free(track->recording_snippets);
+  }
+  free(ts->player_tracks);
+
+  if (ts->drag_state.drag_infos) {
+    free(ts->drag_state.drag_infos);
+  }
+
+  if (ts->events) {
+    free(ts->events);
+  }
+
+  free(ts->recording_snippets.snippets);
+
+  for (int i = 0; i < ts->group_count; ++i) {
+    group_runtime_cleanup(ts, ts->groups[i]);
+    free(ts->groups[i]);
+  }
+  free(ts->groups);
+  snippet_id_vector_free(&ts->selected_snippets);
+
+  memset(ts, 0, sizeof(timeline_state_t));
+}
+
+// Snippet ID Vector Helpers
+
+void snippet_id_vector_init(snippet_id_vector_t *vec) {
+  vec->ids = NULL;
+  vec->count = 0;
+  vec->capacity = 0;
+}
+
+void snippet_id_vector_free(snippet_id_vector_t *vec) {
+  free(vec->ids);
+  snippet_id_vector_init(vec);
+}
+
+void snippet_id_vector_add(snippet_id_vector_t *vec, int snippet_id) {
+  if (vec->count >= vec->capacity) {
+    int new_capacity = vec->capacity == 0 ? 8 : vec->capacity * 2;
+    vec->ids = realloc(vec->ids, sizeof(int) * new_capacity);
+    if (!vec->ids) return;
+    vec->capacity = new_capacity;
+  }
+  vec->ids[vec->count++] = snippet_id;
+}
+
+bool snippet_id_vector_remove(snippet_id_vector_t *vec, int snippet_id) {
+  for (int i = 0; i < vec->count; ++i) {
+    if (vec->ids[i] == snippet_id) {
+      if (i < vec->count - 1) {
+        memmove(&vec->ids[i], &vec->ids[i + 1], (vec->count - i - 1) * sizeof(int));
+      }
+      vec->count--;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool snippet_id_vector_contains(const snippet_id_vector_t *vec, int snippet_id) {
+  for (int i = 0; i < vec->count; ++i) {
+    if (vec->ids[i] == snippet_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Finders
+
+input_snippet_t *model_find_snippet_in_track(player_track_t *track, int snippet_id) {
+  for (int i = 0; i < track->snippet_count; ++i) {
+    if (track->snippets[i].id == snippet_id) {
+      return &track->snippets[i];
+    }
+  }
+  return NULL;
+}
+
+input_snippet_t *model_find_snippet_by_id(timeline_state_t *ts, int snippet_id, int *out_track_index) {
+  for (int i = 0; i < ts->player_track_count; ++i) {
+    input_snippet_t *snippet = model_find_snippet_in_track(&ts->player_tracks[i], snippet_id);
+    if (snippet) {
+      if (out_track_index) *out_track_index = i;
+      return snippet;
+    }
+  }
+  return NULL;
+}
+
+int model_find_available_layer(const player_track_t *track, int start_tick, int end_tick, int exclude_snippet_id) {
+  for (int layer = 0; layer < MAX_SNIPPET_LAYERS; ++layer) {
+    bool layer_is_free = true;
+    for (int i = 0; i < track->snippet_count; ++i) {
+      const input_snippet_t *other = &track->snippets[i];
+      if (other->id == exclude_snippet_id) continue;
+      if (other->layer != layer) continue;
+      if (start_tick < other->end_tick && end_tick > other->start_tick) {
+        layer_is_free = false;
+        break;
+      }
+    }
+    if (layer_is_free) return layer;
+  }
+  return -1;
+}
+
+int model_get_stack_size_at_tick_range(const player_track_t *track, int start_tick, int end_tick) {
+  int max_layer = 0;
+  for (int i = 0; i < track->snippet_count; i++) {
+    const input_snippet_t *other = &track->snippets[i];
+    if (start_tick < other->end_tick && end_tick > other->start_tick) {
+      if (other->layer > max_layer) {
+        max_layer = other->layer;
+      }
+    }
+  }
+  return max_layer + 1;
+}
+
+int model_get_max_timeline_tick(timeline_state_t *ts) {
+  int max_tick = 0;
+  for (int i = 0; i < ts->player_track_count; ++i) {
+    player_track_t *track = &ts->player_tracks[i];
+    for (int j = 0; j < track->snippet_count; ++j) {
+      int group_index = model_track_group_index(ts, i);
+      int offset = group_index >= 0 ? ts->groups[group_index]->start_offset : 0;
+      if (track->snippets[j].end_tick + offset > max_tick) {
+        max_tick = track->snippets[j].end_tick + offset;
+      }
+    }
+  }
+  return max_tick;
+}
+
+// Data Modification
+
+void timeline_solve_snippet_layers(input_snippet_t **snippets, int count) {
+  if (count <= 1) {
+    if (count == 1 && snippets[0]) snippets[0]->layer = 0;
+    return;
+  }
+
+  qsort(snippets, count, sizeof(input_snippet_t *), compare_snippets_by_start_tick_p);
+
+  for (int i = 0; i < count; i++) {
+    input_snippet_t *current = snippets[i];
+    int start_tick = current->start_tick;
+    int end_tick = current->end_tick;
+
+    current->layer = 0;
+
+    for (int layer = 0; layer < MAX_SNIPPET_LAYERS; ++layer) {
+      bool layer_is_free = true;
+      for (int j = 0; j < i; j++) {
+        input_snippet_t *other = snippets[j];
+        if (other->layer == layer) {
+          if (start_tick < other->end_tick && end_tick > other->start_tick) {
+            layer_is_free = false;
+            break;
+          }
+        }
+      }
+      if (layer_is_free) {
+        current->layer = layer;
+        break;
+      }
+    }
+  }
+}
+
+void model_insert_snippet_into_track(player_track_t *track, const input_snippet_t *snippet) {
+  if (track->snippet_count >= track->snippet_capacity) {
+    track->snippet_capacity = track->snippet_capacity == 0 ? 8 : track->snippet_capacity * 2;
+    track->snippets = realloc(track->snippets, sizeof(input_snippet_t) * track->snippet_capacity);
+  }
+  track->snippets[track->snippet_count] = *snippet;
+  // Catches snippets built by callers that only fill in the window fields.
+  model_snippet_normalize(&track->snippets[track->snippet_count]);
+  track->snippet_count++;
+}
+
+bool model_remove_snippet_from_track(timeline_state_t *ts, player_track_t *track, int snippet_id) {
+  int found_idx = -1;
+  for (int i = 0; i < track->snippet_count; ++i) {
+    if (track->snippets[i].id == snippet_id) {
+      found_idx = i;
+      break;
+    }
+  }
+
+  if (found_idx != -1) {
+    int removed_start_tick = track->snippets[found_idx].start_tick;
+    model_free_snippet_inputs(&track->snippets[found_idx]);
+
+    memmove(&track->snippets[found_idx], &track->snippets[found_idx + 1], (track->snippet_count - found_idx - 1) * sizeof(input_snippet_t));
+    track->snippet_count--;
+
+    if (track->snippet_count == 0) {
+      free(track->snippets);
+      track->snippets = NULL;
+      track->snippet_capacity = 0;
+    }
+
+    model_recalc_group_physics(ts, track->group_index, removed_start_tick);
+
+    return true;
+  }
+  return false;
+}
+
+void model_resize_snippet_inputs(timeline_state_t *ts, input_snippet_t *snippet, int new_duration) {
+  if (snippet_is_playback(snippet)) {
+    if (new_duration > 0) model_trim_snippet(ts, snippet, snippet->start_tick, snippet->start_tick + new_duration);
+    return;
+  }
+  if (new_duration <= 0) {
+    model_free_snippet_inputs(snippet);
+    snippet->start_tick = snippet->end_tick;
+    return;
+  }
+  if (snippet->input_count == new_duration) return;
+
+  // This rewrites the buffer as a whole, so the window has to be the buffer first.
+  model_snippet_flatten(snippet);
+
+  int old_count = snippet->input_count;
+  input_record_t *grown = realloc(snippet->inputs, sizeof(input_record_t) * (size_t)new_duration);
+  if (!grown) return;
+  snippet->inputs = grown;
+  if (new_duration > old_count) {
+    memset(&snippet->inputs[old_count], 0, (new_duration - old_count) * sizeof(input_record_t));
+  }
+
+  snippet->input_count = new_duration;
+  snippet->end_tick = snippet->start_tick + new_duration;
+  snippet->source_offset = 0;
+  snippet->source_count = new_duration;
+  input_effects_snippet_discard_cache(snippet);
+
+  if (!ts->recording) {
+    model_recalc_snippet_physics(ts, snippet, snippet->start_tick);
+  }
+}
+
+void model_free_snippet_inputs(input_snippet_t *snippet) {
+  free(snippet->inputs);
+  input_effects_snippet_cleanup(snippet);
+  snippet->inputs = NULL;
+  if (snippet_is_playback(snippet)) return; // the window stays: it is onto the recording
+  snippet->input_count = 0;
+  snippet->source_offset = 0;
+  snippet->source_count = 0;
+}
+
+void model_snippet_clone(input_snippet_t *dest, const input_snippet_t *src) {
+  *dest = *src;
+  input_effects_snippet_clone(dest, src);
+  // The whole source travels with the copy, not just the visible window, so a cloned snippet can be
+  // widened back out to everything the original held.
+  if (snippet_is_playback(src)) {
+    dest->inputs = NULL; // shares the recording, which the timeline owns
+  } else if (src->inputs && src->source_count > 0) {
+    dest->inputs = malloc(src->source_count * sizeof(input_record_t));
+    memcpy(dest->inputs, src->inputs, src->source_count * sizeof(input_record_t));
+  } else {
+    dest->inputs = NULL;
+    dest->source_offset = 0;
+    dest->source_count = 0;
+  }
+}
+
+void model_snippet_normalize(input_snippet_t *snippet) {
+  if (!snippet) return;
+  if (snippet->source_offset < 0) snippet->source_offset = 0;
+  if (snippet->source_count < snippet->source_offset + snippet->input_count) {
+    snippet->source_count = snippet->source_offset + snippet->input_count;
+  }
+  snippet->end_tick = snippet->start_tick + snippet->input_count;
+}
+
+void model_snippet_flatten(input_snippet_t *snippet) {
+  if (!snippet || snippet_is_playback(snippet)) return; // its source is the recording
+  model_snippet_normalize(snippet);
+  if (!snippet->inputs) return;
+  if (snippet->source_offset == 0 && snippet->source_count == snippet->input_count) return;
+
+  if (snippet->input_count <= 0) {
+    model_free_snippet_inputs(snippet);
+    return;
+  }
+
+  input_record_t *flat = malloc(sizeof(input_record_t) * snippet->input_count);
+  if (!flat) return;
+  memcpy(flat, snippet_window(snippet), sizeof(input_record_t) * snippet->input_count);
+  free(snippet->inputs);
+  snippet->inputs = flat;
+  snippet->source_offset = 0;
+  snippet->source_count = snippet->input_count;
+  input_effects_snippet_discard_cache(snippet);
+}
+
+bool model_trim_snippet(timeline_state_t *ts, input_snippet_t *snippet, int new_start_tick, int new_end_tick) {
+  if (!snippet) return false;
+  model_snippet_normalize(snippet);
+
+  if (new_start_tick < 0) new_start_tick = 0;
+  if (new_end_tick <= new_start_tick) return false;
+  if (new_start_tick == snippet->start_tick && new_end_tick == snippet->end_tick) return false;
+
+  if (snippet_is_playback(snippet)) {
+    // Nothing exists past the recording's ends to pad with.
+    const int source_start = snippet->start_tick - snippet->source_offset;
+    new_start_tick = imax(new_start_tick, source_start);
+    new_end_tick = imin(new_end_tick, source_start + snippet->source_count);
+    if (new_end_tick <= new_start_tick) return false;
+    if (new_start_tick == snippet->start_tick && new_end_tick == snippet->end_tick) return false;
+  }
+
+  int new_count = new_end_tick - new_start_tick;
+  int new_offset = snippet->source_offset - (snippet->start_tick - new_start_tick);
+
+  // Pulling an edge past the retained source is allowed; it invents blank ticks there.
+  if (new_offset < 0) {
+    int pad = -new_offset;
+    input_record_t *grown = realloc(snippet->inputs, sizeof(input_record_t) * (snippet->source_count + pad));
+    if (!grown) return false;
+    snippet->inputs = grown;
+    if (snippet->source_count > 0) memmove(&snippet->inputs[pad], snippet->inputs, sizeof(input_record_t) * snippet->source_count);
+    memset(snippet->inputs, 0, sizeof(input_record_t) * pad);
+    snippet->source_count += pad;
+    snippet->source_offset += pad;
+    new_offset = 0;
+  }
+
+  if (new_offset + new_count > snippet->source_count) {
+    int pad = new_offset + new_count - snippet->source_count;
+    input_record_t *grown = realloc(snippet->inputs, sizeof(input_record_t) * (snippet->source_count + pad));
+    if (!grown) return false;
+    snippet->inputs = grown;
+    memset(&snippet->inputs[snippet->source_count], 0, sizeof(input_record_t) * pad);
+    snippet->source_count += pad;
+  }
+
+  int earliest = snippet->start_tick == new_start_tick ? imin(snippet->end_tick, new_end_tick)
+                                                       : imin(snippet->start_tick, new_start_tick);
+
+  snippet->source_offset = new_offset;
+  snippet->input_count = new_count;
+  snippet->start_tick = new_start_tick;
+  snippet->end_tick = new_end_tick;
+
+  model_recalc_snippet_physics(ts, snippet, earliest);
+  return true;
+}
+
+static uint32_t s_track_uid;
+
+static player_track_t *insert_track_rows(timeline_state_t *ts, int group_index, int num) {
+  if (num <= 0) return NULL;
+  if (group_index < 0 || group_index >= ts->group_count) return NULL;
+
+  int existing_group_count = model_group_track_count(ts, group_index);
+
+  int insert_index = ts->player_track_count;
+  for (int i = ts->player_track_count - 1; i >= 0; --i) {
+    if (ts->player_tracks[i].group_index == group_index) {
+      insert_index = i + 1;
+      break;
+    }
+  }
+  int new_count = ts->player_track_count + num;
+  player_track_t *grown = realloc(ts->player_tracks, sizeof(player_track_t) * (size_t)new_count);
+  if (!grown) return NULL;
+  ts->player_tracks = grown;
+  memmove(&ts->player_tracks[insert_index + num], &ts->player_tracks[insert_index],
+          sizeof(player_track_t) * (size_t)(ts->player_track_count - insert_index));
+  if (ts->ui && &ts->ui->timeline == ts) {
+    // Only subjects that are tracks move along. One past the tracks (a new camera follows track 0
+    // before there are any) is a placeholder: it stays, and becomes the first track made.
+    camera_timeline_t *camera = &ts->ui->camera_timeline;
+    for (int i = 0; i < camera->subject_count; ++i)
+      if (camera->subject_tracks[i] >= insert_index && camera->subject_tracks[i] < ts->player_track_count) camera->subject_tracks[i] += num;
+    for (int i = 0; i < camera->focus_count; ++i)
+      if (camera->focus_keys[i].track >= insert_index && camera->focus_keys[i].track < ts->player_track_count)
+        camera->focus_keys[i].track += num;
+  }
+
+  // Realloc/memmove changes the address of inline string storage.
+  for (int i = 0; i < ts->player_track_count; ++i)
+    model_rebind_starting_strings(&ts->player_tracks[i].starting_config);
+
+  for (int i = 0; i < num; i++) {
+    player_track_t *new_track = &ts->player_tracks[insert_index + i];
+    memset(new_track, 0, sizeof(player_track_t));
+    snprintf(new_track->name, sizeof(new_track->name), "Track %d", existing_group_count + i + 1);
+    // A fresh track carries no profile. The game fills one in the first time
+    // its panel is used, and reads "none" as its own defaults until then.
+    new_track->group_index = group_index;
+    new_track->uid = ++s_track_uid;
+    new_track->linked_source_player = -1; // whichever tee is being controlled
+    // Copies what can be authored, but not one-shot requests: a kill pressed
+    // for the controlled tee should not kill every linked one too. Nor the
+    // state a player is in, such as its team.
+    const ft_input_schema *schema = game_input_schema(model_host(ts));
+    if (schema) {
+      const uint32_t not_copied =
+          FT_INPUT_FLAG_INTERNAL | FT_INPUT_FLAG_EDITOR_HIDDEN | FT_INPUT_FLAG_TRIGGER | FT_INPUT_FLAG_PLAYER_STATE;
+      for (uint32_t field = 0; field < schema->field_count && field < 64; ++field)
+        if ((schema->fields[field].flags & not_copied) == 0)
+          new_track->linked_copy_fields |= UINT64_C(1) << field;
+    }
+    new_track->export_enabled = true;
+    new_track->prediction_enabled = true;
+  }
+
+  ts->player_track_count = new_count;
+  return &ts->player_tracks[insert_index];
+}
+
+player_track_t *model_add_new_track(timeline_state_t *ts, int num) {
+  if (!ts || num <= 0) return NULL;
+  if (ts->active_group_index < 0 || ts->active_group_index >= ts->group_count) return NULL;
+
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[ts->active_group_index];
+  const int track_count = model_group_track_count(ts, ts->active_group_index);
+  const int world_count = gh_world_player_count(host, group->initial_world);
+
+  // Players a game creates as part of world_create do not need (and for a
+  // fixed cast cannot accept) world_add_player. Claim those players with rows
+  // first, then ask a dynamic game to create only the remaining players.
+  const int unclaimed = world_count > track_count ? world_count - track_count : 0;
+  const int players_to_add = num > unclaimed ? num - unclaimed : 0;
+  int added = 0;
+  for (; added < players_to_add; ++added) {
+    if (gh_world_add_player(host, group->initial_world, -1, NULL) >= 0) continue;
+    while (added-- > 0)
+      gh_world_remove_player(host, group->initial_world, gh_world_player_count(host, group->initial_world) - 1);
+    return NULL;
+  }
+
+  player_track_t *rows = insert_track_rows(ts, ts->active_group_index, num);
+  if (!rows) {
+    while (added-- > 0)
+      gh_world_remove_player(host, group->initial_world, gh_world_player_count(host, group->initial_world) - 1);
+    return NULL;
+  }
+  model_recalc_group_physics(ts, ts->active_group_index, 0);
+  return rows;
+}
+
+void model_sync_tracks_to_world(timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+  const int tracks = model_group_track_count(ts, group_index);
+  const int players = gh_world_player_count(model_host(ts), ts->groups[group_index]->initial_world);
+  if (players <= tracks) return;
+
+  const int old_active = ts->active_group_index;
+  ts->active_group_index = group_index;
+  player_track_t *first = model_add_new_track(ts, players - tracks);
+  ts->active_group_index = old_active;
+  if (first && ts->selected_player_track_index < 0)
+    ts->selected_player_track_index = (int)(first - ts->player_tracks);
+}
+
+void model_remove_track_logic(timeline_state_t *ts, int track_index) {
+  if (track_index < 0 || track_index >= ts->player_track_count) return;
+  if (ts->ui && &ts->ui->timeline == ts) {
+    // A removed character leaves the camera's set; the rest keep their places.
+    camera_timeline_t *camera = &ts->ui->camera_timeline;
+    int kept = 0;
+    for (int i = 0; i < camera->subject_count; ++i) {
+      const int track = camera->subject_tracks[i];
+      if (track == track_index) continue;
+      camera->subject_tracks[kept++] = track > track_index ? track - 1 : track;
+    }
+    camera->subject_count = kept;
+    // A cut to it stays a cut, to nobody: the shot falls back there as if it had no focus.
+    for (int i = 0; i < camera->focus_count; ++i) {
+      int *track = &camera->focus_keys[i].track;
+      if (*track == track_index) *track = -1;
+      else if (*track > track_index) --*track;
+    }
+  }
+
+  int group_index = model_track_group_index(ts, track_index);
+  int local_index = model_group_local_track_index(ts, track_index);
+  if (group_index >= 0 && local_index >= 0)
+    gh_world_remove_player(model_host(ts), ts->groups[group_index]->initial_world, local_index);
+  // Links name their source by its place in the group: the players after the
+  // removed one move up, and a link to it falls back to the controlled tee.
+  for (int i = 0; group_index >= 0 && i < ts->player_track_count; ++i) {
+    player_track_t *other = &ts->player_tracks[i];
+    if (i == track_index || other->group_index != group_index) continue;
+    if (other->linked_source_player == local_index) other->linked_source_player = -1;
+    else if (other->linked_source_player > local_index) --other->linked_source_player;
+  }
+
+  player_track_t *track = &ts->player_tracks[track_index];
+  for (int i = 0; i < track->snippet_count; ++i) {
+    model_free_snippet_inputs(&track->snippets[i]);
+  }
+  free(track->snippets);
+
+  for (int i = 0; i < track->recording_snippet_count; ++i) {
+    model_free_snippet_inputs(&track->recording_snippets[i]);
+  }
+  free(track->recording_snippets);
+
+  if (track_index < ts->player_track_count - 1) {
+    memmove(&ts->player_tracks[track_index], &ts->player_tracks[track_index + 1],
+            (ts->player_track_count - track_index - 1) * sizeof(player_track_t));
+  }
+
+  ts->player_track_count--;
+  if (ts->player_track_count == 0) {
+    free(ts->player_tracks);
+    ts->player_tracks = NULL;
+  } else {
+    ts->player_tracks = realloc(ts->player_tracks, sizeof(player_track_t) * ts->player_track_count);
+    for (int i = 0; i < ts->player_track_count; ++i)
+      model_rebind_starting_strings(&ts->player_tracks[i].starting_config);
+  }
+
+  if (ts->selected_player_track_index == track_index) ts->selected_player_track_index = -1;
+  else if (ts->selected_player_track_index > track_index) ts->selected_player_track_index--;
+
+  model_recalc_group_physics(ts, group_index, 0);
+}
+
+void model_insert_track_physics(timeline_state_t *ts, int track_index) {
+  const int group_index = model_track_group_index(ts, track_index);
+  const int local_index = model_group_local_track_index(ts, track_index);
+  if (group_index < 0 || local_index < 0) return;
+  // Inserting rather than appending is the game's problem: only it knows what
+  // renumbering a player means for the rest of its world.
+  gh_world_add_player(model_host(ts), ts->groups[group_index]->initial_world, local_index, NULL);
+  // Links name their source by its place in the group, which moves down.
+  for (int i = 0; i < ts->player_track_count; ++i) {
+    player_track_t *other = &ts->player_tracks[i];
+    if (i != track_index && other->group_index == group_index && other->linked_source_player >= local_index)
+      ++other->linked_source_player;
+  }
+  snapshots_reset(ts->groups[group_index]);
+  model_recalc_group_physics(ts, group_index, 0);
+}
+
+void model_compact_layers_for_track(player_track_t *track) {
+  if (track->snippet_count == 0) return;
+
+  input_snippet_t **all_snippets = malloc(track->snippet_count * sizeof(input_snippet_t *));
+  if (!all_snippets) return;
+
+  for (int i = 0; i < track->snippet_count; i++) {
+    all_snippets[i] = &track->snippets[i];
+  }
+
+  timeline_solve_snippet_layers(all_snippets, track->snippet_count);
+
+  free(all_snippets);
+}
+
+// Recording & Merging
+
+void model_insert_snippet_into_recording_track(player_track_t *track, const input_snippet_t *snippet) {
+  if (track->recording_snippet_count >= track->recording_snippet_capacity) {
+    track->recording_snippet_capacity = track->recording_snippet_capacity == 0 ? 8 : track->recording_snippet_capacity * 2;
+    track->recording_snippets = realloc(track->recording_snippets, sizeof(input_snippet_t) * track->recording_snippet_capacity);
+  }
+  track->recording_snippets[track->recording_snippet_count] = *snippet;
+  track->recording_snippet_count++;
+}
+
+void model_apply_input_to_main_buffer(timeline_state_t *ts, player_track_t *track, int tick, const input_record_t *input) {
+  // Recorded input never goes into a playback snippet, which holds no inputs.
+  input_snippet_t *overlapping_snippet = NULL;
+  for (int j = 0; j < track->snippet_count; ++j) {
+    if (snippet_is_playback(&track->snippets[j])) continue;
+    if (track->snippets[j].is_active && tick >= track->snippets[j].start_tick && tick < track->snippets[j].end_tick) {
+      overlapping_snippet = &track->snippets[j];
+      break;
+    }
+  }
+  if (overlapping_snippet) {
+    snippet_window(overlapping_snippet)[tick - overlapping_snippet->start_tick] = *input;
+    return;
+  }
+
+  input_snippet_t *before = NULL;
+  input_snippet_t *after = NULL;
+  for (int j = 0; j < track->snippet_count; ++j) {
+    if (snippet_is_playback(&track->snippets[j])) continue;
+    if (track->snippets[j].is_active && track->snippets[j].end_tick == tick) before = &track->snippets[j];
+    if (track->snippets[j].is_active && track->snippets[j].start_tick == tick + 1) after = &track->snippets[j];
+  }
+
+  if (before && after && input_effect_stack_mergeable(before->effects, before->effect_count, after->effects, after->effect_count)) {
+    int old_before_duration = before->input_count;
+    int after_duration = after->input_count;
+    // Swallowing `after` into `before` rewrites both buffers, so read the window before resizing.
+    input_record_t *after_window = snippet_window(after);
+    model_resize_snippet_inputs(ts, before, old_before_duration + 1 + after_duration);
+    before->inputs[old_before_duration] = *input;
+    memcpy(&before->inputs[old_before_duration + 1], after_window, sizeof(input_record_t) * after_duration);
+    // The fused snippet keeps whichever stack the two sides agreed on.
+    if (before->effect_count == 0 && after->effect_count > 0)
+      input_effects_snippet_set_stack(before, after->effects, after->effect_count);
+    model_remove_snippet_from_track(ts, track, after->id);
+    model_compact_layers_for_track(track);
+  } else if (before) {
+    model_resize_snippet_inputs(ts, before, before->input_count + 1);
+    before->inputs[before->input_count - 1] = *input;
+  } else if (after) {
+    // Recording into the tick before a snippet just widens its window by one.
+    if (model_trim_snippet(ts, after, after->start_tick - 1, after->end_tick)) {
+      snippet_window(after)[0] = *input;
+    }
+  } else {
+    input_snippet_t new_snippet = {0};
+    new_snippet.id = ts->next_snippet_id++;
+    new_snippet.start_tick = tick;
+    new_snippet.end_tick = tick + 1;
+    new_snippet.is_active = true;
+    new_snippet.input_count = 1;
+    new_snippet.inputs = calloc(1, sizeof(input_record_t));
+    new_snippet.inputs[0] = *input;
+    new_snippet.layer = model_find_available_layer(track, tick, tick + 1, -1);
+    if (new_snippet.layer == -1) new_snippet.layer = 0;
+    model_insert_snippet_into_track(track, &new_snippet);
+    model_compact_layers_for_track(track);
+  }
+}
+
+void model_clear_all_recording_buffers(timeline_state_t *ts) {
+  for (int i = 0; i < ts->player_track_count; ++i) {
+    player_track_t *track = &ts->player_tracks[i];
+    for (int j = 0; j < track->recording_snippet_count; ++j) {
+      model_free_snippet_inputs(&track->recording_snippets[j]);
+    }
+    free(track->recording_snippets);
+    track->recording_snippets = NULL;
+    track->recording_snippet_count = 0;
+    track->recording_snippet_capacity = 0;
+  }
+}
+
+// Physics & Playback
+
+void model_invalidate_group_physics(timeline_state_t *ts, int group_index, int tick) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+  game_host_t *host = model_host(ts);
+  if (!host) return;
+  timeline_group_t *group = ts->groups[group_index];
+  physics_changed(group);
+  tick = imax(0, tick);
+  audio_track_invalidate(group->audio, tick + 1);
+  if (group->audio_world_tick > tick) group->audio_world_tick = -1;
+  // Input at tick T first changes world T+1. Preserve the snapshot at T.
+  const uint32_t keep = (uint32_t)(tick / group->snapshot_step) + 1;
+  if (group->vec.current_size > keep) group->vec.current_size = keep;
+  if (tick == 0) {
+    snapshots_reset(group);
+    group->cached_tick = -1;
+    group->presentation_tick = -1;
+    group_start_world(ts, group_index, group->previous_world);
+    if (group->vec.data && group->vec.data[0]) gh_world_copy(host, group->vec.data[0], group->previous_world);
+  } else {
+    if (group->cached_tick > tick) group->cached_tick = -1;
+    if (group->presentation_tick > tick) group->presentation_tick = -1;
+    if (gh_world_tick(host, group->previous_world) > tick)
+      gh_world_copy(host, group->previous_world, group->vec.data[group->vec.current_size - 1]);
+  }
+}
+
+void model_reset_physics_cache(timeline_state_t *ts) {
+  if (!ts) return;
+  ts->current_tick = imax(ts->current_tick, model_get_min_global_tick(ts));
+  for (int i = 0; i < ts->group_count; ++i)
+    model_invalidate_group_physics(ts, i, 0);
+}
+
+int model_max_playback_speed(const timeline_state_t *ts) {
+  return game_ticks_per_second(&ts->ui->gfx_handler->game_host) * 10;
+}
+
+void model_recalc_group_physics(timeline_state_t *ts, int group_index, int tick) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+  input_effects_invalidate_group(ts, group_index);
+  // A demo's tick T is the state world T shows, which the step from T - 1 replays.
+  model_invalidate_group_physics(ts, group_index, tick - 1);
+}
+
+void model_recalc_snippet_physics(timeline_state_t *ts, const input_snippet_t *snippet, int tick) {
+  int track = -1;
+  if (snippet && model_find_snippet_by_id(ts, snippet->id, &track))
+    model_recalc_group_physics(ts, model_track_group_index(ts, track), tick);
+}
+
+void model_recalc_physics(timeline_state_t *ts, int tick) {
+  if (!ts) return;
+  ts->current_tick = imax(ts->current_tick, model_get_min_global_tick(ts));
+  for (int i = 0; i < ts->group_count; ++i)
+    model_recalc_group_physics(ts, i, tick);
+}
+
+// A track's input at a tick: from the takes being recorded (when `takes`),
+// then from its snippets, carrying the last one's state past its end. `authored`
+// reads the inputs as written, before input effects.
+static input_record_t track_input_at(const timeline_state_t *ts, int track_index, int tick, bool takes, bool authored) {
+  const player_track_t *track = &ts->player_tracks[track_index];
+  input_record_t blank;
+  engine_input_default(model_host(ts), &blank);
+  input_record_t last_valid_input = blank;
+  int last_input_tick = -1;
+
+  if (takes) {
+    // Newest first: going back over a take and recording this track again
+    // starts a second buffer on top of the first, and the commit applies them
+    // in order, so the later one is what stays.
+    for (int i = track->recording_snippet_count - 1; i >= 0; --i) {
+      const input_snippet_t *snippet = &track->recording_snippets[i];
+      if (snippet->is_active) {
+        const input_record_t *inputs = authored ? snippet_window(snippet) : input_effects_snippet_window(snippet);
+        if (tick >= snippet->start_tick && tick < snippet->end_tick) return inputs[tick - snippet->start_tick];
+        if (snippet->end_tick <= tick && snippet->end_tick - 1 > last_input_tick && snippet->input_count > 0) {
+          last_input_tick = snippet->end_tick - 1;
+          last_valid_input = inputs[snippet->input_count - 1];
+        }
+      }
+    }
+  }
+
+  for (int i = 0; i < track->snippet_count; ++i) {
+    const input_snippet_t *snippet = &track->snippets[i];
+    if (snippet->is_active && snippet_is_playback(snippet)) {
+      // Continue with the controls held at the last visible recording tick. A recording of
+      // states stops replaying one step earlier: the step from its final state is simulated.
+      // An overlapping input snippet still answers, since input takes over from a demo.
+      const int last_tick = snippet->end_tick - 1;
+      const int carry_tick = snippet->end_tick - recordings_ticks_are_states(ts, snippet->recording_id);
+      if (snippet->input_count > 0 && carry_tick <= tick && last_tick > last_input_tick) {
+        last_input_tick = snippet->end_tick - 1;
+        last_valid_input = blank;
+        int recording_tick;
+        if (recordings_snippet_tick(ts, snippet, last_tick, &recording_tick))
+          gh_recording_input(model_host(ts), recordings_handle(ts, snippet->recording_id), snippet->recording_player,
+                             recording_tick, last_valid_input.bytes);
+      }
+      continue;
+    }
+    if (snippet->is_active) {
+      const input_record_t *inputs = authored ? snippet_window(snippet) : input_effects_snippet_window(snippet);
+      if (tick >= snippet->start_tick && tick < snippet->end_tick) return inputs[tick - snippet->start_tick];
+      if (snippet->end_tick <= tick && snippet->end_tick - 1 > last_input_tick && snippet->input_count > 0) {
+        last_input_tick = snippet->end_tick - 1;
+        last_valid_input = inputs[snippet->input_count - 1];
+      }
+    }
+  }
+
+  if (last_input_tick != -1) {
+    // Stateful controls carry beyond the end of a snippet, but one-shot
+    // requests must only exist on the authored tick.
+    engine_input_reset_triggers(model_host(ts), &last_valid_input);
+    return last_valid_input;
+  }
+  return blank;
+}
+
+input_record_t model_get_input_at_tick(const timeline_state_t *ts, int track_index, int tick) {
+  if (!ts->recording && !ts->input_effects_rebuilding) input_effects_ensure((timeline_state_t *)ts);
+  return track_input_at(ts, track_index, tick, ts->recording, false);
+}
+
+input_record_t model_get_authored_input_at_tick(const timeline_state_t *ts, int track_index, int tick) {
+  return track_input_at(ts, track_index, tick, false, true);
+}
+
+input_record_t model_linked_input_at_tick(const timeline_state_t *ts, int track_index, int tick) {
+  const player_track_t *track = &ts->player_tracks[track_index];
+  input_record_t record = model_get_authored_input_at_tick(ts, track_index, tick);
+  engine_input_copy_fields(model_host(ts), &track->current_input, &record, track->linked_driven_fields);
+  return record;
+}
+
+// Whether any world, snapshot or sound of the group was simulated past local
+// `tick`, i.e. whether changing the input at `tick` leaves something stale.
+static bool group_has_worlds_after(timeline_state_t *ts, int group_index, int tick) {
+  if (group_index < 0 || group_index >= ts->group_count) return false;
+  const timeline_group_t *group = ts->groups[group_index];
+  return group->vec.current_size > (uint32_t)(imax(0, tick) / group->snapshot_step) + 1 || group->cached_tick > tick ||
+         group->presentation_tick > tick || group->audio_world_tick > tick ||
+         gh_world_tick(model_host(ts), group->previous_world) > tick;
+}
+
+void model_advance_tick(timeline_state_t *ts, int steps) {
+  ts->current_tick = imax(ts->current_tick + steps, model_get_min_global_tick(ts));
+
+  if (ts->recording) {
+    int group_tick = model_group_playhead_tick(ts, ts->active_group_index);
+    for (int i = 0; i < ts->player_track_count; ++i) {
+      player_track_t *track = &ts->player_tracks[i];
+      if (track->group_index != ts->active_group_index) continue;
+      if (i != ts->selected_player_track_index &&
+          (!game_has_cap(&ts->ui->gfx_handler->game_host, FT_CAP_LINKED_INPUTS) || !track->is_linked)) continue;
+      input_snippet_t *active_rec_snip = NULL;
+      if (track->recording_snippet_count > 0) active_rec_snip = &track->recording_snippets[track->recording_snippet_count - 1];
+      if (active_rec_snip) {
+        // Calculate where the current tick is relative to the start of the snippet
+        int relative_tick = group_tick - active_rec_snip->start_tick;
+
+        // ONLY append if we are past the end of the current recording snippet.
+        // DO NOT overwrite if we are rewinding/scrubbing inside the snippet.
+        if (relative_tick > active_rec_snip->input_count) {
+          int old_count = active_rec_snip->input_count;
+          int needed = relative_tick;
+          // The ticks from the old end on get new inputs. Anything simulated past
+          // it went by the inputs that were there before: a take recorded over,
+          // a trimmed tail, or a jump that moved the playhead ahead of the take.
+          const int first_changed = active_rec_snip->start_tick + old_count;
+          if (group_has_worlds_after(ts, track->group_index, first_changed))
+            model_invalidate_group_physics(ts, track->group_index, first_changed);
+          model_resize_snippet_inputs(ts, active_rec_snip, needed);
+
+          // Fill the first new tick with the current input, then consume any
+          // one-shot fields. This also keeps a lag frame that advances several
+          // ticks from turning one press into several trigger ticks. A linked
+          // tee only takes the fields its link drives; the rest of each tick
+          // keeps the input it already had there.
+          const bool controlled = i == ts->selected_player_track_index;
+          input_record_t sampled_input = track->current_input;
+          for (int s = old_count; s < needed; ++s) {
+            if (controlled) {
+              active_rec_snip->inputs[s] = sampled_input;
+            } else {
+              input_record_t merged = model_get_authored_input_at_tick(ts, i, active_rec_snip->start_tick + s);
+              engine_input_copy_fields(model_host(ts), &sampled_input, &merged, track->linked_driven_fields);
+              // On top of the take's previous tick, field by field: a field that counts
+              // edges (DDNet's fire) has to go on from the value the last tick left.
+              if (s > 0) {
+                input_record_t previous = active_rec_snip->inputs[s - 1];
+                const ft_input_schema *schema = game_input_schema(model_host(ts));
+                const uint64_t fields = !schema ? 0 : schema->field_count >= 64 ? ~UINT64_C(0) : (UINT64_C(1) << schema->field_count) - 1;
+                engine_input_copy_fields(model_host(ts), &merged, &previous, fields);
+                merged = previous;
+              }
+              active_rec_snip->inputs[s] = merged;
+            }
+            engine_input_reset_triggers(model_host(ts), &sampled_input);
+          }
+          track->current_input = sampled_input;
+        } else if (steps != 0) {
+          // The playhead moved without taking a tick (rewinding, or going over
+          // the take again): a one-shot press waiting for the next tick taken
+          // belongs to a moment that is gone, and would otherwise turn up
+          // wherever recording goes on, and in every prediction until then.
+          engine_input_reset_triggers(model_host(ts), &track->current_input);
+        }
+      }
+    }
+  }
+}
+
+void model_move_playhead(timeline_state_t *ts, int tick) {
+  if (ts->recording) model_advance_tick(ts, tick - ts->current_tick);
+  else ts->current_tick = tick;
+}
+
+void model_activate_snippet(timeline_state_t *ts, int track_index, int snippet_id_to_activate) {
+  if (track_index < 0 || track_index >= ts->player_track_count) return;
+
+  player_track_t *track = &ts->player_tracks[track_index];
+  input_snippet_t *target_snippet = model_find_snippet_in_track(track, snippet_id_to_activate);
+  if (!target_snippet || target_snippet->is_active) return;
+
+  for (int i = 0; i < track->snippet_count; ++i) {
+    input_snippet_t *other = &track->snippets[i];
+    if (other->id != snippet_id_to_activate && target_snippet->start_tick < other->end_tick && target_snippet->end_tick > other->start_tick) {
+      other->is_active = false;
+      model_recalc_group_physics(ts, track->group_index, other->start_tick);
+    }
+  }
+
+  target_snippet->is_active = true;
+  model_recalc_group_physics(ts, track->group_index, target_snippet->start_tick);
+}
+
+// Advances `world` to `target_tick`, feeding each player the input the timeline
+// holds for it. This is the whole of the engine's simulation: pick a starting
+// point, step, cache. What a step does is entirely the game's business.
+bool model_gather_step(timeline_state_t *ts, int group_index, int tick, int player_count, uint8_t *inputs,
+                       ft_player_playback *playback) {
+  game_host_t *host = model_host(ts);
+  const size_t input_size = game_input_size(host);
+  bool any_playback = false;
+  // The group's tracks are walked once, in player order: looking each
+  // player's track up would scan the tracks once per player, every tick.
+  int next_track = 0;
+  for (int p = 0; p < player_count; ++p) {
+    while (next_track < ts->player_track_count && ts->player_tracks[next_track].group_index != group_index) ++next_track;
+    const int track_index = next_track < ts->player_track_count ? next_track++ : -1;
+    input_record_t record;
+    if (track_index >= 0) record = model_get_input_at_tick(ts, track_index, tick);
+    else engine_input_default(host, &record);
+    // The ABI promises the game a tightly packed array using its own record
+    // size, not the editor's larger per-tick storage wrapper.
+    memcpy(inputs + (size_t)p * input_size, record.bytes, input_size);
+    if (playback) {
+      memset(&playback[p], 0, sizeof(playback[p]));
+      if (track_index >= 0 && recordings_playback_at_tick(ts, &ts->player_tracks[track_index], tick, &playback[p]))
+        any_playback = true;
+    }
+  }
+  return any_playback;
+}
+
+// The group's world at tick 0: the starting world, with the players a demo shows there put in
+// place, since no step reaches tick 0 to replay them.
+static void group_start_world(timeline_state_t *ts, int group_index, ft_world *world) {
+  game_host_t *host = model_host(ts);
+  gh_world_copy(host, world, ts->groups[group_index]->initial_world);
+  const int players = gh_world_player_count(host, world);
+  ft_player_playback *playback = NULL;
+  int next_track = 0;
+  for (int p = 0; p < players; ++p) {
+    while (next_track < ts->player_track_count && ts->player_tracks[next_track].group_index != group_index) ++next_track;
+    if (next_track >= ts->player_track_count) break;
+    ft_player_playback shown;
+    if (!recordings_start_playback(ts, &ts->player_tracks[next_track++], &shown)) continue;
+    if (!playback && !(playback = calloc((size_t)players, sizeof(*playback)))) return;
+    playback[p] = shown;
+  }
+  if (!playback) return;
+  gh_world_place_playback(host, world, playback, (unsigned)players);
+  free(playback);
+}
+
+// The snapshots fit a memory budget per group. When they fill it, the step
+// doubles and every other snapshot goes: a long timeline keeps sparser
+// snapshots rather than more of them, and seeking replays at most a step.
+#define SNAPSHOT_STEP 50
+#define SNAPSHOT_BUDGET ((size_t)1 << 30)
+#define SNAPSHOT_MIN 64u
+#define SNAPSHOT_MAX 4096u
+
+static void snapshots_reset(timeline_group_t *group) {
+  group->vec.current_size = 1;
+  group->snapshot_step = SNAPSHOT_STEP;
+}
+
+static uint32_t snapshot_capacity(timeline_state_t *ts) {
+  const size_t size = game_world_size(model_host(ts));
+  if (size == 0) return SNAPSHOT_MAX;
+  const size_t count = SNAPSHOT_BUDGET / size;
+  return count < SNAPSHOT_MIN ? SNAPSHOT_MIN : count > SNAPSHOT_MAX ? SNAPSHOT_MAX : (uint32_t)count;
+}
+
+// Keeps the even snapshots and doubles the step. The dropped worlds stay
+// allocated past current_size for the snapshots that follow.
+static void snapshots_thin(timeline_group_t *group) {
+  physics_v_t *v = &group->vec;
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < v->current_size; i += 2, ++kept) {
+    ft_world *dropped = v->data[kept];
+    v->data[kept] = v->data[i];
+    v->data[i] = dropped;
+  }
+  v->current_size = kept;
+  group->snapshot_step *= 2;
+}
+
+// Keeps a copy of `world` when its tick is one the snapshots are taken at.
+static void snapshots_store(timeline_state_t *ts, timeline_group_t *group, int group_index, const ft_world *world) {
+  game_host_t *host = model_host(ts);
+  const int tick = gh_world_tick(host, world);
+  if (tick % group->snapshot_step != 0) return;
+  // While recording, the inputs from the playhead on are not taken yet. A world
+  // past it (a camera path or an inspector looking ahead) would be kept with
+  // inputs the recording is about to replace, and seeking would resume from it.
+  if (ts->recording && group_index == ts->active_group_index && tick > model_group_playhead_tick(ts, group_index)) return;
+  uint32_t index = (uint32_t)(tick / group->snapshot_step);
+  if (index == group->vec.current_size && index >= snapshot_capacity(ts)) {
+    snapshots_thin(group);
+    if (tick % group->snapshot_step != 0) return;
+    index = (uint32_t)(tick / group->snapshot_step);
+  }
+  if (index < group->vec.current_size) gh_world_copy(host, group->vec.data[index], world);
+  else if (index == group->vec.current_size) v_push(ts, &group->vec, world, group_index);
+}
+
+// Simulation time since the playback budget last looked (model_playback_budget_frame).
+static double s_simulation_seconds;
+
+static void simulate_to(timeline_state_t *ts, int group_index, ft_world *world, int target_tick) {
+  const double started = glfwGetTime();
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+
+  const int player_count = gh_world_player_count(host, world);
+  const size_t input_size = game_input_size(host);
+  uint8_t *inputs = player_count > 0 ? calloc((size_t)player_count, input_size) : NULL;
+  ft_player_playback *playback = player_count > 0 ? calloc((size_t)player_count, sizeof(*playback)) : NULL;
+
+  // Steps that are heard say what they sounded like; the rest only get
+  // somewhere (and a game may skip making their sound).
+  const bool capture_audio = audio_heard() && game_has_audio(host);
+  const double ticks_per_second = game_ticks_per_second(host);
+
+  while (gh_world_tick(host, world) < target_tick) {
+    const int current_sim_tick = gh_world_tick(host, world);
+    const bool replaying = model_gather_step(ts, group_index, current_sim_tick, player_count, inputs, playback);
+    gh_world_step_playback(host, world, inputs, replaying ? playback : NULL, (unsigned)player_count);
+    snapshots_store(ts, group, group_index, world);
+    if (capture_audio) {
+      ft_audio_step step;
+      const bool sounded = gh_world_audio(host, world, &step);
+      audio_track_capture(&group->audio, current_sim_tick + 1, sounded ? &step : NULL, ticks_per_second);
+    }
+  }
+
+  free(playback);
+  free(inputs);
+  s_simulation_seconds += glfwGetTime() - started;
+}
+
+// How long the simulation may take per frame while playing: a 60 fps frame is
+// 16.7 ms, and the rest of it is left for drawing.
+#define PLAYBACK_SIMULATION_BUDGET (1.0 / 100.0)
+
+static double s_seconds_per_tick; // simulation time per tick played, smoothed
+static int s_budget_last_tick = INT_MIN;
+
+void model_playback_budget_frame(timeline_state_t *ts, bool playing) {
+  const int moved = s_budget_last_tick == INT_MIN ? 0 : abs(ts->current_tick - s_budget_last_tick);
+  if (playing && moved > 0) {
+    const double cost = s_simulation_seconds / moved;
+    s_seconds_per_tick = s_seconds_per_tick > 0.0 ? s_seconds_per_tick * 0.75 + cost * 0.25 : cost;
+  }
+  s_simulation_seconds = 0.0;
+  s_budget_last_tick = ts->current_tick;
+}
+
+int model_playback_affordable_ticks(void) {
+  if (s_seconds_per_tick <= 0.0) return INT_MAX;
+  const double ticks = PLAYBACK_SIMULATION_BUDGET / s_seconds_per_tick;
+  return ticks >= (double)INT_MAX ? INT_MAX : imax(1, (int)ticks);
+}
+
+// Picks the cheapest starting point for reaching `tick`: the cached world when
+// it is already there, the nearest periodic snapshot when jumping or rewinding,
+// and otherwise wherever the last request left off.
+static void seed_world(timeline_state_t *ts, int group_index, ft_world *out_world, int tick) {
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+  const int step = group->snapshot_step;
+  const int previous_tick = gh_world_tick(host, group->previous_world);
+
+  if (tick < previous_tick || (tick - previous_tick) > 2 * step) {
+    int base_index = (tick - 1) / step;
+    // Visible particles are not part of physics snapshots. Replaying one more
+    // snapshot reconstructs the recent short-lived effects around a jump, as
+    // the pre-game-module timeline did. Read-only scans do not need this work.
+    if (engine_api_presentation_effects_enabled() && base_index > 0) --base_index;
+    if (base_index > (int)group->vec.current_size - 1) base_index = (int)group->vec.current_size - 1;
+    if (base_index < 0) base_index = 0;
+    gh_world_copy(host, out_world, group->vec.data[base_index]);
+  } else {
+    gh_world_copy(host, out_world, group->previous_world);
+  }
+}
+
+// The viewport's world one step on, as playback takes it: the step makes the
+// presentation (particles, sound) the viewport shows.
+static void presentation_step(timeline_state_t *ts, int group_index, int local_tick) {
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+  // The world the viewport follows is heard as it steps.
+  const bool previous_heard = audio_set_heard(render_group_volume(ts->ui, group_index) > 0.f);
+  ts->simulation_group_index = group_index;
+  gh_world_copy(host, group->prev_world_cached, group->world_cached);
+  simulate_to(ts, group_index, group->world_cached, local_tick);
+  gh_world_copy(host, group->previous_world, group->world_cached);
+  group->cached_tick = local_tick;
+  group->presentation_tick = local_tick;
+  audio_set_heard(previous_heard);
+}
+
+const ft_world *model_group_world_at_tick(timeline_state_t *ts, int group_index, int tick) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return NULL;
+  /* Rebuild effects before seeding a simulation world. Rebuilding may ask the
+   * timeline for reference worlds and reset its caches; doing that lazily from
+   * model_get_input_at_tick would overwrite a simulation already in progress. */
+  if (!ts->recording && !ts->input_effects_rebuilding) input_effects_ensure(ts);
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+  tick = imax(0, tick - group->start_offset);
+  ts->simulation_group_index = group_index;
+
+  if (group->cached_tick == tick) return group->world_cached;
+  // The tick after the one the viewport shows (playback moved on and the
+  // editor asks before the viewport does): take the step as the viewport
+  // will, rather than one without its presentation that it would have to
+  // simulate again from a snapshot.
+  if (tick > 0 && group->cached_tick == tick - 1 && group->presentation_tick == tick - 1 &&
+      engine_api_presentation_effects_enabled()) {
+    presentation_step(ts, group_index, tick);
+    return group->world_cached;
+  }
+
+  // A single-world lookup is observational. Camera/rendering use the adjacent
+  // pair API below; inspectors, plugins and input effects must not fill or
+  // rewind game-owned particle state while asking a physics question.
+  const bool previous_effects = engine_api_set_presentation_effects(false);
+  seed_world(ts, group_index, group->world_cached, tick);
+  simulate_to(ts, group_index, group->world_cached, tick);
+  engine_api_set_presentation_effects(previous_effects);
+  gh_world_copy(host, group->previous_world, group->world_cached);
+  group->cached_tick = tick;
+  return group->world_cached;
+}
+
+void model_group_world_pair(timeline_state_t *ts, int group_index, int tick, const ft_world **out_prev, const ft_world **out_cur) {
+  if (out_prev) *out_prev = NULL;
+  if (out_cur) *out_cur = NULL;
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+
+  /* See model_group_world_at_tick: effects must never rebuild from inside the
+   * simulation that is consuming their output. */
+  if (!ts->recording && !ts->input_effects_rebuilding) input_effects_ensure(ts);
+
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+  const int local_tick = imax(0, tick - group->start_offset);
+  const bool presentation_enabled = engine_api_presentation_effects_enabled();
+
+  if (local_tick <= 0) {
+    const ft_world *world = model_group_world_at_tick(ts, group_index, tick);
+    if (presentation_enabled) group->presentation_tick = 0;
+    if (out_prev) *out_prev = world;
+    if (out_cur) *out_cur = world;
+    return;
+  }
+
+  // The worlds drawn are heard as they step.
+  const bool previous_heard = audio_set_heard(presentation_enabled && render_group_volume(ts->ui, group_index) > 0.f);
+  if (group->cached_tick == local_tick - 1 &&
+      (!presentation_enabled || group->presentation_tick == local_tick - 1)) {
+    // Fast path for sequential forward playback: the current world becomes previous,
+    // and we only simulate the 1 single new tick!
+    if (presentation_enabled) {
+      presentation_step(ts, group_index, local_tick);
+    } else {
+      ts->simulation_group_index = group_index;
+      gh_world_copy(host, group->prev_world_cached, group->world_cached);
+      simulate_to(ts, group_index, group->world_cached, local_tick);
+      gh_world_copy(host, group->previous_world, group->world_cached);
+      group->cached_tick = local_tick;
+    }
+  } else if (group->cached_tick != local_tick ||
+             (presentation_enabled && group->presentation_tick != local_tick) ||
+             gh_world_tick(host, group->prev_world_cached) != local_tick - 1) {
+    // Reach the tick before the wanted one first, keep it, then take the last
+    // step. That gives both worlds for interpolation from one simulation run.
+    ts->simulation_group_index = group_index;
+    seed_world(ts, group_index, group->world_cached, local_tick - 1);
+    simulate_to(ts, group_index, group->world_cached, local_tick - 1);
+    gh_world_copy(host, group->prev_world_cached, group->world_cached);
+    simulate_to(ts, group_index, group->world_cached, local_tick);
+    gh_world_copy(host, group->previous_world, group->world_cached);
+    group->cached_tick = local_tick;
+    if (presentation_enabled) group->presentation_tick = local_tick;
+  }
+  audio_set_heard(previous_heard);
+
+  if (out_prev) *out_prev = group->prev_world_cached;
+  if (out_cur) *out_cur = group->world_cached;
+}
+
+void model_group_audio_cover(timeline_state_t *ts, int group_index, int first, int last) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count || last < 1) return;
+  game_host_t *host = model_host(ts);
+  if (!audio_enabled() || !game_has_audio(host)) return;
+  timeline_group_t *group = ts->groups[group_index];
+  const int missing = audio_track_first_missing(group->audio, first < 1 ? 1 : first, last);
+  if (missing < 0) return;
+  if (!ts->recording && !ts->input_effects_rebuilding) input_effects_ensure(ts);
+
+  // The ahead world goes on from where it is when that is near; otherwise from
+  // the snapshot before the first tick missing.
+  const int from = missing - 1;
+  const int step = group->snapshot_step;
+  if (group->audio_world_tick < 0 || group->audio_world_tick > from || from - group->audio_world_tick > 2 * step) {
+    int index = from / step;
+    if (index > (int)group->vec.current_size - 1) index = (int)group->vec.current_size - 1;
+    if (index < 0) index = 0;
+    gh_world_copy(host, group->audio_world, group->vec.data[index]);
+  }
+  ts->simulation_group_index = group_index;
+  const bool previous_effects = engine_api_set_presentation_effects(false);
+  const bool previous_heard = audio_set_heard(true);
+  simulate_to(ts, group_index, group->audio_world, last);
+  audio_set_heard(previous_heard);
+  engine_api_set_presentation_effects(previous_effects);
+  group->audio_world_tick = gh_world_tick(host, group->audio_world);
+}
+
+const ft_world *model_world_at_tick(timeline_state_t *ts, int tick) {
+  return model_group_world_at_tick(ts, ts->active_group_index, tick);
+}
+
+void model_apply_starting_config(timeline_state_t *ts, int track_index) {
+  if (track_index < 0 || track_index >= ts->player_track_count) return;
+
+  game_host_t *host = model_host(ts);
+  player_track_t *track = &ts->player_tracks[track_index];
+  starting_config_t *sc = &track->starting_config;
+  const int group_index = model_track_group_index(ts, track_index);
+  const int local_index = model_group_local_track_index(ts, track_index);
+  if (group_index < 0 || local_index < 0) return;
+
+  ft_world *world = ts->groups[group_index]->initial_world;
+  if (local_index >= gh_world_player_count(host, world)) return;
+  if (!sc->enabled) return;
+
+  // Each override names a property the game published. The engine never has to
+  // know what any of them mean. They are written in the order the game lists
+  // its properties, not the order they were turned on in, so that a game can
+  // put one that others depend on first (DDNet's team before its switches).
+  const ft_entity_class *player_class = gh_entity_class(host, FT_ENTITY_CLASS_PLAYER);
+  const uint32_t prop_count = player_class ? player_class->prop_count : 0;
+  for (uint32_t prop = 0; prop < prop_count; ++prop) {
+    const char *id = player_class->props[prop].id;
+    for (int i = 0; id && i < sc->override_count; ++i) {
+      if (strcmp(sc->overrides[i].prop_id, id) != 0) continue;
+      gh_entity_prop_set(host, world, FT_ENTITY_CLASS_PLAYER, local_index, prop, &sc->overrides[i].value);
+      break;
+    }
+  }
+  model_recalc_group_physics(ts, group_index, 0);
+}
+
+// Puts a group's starting world back the way the level made it, then re-applies
+// whatever overrides are still enabled on its tracks.
+//
+// Overrides are written straight into the starting world, so turning one off
+// cannot simply "unset" it: the only thing that knows what the level said is
+// the level. Rebuilding from it and re-applying the rest is what restores a
+// pristine start.
+void model_rebuild_group_start(timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return;
+  game_host_t *host = model_host(ts);
+  const ft_level *level = ts->ui->gfx_handler->level;
+  if (!level) return;
+
+  timeline_group_t *group = ts->groups[group_index];
+  ft_world *pristine = gh_world_create(host, level, 0, group_index);
+  if (!pristine) return;
+
+  const int tracks = model_group_track_count(ts, group_index);
+  for (int p = gh_world_player_count(host, pristine); p < tracks; ++p)
+    gh_world_add_player(host, pristine, -1, NULL);
+  while (gh_world_player_count(host, pristine) > tracks)
+    gh_world_remove_player(host, pristine, gh_world_player_count(host, pristine) - 1);
+
+  gh_world_copy(host, group->initial_world, pristine);
+  gh_world_destroy(host, pristine);
+
+  for (int track_index = 0; track_index < ts->player_track_count; ++track_index) {
+    if (ts->player_tracks[track_index].group_index != group_index) continue;
+    if (ts->player_tracks[track_index].starting_config.enabled) model_apply_starting_config(ts, track_index);
+  }
+  model_recalc_group_physics(ts, group_index, 0);
+}
+
+void model_rebind_starting_strings(starting_config_t *config) {
+  if (!config) return;
+  int count = config->override_count;
+  if (count < 0) count = 0;
+  if (count > MAX_STARTING_OVERRIDES) count = MAX_STARTING_OVERRIDES;
+  for (int i = 0; i < count; ++i) {
+    starting_override_t *override = &config->overrides[i];
+    if (override->value.kind == FT_VALUE_STRING)
+      override->value.as.s = override->string_value;
+  }
+}
+
+player_track_t *model_clone_track_to_group(timeline_state_t *ts, int track_index, int group_index, int *out_track_index) {
+  if (!ts || track_index < 0 || track_index >= ts->player_track_count || group_index < 0 || group_index >= ts->group_count) return NULL;
+
+  const player_track_t *source = &ts->player_tracks[track_index];
+  player_track_t copy = *source;
+  model_rebind_starting_strings(&copy.starting_config);
+  copy.snippets = NULL;
+  copy.snippet_capacity = source->snippet_count;
+  copy.recording_snippets = NULL;
+  copy.recording_snippet_count = 0;
+  copy.recording_snippet_capacity = 0;
+  if (source->snippet_count > 0) {
+    copy.snippets = calloc((size_t)source->snippet_count, sizeof(input_snippet_t));
+    if (!copy.snippets) return NULL;
+    for (int i = 0; i < source->snippet_count; ++i) {
+      model_snippet_clone(&copy.snippets[i], &source->snippets[i]);
+      copy.snippets[i].id = ts->next_snippet_id++;
+    }
+  }
+  copy.group_index = group_index;
+  snprintf(copy.name, sizeof(copy.name), "%.*s copy", (int)sizeof(copy.name) - 6,
+           source->name[0] ? source->name : "Track");
+
+  int old_active = ts->active_group_index;
+  ts->active_group_index = group_index;
+  player_track_t *new_track = model_add_new_track(ts, 1);
+  ts->active_group_index = old_active;
+  if (!new_track) {
+    for (int i = 0; i < copy.snippet_count; ++i)
+      model_free_snippet_inputs(&copy.snippets[i]);
+    free(copy.snippets);
+    return NULL;
+  }
+
+  int new_index = (int)(new_track - ts->player_tracks);
+  // model_add_new_track created the corresponding character and a pointer-free default row.
+  copy.uid = new_track->uid;
+  *new_track = copy;
+  model_rebind_starting_strings(&new_track->starting_config);
+  if (out_track_index) *out_track_index = new_index;
+  if (copy.starting_config.enabled) model_apply_starting_config(ts, new_index);
+  model_recalc_group_physics(ts, group_index, 0);
+  return new_track;
+}
+
+bool model_remove_group(timeline_state_t *ts, int group_index) {
+  if (!ts || ts->recording || ts->group_count <= 1 || group_index < 0 || group_index >= ts->group_count) return false;
+
+  for (int i = ts->player_track_count - 1; i >= 0; --i) {
+    if (ts->player_tracks[i].group_index == group_index) model_remove_track_logic(ts, i);
+  }
+
+  group_runtime_cleanup(ts, ts->groups[group_index]);
+  free(ts->groups[group_index]);
+  memmove(&ts->groups[group_index], &ts->groups[group_index + 1],
+          sizeof(*ts->groups) * (size_t)(ts->group_count - group_index - 1));
+  ts->group_count--;
+  ts->groups = realloc(ts->groups, sizeof(*ts->groups) * (size_t)ts->group_count);
+  for (int i = group_index; i < ts->group_count; ++i)
+    group_runtime_move(ts, ts->groups[i], i);
+
+  for (int i = 0; i < ts->player_track_count; ++i)
+    if (ts->player_tracks[i].group_index > group_index) ts->player_tracks[i].group_index--;
+  for (int i = 0; i < ts->event_count;) {
+    if (ts->events[i].group_index == group_index) {
+      memmove(&ts->events[i], &ts->events[i + 1], sizeof(timeline_event_t) * (size_t)(ts->event_count - i - 1));
+      ts->event_count--;
+      continue;
+    }
+    if (ts->events[i].group_index > group_index) ts->events[i].group_index--;
+    ++i;
+  }
+  ++ts->event_revision;
+
+  if (ts->active_group_index == group_index) ts->active_group_index = 0;
+  else if (ts->active_group_index > group_index) ts->active_group_index--;
+  // (the selected track stays in the active group, see model_set_active_group)
+  if (ts->selected_player_track_index >= 0) ts->active_group_index = model_track_group_index(ts, ts->selected_player_track_index);
+  if (group_index == 0 && ts->group_count > 0) ts->groups[0]->start_offset = 0;
+  // The other groups' worlds are what they were.
+  ts->current_tick = imax(ts->current_tick, model_get_min_global_tick(ts));
+  return true;
+}
+
+static int model_find_group_race_start(timeline_state_t *ts, int group_index) {
+  if (!ts || group_index < 0 || group_index >= ts->group_count) return -1;
+
+  game_host_t *host = model_host(ts);
+  const int tps = game_ticks_per_second(host);
+
+  // Simulate far enough past the last authored input to catch a start that only
+  // happens once the run gets going.
+  int max_local_tick = tps * 10;
+  for (int track_index = 0; track_index < ts->player_track_count; ++track_index) {
+    if (ts->player_tracks[track_index].group_index != group_index) continue;
+    const player_track_t *track = &ts->player_tracks[track_index];
+    for (int snippet_index = 0; snippet_index < track->snippet_count; ++snippet_index)
+      max_local_tick = imax(max_local_tick, track->snippets[snippet_index].end_tick + tps * 10);
+  }
+
+  // Index -1 marks a scratch world: it is simulated to answer a question, not
+  // shown, so a game must not raise effects into a visible world's state.
+  ft_world *world = gh_world_create(host, ts->ui->gfx_handler->level, 0, -1);
+  if (!world) return -1;
+  group_start_world(ts, group_index, world);
+
+  const int players = gh_world_player_count(host, world);
+  const size_t input_size = game_input_size(host);
+  uint8_t *inputs = players > 0 ? calloc((size_t)players, input_size) : NULL;
+  ft_player_playback *playback = players > 0 ? calloc((size_t)players, sizeof(*playback)) : NULL;
+  int race_start = -1;
+
+  while (gh_world_tick(host, world) <= max_local_tick) {
+    for (int local_index = 0; local_index < players; ++local_index) {
+      ft_player_view view;
+      if (!gh_world_player_view(host, world, local_index, &view)) continue;
+      // run_start_tick is the game-agnostic notion the editor aligns on.
+      if (view.run_start_tick >= 0 && (race_start < 0 || view.run_start_tick > race_start)) race_start = view.run_start_tick;
+    }
+    if (gh_world_tick(host, world) == max_local_tick) break;
+
+    const int input_tick = gh_world_tick(host, world);
+    const bool replaying = model_gather_step(ts, group_index, input_tick, players, inputs, playback);
+    gh_world_step_playback(host, world, inputs, replaying ? playback : NULL, (unsigned)players);
+  }
+
+  free(playback);
+  free(inputs);
+  gh_world_destroy(host, world);
+  return race_start;
+}
+
+void model_align_group_starts(timeline_state_t *ts) {
+  if (!ts || ts->group_count < 2) return;
+  int *starts = malloc(sizeof(int) * (size_t)ts->group_count);
+  if (!starts) return;
+
+  // Simulate fresh worlds rather than consulting the viewport caches. This makes alignment work
+  // after edits, imports, and rewinds even when a group's cached world predates the race start.
+  for (int group_index = 0; group_index < ts->group_count; ++group_index)
+    starts[group_index] = model_find_group_race_start(ts, group_index);
+
+  // Group 1 owns the controlled playhead, so its race start is the natural alignment anchor.
+  // Signed offsets are required when another group reaches the start line later than Group 1.
+  int anchor_group = starts[0] >= 0 ? 0 : -1;
+  for (int group_index = 1; anchor_group < 0 && group_index < ts->group_count; ++group_index)
+    if (starts[group_index] >= 0) anchor_group = group_index;
+
+  if (anchor_group >= 0) {
+    int anchor_tick = starts[anchor_group] + (anchor_group == 0 ? 0 : ts->groups[anchor_group]->start_offset);
+    for (int group_index = 1; group_index < ts->group_count; ++group_index) {
+      if (starts[group_index] >= 0)
+        ts->groups[group_index]->start_offset = anchor_tick - starts[group_index];
+    }
+    ts->groups[0]->start_offset = 0;
+    ts->current_tick = imax(ts->current_tick, model_get_min_global_tick(ts));
+  }
+  free(starts);
+}
+
+// Static Physics Vector Helpers
+static void v_init(timeline_state_t *ts, physics_v_t *t, int world_index) {
+  t->current_size = 1;
+  t->max_size = 1;
+  t->data = calloc(1, sizeof(ft_world *));
+  if (t->data) t->data[0] = gh_world_create(model_host(ts), ts->ui->gfx_handler->level, 0, world_index);
+}
+
+static void v_destroy(timeline_state_t *ts, physics_v_t *t) {
+  game_host_t *host = model_host(ts);
+  for (uint32_t i = 0; i < t->max_size; ++i)
+    gh_world_destroy(host, t->data[i]);
+  free(t->data);
+  t->data = NULL;
+  t->current_size = 0;
+  t->max_size = 0;
+}
+
+// Worlds are handles now, so growing the ring no longer has to repair any
+// interior pointers: nothing moves when the array of pointers is reallocated.
+// A slot gets its world when first used: a world can be several megabytes.
+static void v_push(timeline_state_t *ts, physics_v_t *t, const ft_world *world, int world_index) {
+  game_host_t *host = model_host(ts);
+  if (t->current_size == t->max_size) {
+    const uint32_t max_size = t->max_size * 2;
+    ft_world **new_data = realloc(t->data, max_size * sizeof(ft_world *));
+    if (!new_data) return;
+    memset(new_data + t->max_size, 0, (max_size - t->max_size) * sizeof(ft_world *));
+    t->data = new_data;
+    t->max_size = max_size;
+  }
+  ft_world **slot = &t->data[t->current_size];
+  if (!*slot && !(*slot = gh_world_create(host, ts->ui->gfx_handler->level, 0, world_index))) return;
+  gh_world_copy(host, *slot, world);
+  ++t->current_size;
+}
+
+int model_find_player_prop(game_host_t *host, const char *prop_id) {
+  const ft_entity_class *player_class = gh_entity_class(host, FT_ENTITY_CLASS_PLAYER);
+  if (!player_class || !prop_id) return -1;
+  for (uint32_t i = 0; i < player_class->prop_count; ++i) {
+    if (player_class->props[i].id && strcmp(player_class->props[i].id, prop_id) == 0) return (int)i;
+  }
+  return -1;
+}
+
+bool model_player_position(timeline_state_t *ts, const ft_world *world, int local_player, float out[3]) {
+  game_host_t *host = model_host(ts);
+  out[0] = out[1] = out[2] = 0.f;
+  if (!world) return false;
+  if (game_is_3d(host)) {
+    ft_value value;
+    if (!gh_entity_prop_get(host, world, FT_ENTITY_CLASS_PLAYER, local_player, 0, &value) || value.kind != FT_VALUE_VEC3)
+      return false;
+    out[0] = value.as.v3.x;
+    out[1] = value.as.v3.y;
+    out[2] = value.as.v3.z;
+    return true;
+  }
+  ft_player_view view = {.struct_size = sizeof(view)};
+  if (!gh_world_player_view(host, world, local_player, &view)) return false;
+  out[0] = view.position.x;
+  out[1] = view.position.y;
+  return true;
+}
+
+struct model_position_sampler_t {
+  int track_index, group_index, local_player;
+  int next_tick; // global
+  ft_world *world;
+};
+
+model_position_sampler_t *model_position_sampler_create(timeline_state_t *ts, int track_index, int first_tick) {
+  const int group_index = model_track_group_index(ts, track_index);
+  if (group_index < 0 || !ts->ui->gfx_handler->level) return NULL;
+  game_host_t *host = model_host(ts);
+  timeline_group_t *group = ts->groups[group_index];
+  model_position_sampler_t *sampler = calloc(1, sizeof(*sampler));
+  if (!sampler) return NULL;
+  sampler->track_index = track_index;
+  sampler->group_index = group_index;
+  sampler->local_player = model_group_local_track_index(ts, track_index);
+  sampler->next_tick = first_tick;
+  sampler->world = gh_world_create(host, ts->ui->gfx_handler->level, gh_world_player_count(host, group->initial_world), -1);
+  if (!sampler->world) {
+    free(sampler);
+    return NULL;
+  }
+  // Start from the nearest snapshot at or before the first tick.
+  int base = imax(0, first_tick - group->start_offset) / group->snapshot_step;
+  if (base > (int)group->vec.current_size - 1) base = (int)group->vec.current_size - 1;
+  gh_world_copy(host, sampler->world, group->vec.data[imax(0, base)]);
+  return sampler;
+}
+
+int model_position_sampler_step(timeline_state_t *ts, model_position_sampler_t *sampler, int count, float (*out)[3]) {
+  if (!sampler) return 0;
+  // As for any simulation: effects rebuild first, never from inside the steps.
+  if (!ts->recording && !ts->input_effects_rebuilding) input_effects_ensure(ts);
+  timeline_group_t *group = ts->groups[sampler->group_index];
+  const bool effects = engine_api_set_presentation_effects(false);
+  const int previous_group = ts->simulation_group_index;
+  ts->simulation_group_index = sampler->group_index;
+  int written = 0;
+  for (; written < count; ++written) {
+    const int local = imax(0, sampler->next_tick - group->start_offset);
+    simulate_to(ts, sampler->group_index, sampler->world, local);
+    if (!model_player_position(ts, sampler->world, sampler->local_player, out[written])) break;
+    ++sampler->next_tick;
+  }
+  ts->simulation_group_index = previous_group;
+  engine_api_set_presentation_effects(effects);
+  return written;
+}
+
+void model_position_sampler_destroy(timeline_state_t *ts, model_position_sampler_t *sampler) {
+  if (!sampler) return;
+  gh_world_destroy(model_host(ts), sampler->world);
+  free(sampler);
+}

@@ -1,0 +1,280 @@
+#ifndef ENGINE_GAME_HOST_H
+#define ENGINE_GAME_HOST_H
+
+// The engine's side of the game module ABI.
+//
+// The host discovers module metadata and owns one running game. The splash
+// selection and its lightweight browser have independent state: browsing never
+// calls a game's constructor or changes the running game's ruleset.
+
+#include <frametee/game_abi.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define GAME_HOST_MAX_PATH 1024
+
+typedef struct game_module_slot_t {
+  char path[GAME_HOST_MAX_PATH];
+  void *handle;                 // shared library handle, NULL for builtins
+  const ft_game_module *module; // valid while the library stays loaded
+  char id[FT_ID_MAX];
+  char display_name[FT_NAME_MAX];
+  char error[512]; // why the module was rejected, empty when usable
+  bool usable;
+} game_module_slot_t;
+
+typedef struct game_host_t {
+  game_module_slot_t *slots;
+  int count;
+  int capacity;
+
+  int active; // index into slots, -1 when no game is active
+  const ft_game_module *module;
+  ft_game *instance;
+  // Counts the instances created, so something kept for one (a file dialog's
+  // answer) can tell it from a later one at the same address.
+  uint32_t instance_serial;
+  const ft_engine_api *engine_api;
+
+  int browsed; // selected slot, -1 when no game is selected on the splash
+  char browsed_variant_id[FT_ID_MAX];
+  int browser_index; // owner of browser_context, retired at a frame boundary
+  void *browser_context;
+  int calling_index; // ambient API identity during browser callbacks, else -1
+
+  char directory[GAME_HOST_MAX_PATH];
+  char variant_id[FT_ID_MAX];
+  // Id of the active game, or "" when none. Held in the host rather than read
+  // out of the module so callers can keep a pointer to it across activations
+  // and unloads.
+  char active_id[FT_ID_MAX];
+} game_host_t;
+
+// Lifecycle ------------------------------------------------------------------
+
+void game_host_init(game_host_t *host, const ft_engine_api *engine_api);
+// Scans `directory` for shared libraries and records every module that passes
+// the handshake. Rejected libraries are kept in the list with an error string
+// so the UI can explain the problem instead of silently ignoring them.
+int game_host_discover(game_host_t *host, const char *directory);
+bool game_host_activate_index(game_host_t *host, int index);
+void game_host_deactivate(game_host_t *host);
+void game_host_shutdown(game_host_t *host);
+
+// Browsing only selects module metadata and a ruleset. It never creates a game.
+bool game_host_browse(game_host_t *host, int index);
+void game_host_browse_clear(game_host_t *host);
+// Retire a deselected browser before the next frame draws, or at shutdown.
+void game_host_browser_sync(game_host_t *host);
+int game_host_browsed_index(const game_host_t *host);
+const ft_game_module *game_host_browsed_module(const game_host_t *host);
+const char *game_host_browsed_variant(const game_host_t *host);
+void game_host_browsed_set_variant(game_host_t *host, const char *variant_id);
+
+int game_host_find_id(const game_host_t *host, const char *id);
+// Whether modules `a` and `b` are backends of one game (ft_game_info::backend_of): one is a backend of
+// the other, or both are of the same third one. A project moves between them, and a game's start screen
+// opens levels with them. A module is one of its own.
+bool game_host_same_game(const game_host_t *host, int a, int b);
+static inline bool game_host_ready(const game_host_t *host) { return host && host->instance != NULL; }
+const char *game_host_active_id(const game_host_t *host);
+// The id the active game's preferences are kept under (its settings, key bindings, camera mode, panels):
+// for a backend of another game (ft_game_info::backend_of) that game's, so that all its backends share
+// them; else its own.
+const char *game_host_settings_id(const game_host_t *host);
+// The game an ambient service is answering for. That is the active game,
+// except while the host is inside a call to a browsed one: a game being looked
+// at resolves its own data and cache directories rather than borrowing those
+// of whatever happens to be open.
+const char *game_host_calling_id(const game_host_t *host);
+const char *game_host_active_version(const game_host_t *host);
+// Prints every discovered module and what it allows, including the ones that
+// were rejected and why. Backs the --list-games command.
+void game_host_print_listing(const game_host_t *host);
+
+// Selects the ruleset used for worlds created from now on. Passing NULL or an
+// unknown id falls back to the module's first variant.
+void game_host_set_variant(game_host_t *host, const char *variant_id);
+const char *game_host_variant(const game_host_t *host);
+
+// Constraints ----------------------------------------------------------------
+//
+// All of these are safe to call with no game active; they then report the most
+// restrictive answer so the engine degrades to doing nothing rather than to
+// doing something invalid.
+
+bool game_has_cap(const game_host_t *host, uint32_t cap);
+int game_min_players(const game_host_t *host);
+int game_max_players(const game_host_t *host); // 0 means unbounded
+int game_clamp_player_count(const game_host_t *host, int count);
+bool game_can_add_player(const game_host_t *host, int current_count);
+bool game_can_remove_player(const game_host_t *host, int current_count);
+// True when the player count is pinned, e.g. a one-player-only game. The
+// engine hides its add/remove affordances entirely in that case.
+bool game_has_fixed_players(const game_host_t *host);
+int game_ticks_per_second(const game_host_t *host);
+// Whether the active game's world is a volume. Decides the viewport camera, the
+// projection the renderer builds and whether depth testing is on.
+bool game_is_3d(const game_host_t *host);
+// About how many bytes one world holds, or 0 when the game did not say.
+size_t game_world_size(const game_host_t *host);
+float game_units_per_tile(const game_host_t *host);
+// The near plane the game asks the engine's 3D views for, 0 for none.
+float game_camera_near_z(const game_host_t *host);
+float game_default_camera_height(const game_host_t *host);
+// What a 2D view at `zoom` shows in a picture of `aspect` (width over height), in world units: the game's
+// view at zoom 1 (ft_game_constraints.view_area) times the zoom.
+void game_view_size(const game_host_t *host, float aspect, float zoom, float *width, float *height);
+// The zoom that shows `width` world units across a picture of `aspect`.
+float game_zoom_for_width(const game_host_t *host, float aspect, float width);
+// A zoom as the game numbers it for people (ft_game_constraints.view_zoom_step), and back.
+float game_zoom_level(const game_host_t *host, float zoom);
+float game_zoom_from_level(const game_host_t *host, float level);
+
+const ft_input_schema *game_input_schema(const game_host_t *host);
+unsigned game_input_size(const game_host_t *host);
+unsigned game_input_align(const game_host_t *host);
+int game_input_field_index(const game_host_t *host, const char *field_id);
+
+// Call wrappers --------------------------------------------------------------
+//
+// Thin, null-safe forwards to the active module. Everything returns a benign
+// value when the feature is unavailable.
+
+ft_level *gh_level_load_path(game_host_t *host, const char *path);
+ft_level *gh_level_load_memory(game_host_t *host, const void *data, size_t size);
+void gh_level_destroy(game_host_t *host, ft_level *level);
+bool gh_level_info(game_host_t *host, const ft_level *level, ft_level_info *out);
+// Bytes that reload the level, or 0 when the game cannot provide them.
+size_t gh_level_serialize(game_host_t *host, const ft_level *level, void *out, size_t out_size);
+
+// `world_index` is the editor world this belongs to; every copy of it shares one.
+ft_world *gh_world_create(game_host_t *host, const ft_level *level, int player_count, int world_index);
+// The same with ft_world_flags, such as FT_WORLD_MARKS for a prediction's world.
+ft_world *gh_world_create_flags(game_host_t *host, const ft_level *level, int player_count, int world_index, uint32_t flags);
+void gh_world_destroy(game_host_t *host, ft_world *world);
+void gh_world_copy(game_host_t *host, ft_world *dst, const ft_world *src);
+void gh_world_step(game_host_t *host, ft_world *world, const void *inputs, unsigned player_count);
+// world_step with recorded players; `playback` NULL is a plain world_step.
+void gh_world_step_playback(game_host_t *host, ft_world *world, const void *inputs, const ft_player_playback *playback,
+                            unsigned player_count);
+// Puts recorded players in place without stepping (a starting world).
+void gh_world_place_playback(game_host_t *host, ft_world *world, const ft_player_playback *playback, unsigned player_count);
+int gh_world_tick(game_host_t *host, const ft_world *world);
+// Sound: whether the game reports any, the sound of a world's last step, and
+// how loud a positioned sound is in each ear (false: the game does not say).
+bool game_has_audio(const game_host_t *host);
+bool gh_world_audio(game_host_t *host, const ft_world *world, ft_audio_step *out);
+bool gh_audio_spatialize(game_host_t *host, int world_index, const ft_audio_sound *sound, float gain[2]);
+// The sound an authored timeline event makes; false when none.
+bool gh_event_audio(game_host_t *host, const ft_timeline_event *event, ft_audio_sound *out);
+int gh_world_player_count(game_host_t *host, const ft_world *world);
+bool gh_world_player_view(game_host_t *host, const ft_world *world, int player, ft_player_view *out);
+int gh_world_add_player(game_host_t *host, ft_world *world, int at_index, const ft_player_setup *setup);
+bool gh_world_remove_player(game_host_t *host, ft_world *world, int player);
+size_t gh_world_serialize(game_host_t *host, const ft_world *world, void *out, size_t out_size);
+bool gh_world_deserialize(game_host_t *host, ft_world *world, const void *data, size_t size);
+
+// Recordings. gh_recording_open may be called from a worker thread; the host
+// must keep the game active until it returns.
+bool game_has_recordings(const game_host_t *host);
+ft_recording *gh_recording_open(game_host_t *host, const void *data, size_t size, const char *name,
+                                bool (*progress)(void *user, float fraction), void *progress_user, char *error, size_t error_size);
+void gh_recording_destroy(game_host_t *host, ft_recording *recording);
+bool gh_recording_info(game_host_t *host, const ft_recording *recording, ft_recording_info *out);
+bool gh_recording_player(game_host_t *host, const ft_recording *recording, unsigned index, ft_recording_player *out);
+bool gh_recording_level_matches(game_host_t *host, const ft_recording *recording, const ft_level *level);
+void gh_recording_tick_flags(game_host_t *host, const ft_recording *recording, int player, int first_tick, unsigned count,
+                             uint8_t *out);
+bool gh_recording_input(game_host_t *host, const ft_recording *recording, int player, int tick, void *out_record);
+void gh_recording_events(game_host_t *host, const ft_recording *recording, const int32_t *world_players, unsigned player_count,
+                         void (*emit)(void *user, const ft_timeline_event *event), void *user);
+
+void gh_input_default(game_host_t *host, void *record);
+long long gh_input_get(game_host_t *host, const void *record, unsigned field);
+void gh_input_set(game_host_t *host, void *record, unsigned field, long long value);
+float gh_input_get_float(game_host_t *host, const void *record, unsigned field);
+void gh_input_set_float(game_host_t *host, void *record, unsigned field, float value);
+ft_vec2 gh_input_get_vec2(game_host_t *host, const void *record, unsigned field);
+void gh_input_set_vec2(game_host_t *host, void *record, unsigned field, ft_vec2 value);
+void gh_linked_input_update(game_host_t *host, const ft_linked_input_frame *frame, void *inout_record);
+
+unsigned gh_input_effect_count(game_host_t *host);
+const ft_input_effect_desc *gh_input_effect_desc(game_host_t *host, unsigned index);
+int gh_input_effect_find(game_host_t *host, const char *id);
+bool gh_input_effect_default(game_host_t *host, unsigned index, void *parameters, unsigned parameter_size);
+bool gh_input_effect_apply(game_host_t *host, unsigned index, const ft_input_effect_frame *frame,
+                           const void *parameters, unsigned parameter_size, void *runtime,
+                           unsigned runtime_size, void *inout_records);
+bool gh_input_effect_ui(game_host_t *host, unsigned index, const ft_input_effect_ui_frame *frame,
+                        void *parameters, unsigned parameter_size, const void *runtime,
+                        unsigned runtime_size);
+
+void gh_update(game_host_t *host, const ft_engine_state *state);
+void gh_render(game_host_t *host, const ft_render_frame *frame);
+void gh_ui(game_host_t *host, const ft_ui_frame *frame);
+// The same call for the start screen, which draws whichever game is being
+// browsed rather than the one that is open.
+void gh_browsed_ui(game_host_t *host, const ft_ui_frame *frame);
+// Default placement for the windows the active game opens, or NULL when it asks
+// for none. Borrowed from the module and valid while it stays loaded.
+const ft_panel_desc *gh_panels(game_host_t *host, uint32_t *out_count);
+bool gh_resources_create(game_host_t *host);
+void gh_resources_destroy(game_host_t *host);
+
+unsigned gh_exporter_count(game_host_t *host);
+const ft_exporter_desc *gh_exporter_desc(game_host_t *host, unsigned index);
+bool gh_export_run(game_host_t *host, unsigned index, const ft_export_request *request);
+
+bool gh_entity_prop_get(game_host_t *host, const ft_world *world, unsigned entity_class, int entity, unsigned prop, ft_value *out);
+bool gh_entity_prop_set(game_host_t *host, ft_world *world, unsigned entity_class, int entity, unsigned prop, const ft_value *value);
+int gh_entity_count(game_host_t *host, const ft_world *world, unsigned entity_class);
+// How the prediction draws an entity's path; false when the game says nothing about it.
+bool gh_entity_trail(game_host_t *host, const ft_world *world, unsigned entity_class, int entity, ft_entity_trail *out);
+// What the last step of a world made with FT_WORLD_MARKS left to mark (see ft_game_module.world_marks).
+uint32_t gh_world_marks(game_host_t *host, const ft_world *world, ft_world_mark *out, uint32_t capacity);
+const ft_entity_class *gh_entity_class(const game_host_t *host, unsigned index);
+unsigned gh_entity_class_count(const game_host_t *host);
+
+// The game's own status readout for the viewport overlay. Returns how many
+// lines were written into `out`, which must hold max_lines * line_size bytes.
+unsigned gh_status_lines(game_host_t *host, const ft_world *world, int player, float alpha, char *out, unsigned max_lines,
+                         unsigned line_size);
+
+// A short line for a player in a list, e.g. a finish time. False when the game
+// has nothing to say about that player.
+bool gh_player_label(game_host_t *host, const ft_world *world, int player, char *out, size_t out_size);
+
+// True when the game the start screen is showing draws its own, so the editor
+// knows whether to fall back to its own.
+bool game_provides_splash(const game_host_t *host);
+
+// Camera modes the active game offers. Falls back to a single free view when a
+// game declares none, so the engine always has something to show.
+// The mode list a 3D game exposes ends with the engine's own freecam and
+// top-down modes, which is why these are the only correct way to count and
+// read modes.
+unsigned game_camera_mode_count(const game_host_t *host);
+const ft_camera_mode *game_camera_mode(const game_host_t *host, unsigned index);
+// Whether the given index is that freecam, which the engine flies itself
+// instead of asking the game where to point.
+bool game_camera_mode_is_freecam(const game_host_t *host, unsigned index);
+// Whether the given index is the engine's axis-aligned orthographic plan view.
+bool game_camera_mode_is_top_down(const game_host_t *host, unsigned index);
+bool gh_camera_update(game_host_t *host, const ft_camera_frame *frame, ft_camera *inout);
+
+// Game settings the engine renders and persists on the game's behalf.
+unsigned gh_setting_count(game_host_t *host);
+const ft_setting_desc *gh_setting_desc(game_host_t *host, unsigned index);
+bool gh_setting_get(game_host_t *host, unsigned index, ft_value *out);
+bool gh_setting_set(game_host_t *host, unsigned index, const ft_value *value);
+int gh_setting_find(game_host_t *host, const char *id);
+
+// Opaque per-project data owned by the active game module.
+size_t gh_project_save(game_host_t *host, void *out, size_t out_size);
+bool gh_project_load(game_host_t *host, const void *data, size_t size);
+
+void gh_collect_events(game_host_t *host, const ft_world *previous, const ft_world *world,
+                       void (*emit)(void *user, const ft_timeline_event *event), void *user);
+
+#endif // ENGINE_GAME_HOST_H

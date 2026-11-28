@@ -1,0 +1,155 @@
+#ifndef UI_TIMELINE_MODEL_H
+#define UI_TIMELINE_MODEL_H
+
+#include "timeline_types.h"
+
+// Initialization and Cleanup
+void model_init(timeline_state_t *ts, ui_handler_t *ui);
+void model_cleanup(timeline_state_t *ts);
+
+// Groups
+timeline_group_t *model_add_group(timeline_state_t *ts, const char *name);
+bool model_remove_group(timeline_state_t *ts, int group_index);
+void model_reset_groups_for_level(timeline_state_t *ts);
+int model_track_group_index(const timeline_state_t *ts, int track_index);
+int model_group_track_count(const timeline_state_t *ts, int group_index);
+int model_group_track_index(const timeline_state_t *ts, int group_index, int local_index);
+int model_group_local_track_index(const timeline_state_t *ts, int track_index);
+// The track a linked track copies from: its pinned source, else the one being
+// controlled in its group; -1 when there is none.
+int model_linked_source_track(const timeline_state_t *ts, int track_index);
+// out[p] = the track playing the group's player p (-1 past its tracks), for
+// loops over all players: model_group_track_index scans the tracks per call.
+void model_group_tracks(const timeline_state_t *ts, int group_index, int *out, int count);
+int model_group_playhead_tick(const timeline_state_t *ts, int group_index);
+// Earliest meaningful shared/global tick. Group-local playheads remain clamped to zero.
+int model_get_min_global_tick(const timeline_state_t *ts);
+int model_clamp_global_tick_for_group(const timeline_state_t *ts, int group_index, int tick);
+void model_set_active_group(timeline_state_t *ts, int group_index);
+void model_set_group_start_offset(timeline_state_t *ts, int group_index, int offset);
+player_track_t *model_clone_track_to_group(timeline_state_t *ts, int track_index, int group_index, int *out_track_index);
+void model_align_group_starts(timeline_state_t *ts);
+
+// Snippet ID Vector Helpers
+void snippet_id_vector_init(snippet_id_vector_t *vec);
+void snippet_id_vector_free(snippet_id_vector_t *vec);
+void snippet_id_vector_add(snippet_id_vector_t *vec, int snippet_id);
+bool snippet_id_vector_remove(snippet_id_vector_t *vec, int snippet_id);
+bool snippet_id_vector_contains(const snippet_id_vector_t *vec, int snippet_id);
+
+// Source Window Access
+// Snippet inputs are addressed through the visible window, never through `inputs` directly, because
+// the source buffer can hold trimmed-away ticks on either side. Index 0 is the tick at start_tick.
+static inline input_record_t *snippet_window(const input_snippet_t *snippet) { return snippet->inputs + snippet->source_offset; }
+// Ticks of retained source sitting outside the window, i.e. how far each edge can still be pulled
+// before blank ticks have to be invented.
+static inline int snippet_source_before(const input_snippet_t *snippet) { return snippet->source_offset; }
+static inline int snippet_source_after(const input_snippet_t *snippet) {
+  return snippet->source_count - snippet->source_offset - snippet->input_count;
+}
+// Repairs source bookkeeping for snippets built by older code paths or loaded from older files.
+void model_snippet_normalize(input_snippet_t *snippet);
+// Drops the retained ticks outside the window so `inputs` holds exactly what plays. Used by the
+// operations that rewrite a snippet's buffer wholesale.
+void model_snippet_flatten(input_snippet_t *snippet);
+// Moves the window to [new_start_tick, new_end_tick), revealing retained source where it exists and
+// padding with blank ticks where it does not.
+bool model_trim_snippet(timeline_state_t *ts, input_snippet_t *snippet, int new_start_tick, int new_end_tick);
+
+// Finders
+input_snippet_t *model_find_snippet_by_id(timeline_state_t *ts, int snippet_id, int *out_track_index);
+input_snippet_t *model_find_snippet_in_track(player_track_t *track, int snippet_id);
+int model_find_available_layer(const player_track_t *track, int start_tick, int end_tick, int exclude_snippet_id);
+int model_get_stack_size_at_tick_range(const player_track_t *track, int start_tick, int end_tick);
+int model_get_max_timeline_tick(timeline_state_t *ts);
+
+// Data Modification
+void timeline_solve_snippet_layers(input_snippet_t **snippets, int count);
+void model_insert_snippet_into_track(player_track_t *track, const input_snippet_t *snippet);
+bool model_remove_snippet_from_track(timeline_state_t *ts, player_track_t *track, int snippet_id);
+void model_resize_snippet_inputs(timeline_state_t *ts, input_snippet_t *snippet, int new_duration);
+void model_snippet_clone(input_snippet_t *dest, const input_snippet_t *src);
+void model_free_snippet_inputs(input_snippet_t *snippet);
+player_track_t *model_add_new_track(timeline_state_t *ts, int num);
+// Creates timeline rows for players already present in a group's starting
+// world. Fixed-cast games use this because their players exist at world
+// creation time and cannot be added through world_add_player.
+void model_sync_tracks_to_world(timeline_state_t *ts, int group_index);
+void model_remove_track_logic(timeline_state_t *ts, int track_index);
+void model_insert_track_physics(timeline_state_t *ts, int track_index);
+void model_compact_layers_for_track(player_track_t *track);
+
+// Recording & Merging
+void model_apply_input_to_main_buffer(timeline_state_t *ts, player_track_t *track, int tick, const input_record_t *input);
+void model_clear_all_recording_buffers(timeline_state_t *ts);
+void model_insert_snippet_into_recording_track(player_track_t *track, const input_snippet_t *snippet);
+
+// Physics & Playback
+// Resets only simulated worlds. Effect implementations use this while testing
+// a derived buffer without invalidating the effect pipeline they are building.
+void model_reset_physics_cache(timeline_state_t *ts);
+// Keep snapshots through the local input tick; only later worlds are stale.
+void model_invalidate_group_physics(timeline_state_t *ts, int group_index, int tick);
+void model_recalc_group_physics(timeline_state_t *ts, int group_index, int tick);
+void model_recalc_snippet_physics(timeline_state_t *ts, const input_snippet_t *snippet, int tick);
+// Conservative fallback for changes whose affected groups are unknown.
+void model_recalc_physics(timeline_state_t *ts, int tick);
+input_record_t model_get_input_at_tick(const timeline_state_t *ts, int track_index, int tick);
+// The input a track's snippets hold at a tick, as written (before input
+// effects), leaving out what is being recorded right now.
+input_record_t model_get_authored_input_at_tick(const timeline_state_t *ts, int track_index, int tick);
+// Whether a tick of a track is already recorded in the take(s) of this recording.
+// What a linked track, while recording, plays at a tick: its own inputs there
+// with the fields its link drives this frame taken from its current input.
+input_record_t model_linked_input_at_tick(const timeline_state_t *ts, int track_index, int tick);
+// One step's inputs for every player of a group's world at `tick`, packed at the game's record
+// size, and in `playback` (may be NULL) which players replay a recording instead. Returns true when
+// anyone does, i.e. when the step must go through gh_world_step_playback.
+bool model_gather_step(timeline_state_t *ts, int group_index, int tick, int player_count, uint8_t *inputs,
+                       ft_player_playback *playback);
+void model_advance_tick(timeline_state_t *ts, int steps);
+// Puts the playhead at a global tick. While recording, a playhead moved ahead
+// takes the ticks it passes over the way playing does, rather than getting
+// ahead of the take and being drawn from inputs the take is about to replace.
+void model_move_playhead(timeline_state_t *ts, int tick);
+// Playback keeps the simulation within a budget per frame, so heavy physics
+// play slower instead of falling further behind every frame until the editor
+// hangs. The budget looks once a frame, before anything moves the playhead,
+// at how far the playhead moved last frame and what simulating it cost.
+void model_playback_budget_frame(timeline_state_t *ts, bool playing);
+// How many ticks playing may move the playhead this frame.
+int model_playback_affordable_ticks(void);
+// Upper end of the playback/recording tick rate, shared by the speed widget and its keybinds.
+int model_max_playback_speed(const timeline_state_t *ts);
+void model_activate_snippet(timeline_state_t *ts, int track_index, int snippet_id_to_activate);
+// World access. The returned world is borrowed from the group's cache and stays
+// valid until the next call for that group, which is enough for a frame's worth
+// of rendering and inspection without copying a world per query.
+const ft_world *model_world_at_tick(timeline_state_t *ts, int tick);
+const ft_world *model_group_world_at_tick(timeline_state_t *ts, int group_index, int tick);
+// Both the tick and the one before it, for interpolated rendering.
+void model_group_world_pair(timeline_state_t *ts, int group_index, int tick, const ft_world **out_prev, const ft_world **out_cur);
+// Makes the group's sound hold local ticks [first, last], simulating the ones
+// not heard yet with a world of its own, so playing never disturbs the drawn one.
+void model_group_audio_cover(timeline_state_t *ts, int group_index, int first, int last);
+// A player's position in a world: the first player property in 3D, the player
+// view in 2D.
+bool model_player_position(timeline_state_t *ts, const ft_world *world, int local_player, float out[3]);
+// Walks one track's positions tick by tick in a world of its own, so the
+// timeline's cached worlds stay where playback left them. step writes up to
+// `count` positions from the next tick on and returns how many it wrote.
+typedef struct model_position_sampler_t model_position_sampler_t;
+model_position_sampler_t *model_position_sampler_create(timeline_state_t *ts, int track_index, int first_tick);
+int model_position_sampler_step(timeline_state_t *ts, model_position_sampler_t *sampler, int count, float (*out)[3]);
+void model_position_sampler_destroy(timeline_state_t *ts, model_position_sampler_t *sampler);
+
+// Index of a player property by id in the active game's table, or -1.
+int model_find_player_prop(game_host_t *host, const char *prop_id);
+void model_apply_starting_config(timeline_state_t *ts, int track_index);
+// Rebuilds a group's starting world from the level and re-applies the overrides
+// still enabled on it. This is how an override that is turned off gives back
+// what the level originally said.
+void model_rebuild_group_start(timeline_state_t *ts, int group_index);
+void model_rebind_starting_strings(starting_config_t *config);
+
+#endif // UI_TIMELINE_MODEL_H

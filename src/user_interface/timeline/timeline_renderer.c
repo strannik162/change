@@ -1,0 +1,986 @@
+#include "timeline_renderer.h"
+#include "../timeline_events.h"
+#include "renderer/graphics_backend.h"
+#include "timeline_commands.h"
+#include "timeline_interaction.h"
+#include "timeline_model.h"
+#include "timeline_recordings.h"
+#include <engine/game_host.h>
+#include <engine/int_math.h>
+#include <engine/prediction.h>
+#include <frametee/icons.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <system/config.h>
+#include <system/include_cimgui.h>
+#include <user_interface/input_effects.h>
+#include <user_interface/undo_redo.h>
+#include <user_interface/widgets/imcol.h>
+
+#define MIN_TIMELINE_ZOOM 0.05f
+#define MAX_TIMELINE_ZOOM 20.0f
+#define TPS 50
+
+typedef struct {
+  bool active;
+  int track_index;
+  char before[MAX_TRACK_NAME];
+} RendererTrackNameEditUndo;
+
+static RendererTrackNameEditUndo g_track_name_edit_undo;
+
+// Forward Declarations for Static Render Helpers
+static void render_input_snippet(timeline_state_t *ts, player_track_t *track, input_snippet_t *snippet, ImDrawList *draw_list, ImRect timeline_bb,
+                                 float track_top, bool is_recording_snippet);
+static void render_player_track(timeline_state_t *ts, int track_index, ImDrawList *draw_list, ImRect timeline_bb, float track_top, float track_bottom,
+                                bool is_selected);
+static double choose_nice_tick_step(double pixels_per_tick, double min_label_spacing);
+
+// Coordinate Conversion
+int renderer_screen_x_to_tick(const timeline_state_t *ts, float screen_x, float timeline_start_x) {
+  if (fabsf(ts->zoom) < 1e-6f) return ts->view_start_tick;
+  return ts->view_start_tick + (int)roundf((screen_x - timeline_start_x) / ts->zoom);
+}
+
+float renderer_track_header_width(void) { return roundf(120.0f * gfx_get_ui_scale()); }
+
+float renderer_tick_to_screen_x(const timeline_state_t *ts, int tick, float timeline_start_x) {
+  return timeline_start_x + (tick - ts->view_start_tick) * ts->zoom;
+}
+
+float renderer_get_track_row_height(const timeline_state_t *ts) {
+  return (ts->track_height * gfx_get_ui_scale()) + igGetStyle()->ItemSpacing.y;
+}
+
+float renderer_get_track_screen_y(const timeline_state_t *ts, int track_index) {
+  return ts->tracks_origin_y + (float)track_index * renderer_get_track_row_height(ts);
+}
+
+int renderer_screen_y_to_track_index(const timeline_state_t *ts, float screen_y) {
+  float content_y = screen_y - ts->tracks_origin_y;
+  if (content_y < 0) return -1;
+
+  int track_index = (int)floorf(content_y / renderer_get_track_row_height(ts));
+  return (track_index >= ts->player_track_count) ? -1 : track_index;
+}
+
+typedef struct {
+  int group_index;
+  int start_offset;
+} playhead_group_entry_t;
+
+static int compare_playhead_entries(const void *a, const void *b) {
+  const playhead_group_entry_t *ea = (const playhead_group_entry_t *)a;
+  const playhead_group_entry_t *eb = (const playhead_group_entry_t *)b;
+  if (ea->start_offset != eb->start_offset) {
+    return (ea->start_offset < eb->start_offset) ? 1 : -1;
+  }
+  return ea->group_index - eb->group_index;
+}
+
+// Playheads are drawn from left to right. When their handles overlap, this leaves the rightmost
+// playhead in front. The unclamped tick breaks ties at tick zero, where several groups can share
+// the same visible position while approaching it from different offsets.
+// Visit distinct offsets from largest to smallest to draw their playheads from left to right
+// and deduplicate groups whose offset is exactly equal.
+static int collect_playhead_groups(const timeline_state_t *ts, int *out_groups, int capacity) {
+  if (!ts || ts->group_count <= 0 || capacity <= 0) return 0;
+
+  playhead_group_entry_t stack_entries[64];
+  playhead_group_entry_t *entries = stack_entries;
+  if (ts->group_count > 64) {
+    entries = malloc(sizeof(*entries) * (size_t)ts->group_count);
+    if (!entries) return 0;
+  }
+
+  int candidate_count = 0;
+  for (int i = 0; i < ts->group_count; ++i) {
+    if (i != ts->active_group_index && !ts->groups[i]->visible) continue;
+    entries[candidate_count++] = (playhead_group_entry_t){
+        .group_index = i,
+        .start_offset = ts->groups[i]->start_offset,
+    };
+  }
+
+  if (candidate_count == 0) {
+    if (entries != stack_entries) free(entries);
+    return 0;
+  }
+
+  qsort(entries, (size_t)candidate_count, sizeof(*entries), compare_playhead_entries);
+
+  int count = 0;
+  int last_offset = 0;
+  for (int i = 0; i < candidate_count && count < capacity; ++i) {
+    if (count == 0 || entries[i].start_offset < last_offset) {
+      out_groups[count++] = entries[i].group_index;
+      last_offset = entries[i].start_offset;
+    }
+  }
+
+  if (entries != stack_entries) free(entries);
+  return count;
+}
+
+int renderer_hit_test_playhead_handle(const timeline_state_t *ts, ImRect header_bb, ImVec2 position) {
+  float dpi_scale = gfx_get_ui_scale();
+  float handle_top = header_bb.Max.y - 11.0f * dpi_scale;
+  if (position.y < handle_top || position.y > header_bb.Max.y + 1.0f * dpi_scale) return -1;
+
+  int frontmost_group = -1;
+  float hit_half_width = 7.0f * dpi_scale;
+  int stack_groups[64];
+  int *group_list = stack_groups;
+  if (ts->group_count > 64) {
+    group_list = malloc(sizeof(int) * (size_t)ts->group_count);
+    if (!group_list) return -1;
+  }
+  int group_count = collect_playhead_groups(ts, group_list, ts->group_count);
+
+  for (int i = 0; i < group_count; ++i) {
+    int group_index = group_list[i];
+    float x = renderer_tick_to_screen_x(ts, model_group_playhead_tick(ts, group_index), header_bb.Min.x);
+    if (x < header_bb.Min.x || x > header_bb.Max.x) continue;
+    if (fabsf(position.x - x) <= hit_half_width) frontmost_group = group_index;
+  }
+
+  if (group_list != stack_groups) free(group_list);
+  return frontmost_group;
+}
+
+int renderer_find_nearest_playhead(const timeline_state_t *ts, ImRect header_bb, float position_x) {
+  int nearest_group = -1;
+  float nearest_distance = 0.0f;
+  int stack_groups[64];
+  int *group_list = stack_groups;
+  if (ts->group_count > 64) {
+    group_list = malloc(sizeof(int) * (size_t)ts->group_count);
+    if (!group_list) return -1;
+  }
+  int group_count = collect_playhead_groups(ts, group_list, ts->group_count);
+
+  for (int i = 0; i < group_count; ++i) {
+    int group_index = group_list[i];
+    float x = renderer_tick_to_screen_x(ts, model_group_playhead_tick(ts, group_index), header_bb.Min.x);
+    float distance = fabsf(position_x - x);
+    // Render order is back-to-front, so an equal-distance candidate encountered later is the
+    // visible one and must also win selection.
+    if (nearest_group < 0 || distance <= nearest_distance) {
+      nearest_group = group_index;
+      nearest_distance = distance;
+    }
+  }
+
+  if (group_list != stack_groups) free(group_list);
+  return nearest_group;
+}
+
+// Main Rendering Functions
+
+transport_action_t renderer_draw_transport(ui_handler_t *ui, bool playing) {
+  float dpi_scale = gfx_get_ui_scale();
+  float btn_gap = 6.0f * dpi_scale;
+  transport_action_t action = TRANSPORT_NONE;
+  igSameLine(0, 10 * dpi_scale);
+  if (ui_icon_button(ui, ICON_FA_BACKWARD_STEP, (ImVec2){30 * dpi_scale, 0})) action = TRANSPORT_START;
+  igSameLine(0, btn_gap);
+  if (ui_icon_button(ui, ICON_FA_BACKWARD, (ImVec2){30 * dpi_scale, 0})) action = TRANSPORT_BACK;
+  igSameLine(0, btn_gap);
+  if (ui_icon_button(ui, playing ? ICON_FA_PAUSE : ICON_FA_PLAY, (ImVec2){45 * dpi_scale, 0})) action = TRANSPORT_PLAY;
+  igSameLine(0, btn_gap);
+  if (ui_icon_button(ui, ICON_FA_FORWARD, (ImVec2){30 * dpi_scale, 0})) action = TRANSPORT_FORWARD;
+  igSameLine(0, btn_gap);
+  if (ui_icon_button(ui, ICON_FA_FORWARD_STEP, (ImVec2){30 * dpi_scale, 0})) action = TRANSPORT_END;
+  return action;
+}
+
+void renderer_draw_controls(timeline_state_t *ts) {
+  float dpi_scale = gfx_get_ui_scale();
+  float btn_gap = 6.0f * dpi_scale;
+
+  igPushItemWidth(80 * dpi_scale);
+  int field_tick = ts->current_tick;
+  igDragInt("##CurrentTick", &field_tick, 1, model_get_min_global_tick(ts), 100000000, "Tick %d", ImGuiSliderFlags_AlwaysClamp);
+  ts->tick_field_active = igIsItemActive();
+  if (field_tick != ts->current_tick) model_move_playhead(ts, field_tick);
+  igPopItemWidth();
+
+  switch (renderer_draw_transport(ts->ui, ts->is_playing)) {
+  case TRANSPORT_START: model_move_playhead(ts, model_get_min_global_tick(ts)); break;
+  case TRANSPORT_BACK: model_advance_tick(ts, -ts->playback_speed); break;
+  case TRANSPORT_PLAY:
+    ts->is_playing = !ts->is_playing;
+    if (ts->is_playing) {
+      if (ts->recording && ts->recording_snippets.count > 0) {
+        input_snippet_t *recording_snippet = ts->recording_snippets.snippets[0];
+        if (recording_snippet)
+          model_move_playhead(ts, recording_snippet->end_tick + ts->groups[ts->active_group_index]->start_offset);
+      }
+      ts->last_update_time = igGetTime();
+    }
+    break;
+  case TRANSPORT_FORWARD: model_advance_tick(ts, ts->playback_speed); break;
+  case TRANSPORT_END: model_move_playhead(ts, model_get_max_timeline_tick(ts)); break;
+  case TRANSPORT_NONE: break;
+  }
+
+  igSameLine(0, btn_gap);
+  const bool following = ts->ui->follow_playhead;
+  ui_toggle_style_push(following);
+  if (ui_icon_button(ts->ui, ICON_FA_ARROWS_TO_DOT, (ImVec2){30 * dpi_scale, 0})) ts->ui->follow_playhead = !following;
+  ui_toggle_style_pop();
+  if (igIsItemHovered(ImGuiHoveredFlags_None)) igSetTooltip("Follow playhead");
+
+  igSameLine(0, 12 * dpi_scale);
+  igText("Zoom");
+  igSameLine(0, 4 * dpi_scale);
+  igSetNextItemWidth(75 * dpi_scale);
+  igDragFloat("##Zoom", &ts->zoom, 0.02f, MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM, "%.2f",
+              ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+
+  igSameLine(0, 12 * dpi_scale);
+  igText("Speed");
+  igSameLine(0, 4 * dpi_scale);
+  igSetNextItemWidth(75 * dpi_scale);
+  igDragInt("##Speed", &ts->gui_playback_speed, 0.5f, 1, model_max_playback_speed(ts), "%d", ImGuiSliderFlags_AlwaysClamp);
+
+  igSameLine(0, 14 * dpi_scale);
+
+  // Cycles the camera modes the active game declared, the same step the
+  // ACTION_CYCLE_CAMERA_MODE keybind takes. Both are read before the button, so
+  // the tooltip describes the mode that is on screen rather than the one the
+  // click just moved to.
+  camera_t *camera = &ts->ui->gfx_handler->renderer.camera;
+  game_host_t *camera_host = &ts->ui->gfx_handler->game_host;
+  const unsigned mode_count = game_camera_mode_count(camera_host);
+  const ft_camera_mode *mode = game_camera_mode(camera_host, camera->mode);
+  const ft_camera_mode *next = game_camera_mode(camera_host, mode_count ? (camera->mode + 1) % mode_count : 0);
+  keybind_entry_t *cycle_bind = keybinds_get_binding_for_action(&ts->ui->keybinds, ACTION_CYCLE_CAMERA_MODE, 0);
+
+  if (ui_icon_button(ts->ui, ICON_FA_VIDEO, (ImVec2){30 * dpi_scale, 0})) ui_cycle_camera_mode(ts->ui);
+  if (igIsItemHovered(ImGuiHoveredFlags_None)) {
+    igSetTooltip("Camera: %s\nClick%s%s for %s", mode ? mode->display_name : "?", cycle_bind ? " or " : "",
+                 cycle_bind ? keybind_get_combo_string(&cycle_bind->combo) : "", next ? next->display_name : "?");
+  }
+
+  igSameLine(0, btn_gap);
+
+  prediction_render_menu(ts);
+
+  igSameLine(0, btn_gap);
+
+  if (igButton(ts->recording ? "Recording..." : "Record", (ImVec2){125 * dpi_scale, 0})) {
+    interaction_toggle_recording(ts);
+  }
+}
+
+static double choose_nice_tick_step(double pixels_per_tick, double min_label_spacing) {
+  static const double nice_steps[] = {1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000};
+  int count = sizeof(nice_steps) / sizeof(nice_steps[0]);
+  for (int i = 0; i < count; i++) {
+    if (nice_steps[i] * pixels_per_tick >= min_label_spacing) {
+      return nice_steps[i];
+    }
+  }
+  return nice_steps[count - 1];
+}
+
+void renderer_draw_header(timeline_state_t *ts, ImDrawList *draw_list, ImRect header_bb) {
+  float dpi_scale = gfx_get_ui_scale();
+  ImU32 tick_minor_col = igGetColorU32_Col(ImGuiCol_TextDisabled, 0.25f);
+  ImU32 tick_col = igGetColorU32_Col(ImGuiCol_TextDisabled, 0.7f);
+  ImU32 tick_major_col = igGetColorU32_Col(ImGuiCol_Text, 0.9f);
+  ImU32 tick_text_col = igGetColorU32_Col(ImGuiCol_Text, 1.0f);
+
+  ImDrawList_PushClipRect(draw_list, header_bb.Min, header_bb.Max, true);
+
+  float header_height = header_bb.Max.y - header_bb.Min.y;
+  int start_tick = renderer_screen_x_to_tick(ts, header_bb.Min.x, header_bb.Min.x);
+  int end_tick = renderer_screen_x_to_tick(ts, header_bb.Max.x, header_bb.Min.x);
+
+  // Pass 1: Draw a faint line for every single tick if they are at least 1px apart
+  if (ts->zoom >= 1.0f) {
+    for (int tick = start_tick; tick <= end_tick; tick++) {
+      if (tick < 0) continue;
+      float x = renderer_tick_to_screen_x(ts, tick, header_bb.Min.x);
+      ImDrawList_AddLine(draw_list, (ImVec2){x, header_bb.Max.y - header_height * 0.25f}, (ImVec2){x, header_bb.Max.y}, tick_minor_col, 1.0f * dpi_scale);
+    }
+  }
+
+  // Pass 2: Draw adaptive major ticks and labels for readability
+  double tick_step = choose_nice_tick_step(ts->zoom, 80.0f * dpi_scale);
+  double start_tick_major = floor((double)start_tick / tick_step) * tick_step;
+
+  for (double tick_d = start_tick_major; tick_d <= end_tick; tick_d += tick_step) {
+    int tick = (int)tick_d;
+    if (tick < 0) continue;
+    float x = renderer_tick_to_screen_x(ts, tick, header_bb.Min.x);
+
+    const int tps = game_ticks_per_second(&ts->ui->gfx_handler->game_host);
+    bool is_sec_marker = tps > 0 && (tick % tps) == 0;
+    ImU32 col = is_sec_marker ? tick_major_col : tick_col;
+    float line_height = is_sec_marker ? header_height * 0.5f : header_height * 0.3f;
+
+    ImDrawList_AddLine(draw_list, (ImVec2){x, header_bb.Max.y - line_height}, (ImVec2){x, header_bb.Max.y}, col, 1.0f * dpi_scale);
+
+    // Format labels based on the time scale. Seconds come from the active game's
+    // tick rate, so a 60 Hz game reads correctly on the same ruler as a 50 Hz one.
+    char label[64];
+    if (tick < tps) {
+      snprintf(label, sizeof(label), "%d", tick);
+    } else if (tick < tps * 60) { // Under 1 minute
+      snprintf(label, sizeof(label), "%.1fs", (double)tick / (double)tps);
+    } else { // Over 1 minute
+      int total_secs = tick / tps;
+      int mins = total_secs / 60;
+      int secs = total_secs % 60;
+      snprintf(label, sizeof(label), "%d:%02d", mins, secs);
+    }
+
+    ImVec2 text_size = igCalcTextSize(label, NULL, false, 0);
+    ImVec2 text_pos = {x - text_size.x * 0.5f, header_bb.Min.y + 2.0f * dpi_scale};
+
+    ImDrawList_AddText_Vec2(draw_list, text_pos, tick_text_col, label, NULL);
+  }
+
+  // Draw markers for events reported by the active game.
+  for (int i = 0; i < ts->event_count; ++i) {
+    timeline_event_t *ev = &ts->events[i];
+    if (ev->group_index < 0 || ev->group_index >= ts->group_count) continue;
+    int global_tick = ev->tick + ts->groups[ev->group_index]->start_offset;
+    if (global_tick < start_tick || global_tick > end_tick) continue;
+    timeline_group_t *group = ts->groups[ev->group_index];
+    ImU32 event_marker_col = igColorConvertFloat4ToU32((ImVec4){group->color[0], group->color[1], group->color[2], 1.0f});
+    float x = renderer_tick_to_screen_x(ts, global_tick, header_bb.Min.x);
+    if (x >= header_bb.Min.x && x <= header_bb.Max.x) {
+      ImVec2 p1 = {x - 4 * dpi_scale, header_bb.Max.y - 12 * dpi_scale};
+      ImVec2 p2 = {x + 4 * dpi_scale, header_bb.Max.y - 12 * dpi_scale};
+      ImVec2 p3 = {x, header_bb.Max.y - 4 * dpi_scale};
+      ImDrawList_AddTriangleFilled(draw_list, p1, p2, p3, event_marker_col);
+
+      // Optional: Hover tooltip for the event
+      if (igIsWindowHovered(0) && igIsMouseHoveringRect((ImVec2){x - 4 * dpi_scale, header_bb.Max.y - 12 * dpi_scale}, (ImVec2){x + 4 * dpi_scale, header_bb.Max.y - 4 * dpi_scale}, true)) {
+        igBeginTooltip();
+        igText("Group: %s", group->name);
+        timeline_event_tooltip_content(ev);
+        igEndTooltip();
+      }
+    }
+  }
+
+  ImDrawList_PopClipRect(draw_list);
+}
+
+void renderer_draw_playhead_line(timeline_state_t *ts, ImDrawList *draw_list, ImRect timeline_rect) {
+  if (ts->player_track_count <= 0) return;
+  float dpi_scale = gfx_get_ui_scale();
+  float y0 = renderer_get_track_screen_y(ts, 0);
+  float y1 = renderer_get_track_screen_y(ts, ts->player_track_count - 1) + ts->track_height * dpi_scale;
+
+  int stack_groups[64];
+  int *group_list = stack_groups;
+  if (ts->group_count > 64) {
+    group_list = malloc(sizeof(int) * (size_t)ts->group_count);
+    if (!group_list) return;
+  }
+  int group_count = collect_playhead_groups(ts, group_list, ts->group_count);
+
+  for (int i = 0; i < group_count; ++i) {
+    int group_index = group_list[i];
+    int playhead_tick = model_group_playhead_tick(ts, group_index);
+
+    float playhead_x = renderer_tick_to_screen_x(ts, playhead_tick, timeline_rect.Min.x);
+    if (playhead_x < timeline_rect.Min.x || playhead_x > timeline_rect.Max.x) continue;
+    ImU32 color = group_index == 0 ? igGetColorU32_Col(ImGuiCol_SeparatorActive, 1.0f)
+                                   : igGetColorU32_Vec4((ImVec4){ts->groups[group_index]->color[0], ts->groups[group_index]->color[1],
+                                                                 ts->groups[group_index]->color[2], 0.95f});
+    ImDrawList_AddLine(draw_list, (ImVec2){playhead_x, y0}, (ImVec2){playhead_x, y1}, color, 2.0f * dpi_scale);
+  }
+
+  if (group_list != stack_groups) free(group_list);
+}
+
+void renderer_draw_playhead_handle(timeline_state_t *ts, ImDrawList *draw_list, ImRect timeline_rect, ImRect header_bb) {
+  float dpi_scale = gfx_get_ui_scale();
+
+  int stack_groups[64];
+  int *group_list = stack_groups;
+  if (ts->group_count > 64) {
+    group_list = malloc(sizeof(int) * (size_t)ts->group_count);
+    if (!group_list) return;
+  }
+  int group_count = collect_playhead_groups(ts, group_list, ts->group_count);
+
+  for (int i = 0; i < group_count; ++i) {
+    int group_index = group_list[i];
+    int playhead_tick = model_group_playhead_tick(ts, group_index);
+    float group_x = renderer_tick_to_screen_x(ts, playhead_tick, timeline_rect.Min.x);
+    if (group_x < timeline_rect.Min.x || group_x > timeline_rect.Max.x) continue;
+    ImU32 color = group_index == 0 ? igGetColorU32_Col(ImGuiCol_SeparatorActive, 1.0f)
+                                   : igGetColorU32_Vec4((ImVec4){ts->groups[group_index]->color[0], ts->groups[group_index]->color[1],
+                                                                 ts->groups[group_index]->color[2], 0.95f});
+    ImVec2 head_bottom = {group_x + 0.5f, header_bb.Max.y + 0.5f};
+    ImVec2 head_top_left = {(head_bottom.x - 6.0f * dpi_scale) + 0.5f, head_bottom.y - 10.0f * dpi_scale + 0.5f};
+    ImVec2 head_top_right = {(head_bottom.x + 6.0f * dpi_scale) - 0.5f, head_bottom.y - 10.0f * dpi_scale + 0.5f};
+    ImDrawList_AddTriangleFilled(draw_list, head_top_left, head_top_right, head_bottom, color);
+    ImDrawList_AddLine(draw_list, (ImVec2){group_x, header_bb.Max.y - 5.0f * dpi_scale}, (ImVec2){group_x, header_bb.Max.y}, color,
+                       2.0f * dpi_scale);
+  }
+
+  if (group_list != stack_groups) free(group_list);
+}
+
+void renderer_draw_tracks_area(timeline_state_t *ts, ImRect timeline_bb) {
+  float dpi_scale = gfx_get_ui_scale();
+  float track_header_width = renderer_track_header_width();
+  ImDrawList *draw_list = igGetWindowDrawList();
+  int pending_clone_track = -1;
+  int pending_clone_group = -1;
+
+  // The rows are laid out from this origin, and hit testing derives the same positions from it.
+  ts->tracks_origin_y = igGetCursorScreenPos().y;
+
+  ImGuiListClipper *clipper = ImGuiListClipper_ImGuiListClipper();
+  float total_row_height = renderer_get_track_row_height(ts);
+  ImGuiListClipper_Begin(clipper, ts->player_track_count, total_row_height);
+  while (ImGuiListClipper_Step(clipper)) {
+    for (int i = clipper->DisplayStart; i < clipper->DisplayEnd; i++) {
+      // Pin the row instead of letting the cursor accumulate: ImGui truncates it after every
+      ImVec2 row_start_pos = {igGetCursorScreenPos().x, renderer_get_track_screen_y(ts, i)};
+      igSetCursorScreenPos(row_start_pos);
+      player_track_t *track = &ts->player_tracks[i];
+      timeline_group_t *group = ts->groups[track->group_index];
+      const bool supports_linked = game_has_cap(&ts->ui->gfx_handler->game_host, FT_CAP_LINKED_INPUTS);
+      // (a game without linked tracks ignores the flag; the track keeps it)
+      const bool linked = supports_linked && track->is_linked;
+
+      // Render Track Info Panel (Left)
+      bool is_track_selected = (ts->selected_player_track_index == i);
+      ImU32 header_bg_col = linked ? igGetColorU32_Col(ImGuiCol_TextLink, 0.6f) : igGetColorU32_Col(ImGuiCol_FrameBg, 0.8f);
+
+      ImVec2 header_rect_min = row_start_pos;
+      ImVec2 header_rect_max = {row_start_pos.x + track_header_width, row_start_pos.y + (ts->track_height * dpi_scale)};
+      ImDrawList_AddRectFilled(draw_list, header_rect_min, header_rect_max, header_bg_col, 0.0f, 0);
+      ImDrawList_AddLine(draw_list, (ImVec2){header_rect_max.x, header_rect_min.y}, header_rect_max, igGetColorU32_Col(ImGuiCol_Border, 0.5f), 1.0f * dpi_scale);
+
+      // The colored claw is the visual group binding from the issue mockup. Its caps only appear
+      // on the first/last row, so adjacent rows read as one physics instance without spending a
+      // separate header row.
+      ImU32 group_color = igGetColorU32_Vec4((ImVec4){group->color[0], group->color[1], group->color[2], 1.0f});
+      float claw_x = row_start_pos.x + 3.0f * dpi_scale;
+      ImDrawList_AddLine(draw_list, (ImVec2){claw_x, header_rect_min.y}, (ImVec2){claw_x, header_rect_max.y}, group_color, 4.0f * dpi_scale);
+      bool first_in_group = i == 0 || ts->player_tracks[i - 1].group_index != track->group_index;
+      bool last_in_group = i == ts->player_track_count - 1 || ts->player_tracks[i + 1].group_index != track->group_index;
+      if (first_in_group)
+        ImDrawList_AddLine(draw_list, (ImVec2){claw_x, header_rect_min.y + 2.0f * dpi_scale},
+                           (ImVec2){claw_x + 14.0f * dpi_scale, header_rect_min.y + 2.0f * dpi_scale}, group_color, 4.0f * dpi_scale);
+      if (last_in_group)
+        ImDrawList_AddLine(draw_list, (ImVec2){claw_x, header_rect_max.y - 2.0f * dpi_scale},
+                           (ImVec2){claw_x + 14.0f * dpi_scale, header_rect_max.y - 2.0f * dpi_scale}, group_color, 4.0f * dpi_scale);
+
+      igPushID_Int(i);
+
+      // Draw track name. Linked tracks get a compact visual marker.
+      igSetCursorScreenPos((ImVec2){row_start_pos.x + 20.0f * dpi_scale, row_start_pos.y + ((ts->track_height * dpi_scale) - igGetTextLineHeight()) * 0.5f});
+      if (linked) {
+        igTextDisabled("[L]");
+        igSameLine(0, 4.0f * dpi_scale);
+      }
+      igText("%s", track->name[0] ? track->name : "Track");
+
+      // Add a single invisible button over the header for interactions.
+      igSetCursorScreenPos(row_start_pos);
+      igInvisibleButton("##track_header_interact", (ImVec2){track_header_width, ts->track_height * dpi_scale}, 0);
+
+      // Handle interactions: double-click to toggle linking, single-click to select.
+      if (igIsItemHovered(0)) {
+        if (supports_linked && igIsMouseDoubleClicked_Nil(ImGuiMouseButton_Left)) {
+          // Shift sets the whole group to what this track becomes.
+          const bool become = !track->is_linked;
+          const bool whole_group = igGetIO_Nil()->KeyShift;
+          int changed_tracks[256];
+          track_link_state_t before[256];
+          int changed = 0;
+          for (int t = 0; t < ts->player_track_count && changed < 256; ++t) {
+            if (whole_group ? ts->player_tracks[t].group_index != track->group_index : t != i) continue;
+            changed_tracks[changed] = t;
+            before[changed++] = commands_track_link_state(ts, t);
+            ts->player_tracks[t].is_linked = become;
+          }
+          undo_command_t *command = commands_create_track_link_change(ts->ui, changed_tracks, before, changed,
+                                                                      become ? "Link Track" : "Unlink Track");
+          if (command) {
+            undo_manager_register_command(&ts->ui->undo_manager, command);
+            timeline_mark_unsaved(ts);
+          }
+        } else if (igIsItemClicked(ImGuiMouseButton_Left)) {
+          interaction_select_track(ts, i);
+        }
+      }
+
+      if (igBeginPopupContextItem("TrackSettings", 1)) {
+        char name_before_frame[MAX_TRACK_NAME];
+        memcpy(name_before_frame, track->name, sizeof(name_before_frame));
+        igSetNextItemWidth(180.0f * dpi_scale);
+        bool name_changed = igInputText("Name", track->name, sizeof(track->name), ImGuiInputTextFlags_EnterReturnsTrue, NULL, NULL);
+        if (igIsItemActivated()) {
+          g_track_name_edit_undo.active = true;
+          g_track_name_edit_undo.track_index = i;
+          memcpy(g_track_name_edit_undo.before, name_before_frame, sizeof(g_track_name_edit_undo.before));
+        }
+        if (name_changed) timeline_mark_unsaved(ts);
+        if (igIsItemDeactivatedAfterEdit() && g_track_name_edit_undo.active && g_track_name_edit_undo.track_index == i) {
+          undo_command_t *command = commands_create_track_name_change(ts->ui, i, g_track_name_edit_undo.before);
+          if (command) undo_manager_register_command(&ts->ui->undo_manager, command);
+          g_track_name_edit_undo.active = false;
+        }
+        if (ts->group_count > 1 && igBeginMenu("Clone to group", !ts->recording)) {
+          for (int target_group = 0; target_group < ts->group_count; ++target_group) {
+            if (target_group == track->group_index) continue;
+            if (igMenuItem_Bool(ts->groups[target_group]->name, NULL, false, true)) {
+              pending_clone_track = i;
+              pending_clone_group = target_group;
+            }
+          }
+          igEndMenu();
+        }
+        if (supports_linked) {
+          igSeparator();
+          if (track->is_linked) {
+            game_host_t *host = &ts->ui->gfx_handler->game_host;
+            const ft_input_schema *schema = game_input_schema(host);
+            const int player_count = model_group_track_count(ts, track->group_index);
+            const int target_player = model_group_local_track_index(ts, i);
+            const track_link_state_t link_before = commands_track_link_state(ts, i);
+
+            // Whoever is being controlled, unless pinned to one tee.
+            char source_label[96] = "Whoever I control";
+            const int pinned_track = track->linked_source_player >= 0 && track->linked_source_player != target_player
+                                         ? model_group_track_index(ts, track->group_index, track->linked_source_player)
+                                         : -1;
+            if (pinned_track >= 0)
+              snprintf(source_label, sizeof(source_label), "%d: %s", track->linked_source_player + 1, ts->player_tracks[pinned_track].name);
+            if (igBeginCombo("Copies", source_label, 0)) {
+              if (igSelectable_Bool("Whoever I control", pinned_track < 0, 0, (ImVec2){0, 0})) track->linked_source_player = -1;
+              for (int local = 0; local < player_count; ++local) {
+                if (local == target_player) continue;
+                const int candidate = model_group_track_index(ts, track->group_index, local);
+                if (candidate < 0) continue;
+                char label[96];
+                snprintf(label, sizeof(label), "%d: %s", local + 1, ts->player_tracks[candidate].name);
+                if (igSelectable_Bool(label, local == track->linked_source_player, 0, (ImVec2){0, 0})) track->linked_source_player = local;
+              }
+              igEndCombo();
+            }
+
+            igText("Copied fields");
+            igSeparator();
+            bool has_mirror_x = false;
+            bool has_mirror_y = false;
+            if (schema) {
+              for (uint32_t field_index = 0; field_index < schema->field_count && field_index < 64; ++field_index) {
+                const ft_input_field *field = &schema->fields[field_index];
+                if (field->flags & (FT_INPUT_FLAG_INTERNAL | FT_INPUT_FLAG_EDITOR_HIDDEN)) continue;
+                bool copied = (track->linked_copy_fields & (UINT64_C(1) << field_index)) != 0;
+                if (igCheckbox(field->display_name ? field->display_name : field->id, &copied))
+                  track->linked_copy_fields ^= UINT64_C(1) << field_index;
+                has_mirror_x |= (field->flags & FT_INPUT_FLAG_MIRROR_X) != 0;
+                has_mirror_y |= (field->flags & FT_INPUT_FLAG_MIRROR_Y) != 0;
+              }
+            }
+
+            if (has_mirror_x || has_mirror_y) igSeparator();
+            if (has_mirror_x) {
+              bool mirror = (track->linked_transform_flags & FT_LINKED_MIRROR_X) != 0;
+              if (igCheckbox("Mirror horizontally", &mirror)) track->linked_transform_flags ^= FT_LINKED_MIRROR_X;
+            }
+            if (has_mirror_y) {
+              bool mirror = (track->linked_transform_flags & FT_LINKED_MIRROR_Y) != 0;
+              if (igCheckbox("Mirror vertically", &mirror)) track->linked_transform_flags ^= FT_LINKED_MIRROR_Y;
+            }
+            const int this_track = i;
+            undo_command_t *command = commands_create_track_link_change(ts->ui, &this_track, &link_before, 1, "Change Track Link");
+            if (command) {
+              undo_manager_register_command(&ts->ui->undo_manager, command);
+              timeline_mark_unsaved(ts);
+            }
+          } else {
+            igTextDisabled("Not a linked track");
+            igTextDisabled("Double-click header to toggle");
+          }
+        }
+        igEndPopup();
+      }
+
+      igPopID();
+
+      // Render Track Snippets (Right)
+      float track_top = row_start_pos.y;
+      float track_bottom = track_top + (ts->track_height * dpi_scale);
+      render_player_track(ts, i, draw_list, timeline_bb, track_top, track_bottom, is_track_selected);
+
+      igSetCursorScreenPos(row_start_pos);
+      ImVec2 avail = igGetContentRegionAvail();
+      igDummy((ImVec2){avail.x, ts->track_height * dpi_scale});
+    }
+  }
+  ImGuiListClipper_End(clipper);
+  ImGuiListClipper_destroy(clipper);
+  if (pending_clone_track >= 0) {
+    timeline_data_snapshot_t *before = commands_capture_timeline_data(ts);
+    if (before && model_clone_track_to_group(ts, pending_clone_track, pending_clone_group, NULL)) {
+      undo_command_t *command = commands_create_timeline_data_change(ts->ui, before, "Clone Track to Group");
+      if (command) undo_manager_register_command(&ts->ui->undo_manager, command);
+    } else commands_free_timeline_data_snapshot(before);
+  }
+}
+
+void renderer_draw_drag_preview(timeline_state_t *ts, ImDrawList *overlay_draw_list, ImRect timeline_bb) {
+  float dpi_scale = gfx_get_ui_scale();
+  if (!ts->drag_state.active) return;
+
+  int snapped_start_tick_clicked, base_track_index;
+  interaction_calculate_drag_destination(ts, timeline_bb, &snapped_start_tick_clicked, &base_track_index);
+
+  input_snippet_t *clicked_snippet = model_find_snippet_by_id(ts, ts->drag_state.dragged_snippet_id, NULL);
+  if (!clicked_snippet) return;
+
+  int delta_ticks = snapped_start_tick_clicked - clicked_snippet->start_tick;
+
+  // Determine which tracks are affected by the drag operation.
+  bool affected_tracks[256] = {false};
+  for (int i = 0; i < ts->drag_state.drag_info_count; ++i) {
+    dragged_snippet_info_t *d_info = &ts->drag_state.drag_infos[i];
+    int s_track_idx;
+    input_snippet_t *s = model_find_snippet_by_id(ts, d_info->snippet_id, &s_track_idx);
+    if (!s) continue;
+
+    if (s_track_idx < 256) affected_tracks[s_track_idx] = true;
+    int new_track_idx = base_track_index + d_info->track_offset;
+    if (new_track_idx >= 0 && new_track_idx < 256) affected_tracks[new_track_idx] = true;
+  }
+
+  // For each affected track, build a hypothetical layout and solve it.
+  for (int track_idx = 0; track_idx < ts->player_track_count; ++track_idx) {
+    if (track_idx >= 256 || !affected_tracks[track_idx]) continue;
+
+    player_track_t *track = &ts->player_tracks[track_idx];
+
+    // Count how many snippets will be on this track to allocate memory.
+    int hypothetical_count = 0;
+    for (int i = 0; i < track->snippet_count; ++i) {
+      if (!interaction_is_snippet_selected(ts, track->snippets[i].id)) {
+        hypothetical_count++;
+      }
+    }
+    for (int i = 0; i < ts->drag_state.drag_info_count; ++i) {
+      dragged_snippet_info_t *d_info = &ts->drag_state.drag_infos[i];
+      int new_track_idx = base_track_index + d_info->track_offset;
+      if (new_track_idx == track_idx) hypothetical_count++;
+    }
+
+    if (hypothetical_count == 0) continue;
+
+    // Create the list of hypothetical snippets and a pointer list for the solver.
+    input_snippet_t *hypothetical_snippets = malloc(hypothetical_count * sizeof(input_snippet_t));
+    input_snippet_t **solver_list = malloc(hypothetical_count * sizeof(input_snippet_t *));
+    if (!hypothetical_snippets || !solver_list) {
+      free(hypothetical_snippets);
+      free(solver_list);
+      continue;
+    }
+
+    int current_idx = 0;
+    // Add existing, non-dragged snippets.
+    for (int i = 0; i < track->snippet_count; ++i) {
+      if (!interaction_is_snippet_selected(ts, track->snippets[i].id)) {
+        hypothetical_snippets[current_idx] = track->snippets[i];
+        solver_list[current_idx] = &hypothetical_snippets[current_idx];
+        current_idx++;
+      }
+    }
+    // Add dragged snippets with their new proposed times.
+    for (int i = 0; i < ts->drag_state.drag_info_count; ++i) {
+      dragged_snippet_info_t *d_info = &ts->drag_state.drag_infos[i];
+      int new_track_idx = base_track_index + d_info->track_offset;
+      if (new_track_idx == track_idx) {
+        input_snippet_t *original = model_find_snippet_by_id(ts, d_info->snippet_id, NULL);
+        if (original) {
+          hypothetical_snippets[current_idx] = *original;
+          hypothetical_snippets[current_idx].start_tick += delta_ticks;
+          hypothetical_snippets[current_idx].end_tick += delta_ticks;
+          solver_list[current_idx] = &hypothetical_snippets[current_idx];
+          current_idx++;
+        }
+      }
+    }
+
+    // Run the solver to get the new, correct layers.
+    timeline_solve_snippet_layers(solver_list, hypothetical_count);
+
+    // Draw the previews for the dragged snippets using the solved layout.
+    ImDrawList_PushClipRect(overlay_draw_list, timeline_bb.Min, timeline_bb.Max, true);
+    for (int i = 0; i < hypothetical_count; ++i) {
+      input_snippet_t *preview_snip = &hypothetical_snippets[i];
+      if (interaction_is_snippet_selected(ts, preview_snip->id)) {
+        // Calculate stack size for correct height, based on the hypothetical layout
+        int stack_size = 0;
+        for (int j = 0; j < hypothetical_count; ++j) {
+          input_snippet_t *other = &hypothetical_snippets[j];
+          if (preview_snip->start_tick < other->end_tick && preview_snip->end_tick > other->start_tick) {
+            if (other->layer >= stack_size) stack_size = other->layer + 1;
+          }
+        }
+
+        float sub_lane_height = (ts->track_height * dpi_scale) / (float)fmax(1, stack_size);
+        float preview_min_x = renderer_tick_to_screen_x(ts, preview_snip->start_tick, timeline_bb.Min.x);
+        float preview_max_x = renderer_tick_to_screen_x(ts, preview_snip->end_tick, timeline_bb.Min.x);
+        float target_track_top = renderer_get_track_screen_y(ts, track_idx);
+        float preview_min_y = target_track_top + preview_snip->layer * sub_lane_height + 2.0f * dpi_scale;
+        float preview_max_y = preview_min_y + sub_lane_height - 4.0f * dpi_scale;
+
+        timeline_group_t *target_group = ts->groups[track->group_index];
+        ImU32 fill = igGetColorU32_Vec4((ImVec4){target_group->color[0], target_group->color[1], target_group->color[2], 0.35f});
+        ImDrawList_AddRectFilled(overlay_draw_list, (ImVec2){preview_min_x, preview_min_y}, (ImVec2){preview_max_x, preview_max_y}, fill, 4.0f * dpi_scale,
+                                 ImDrawFlags_RoundCornersAll);
+        if (igGetIO_Nil()->KeyAlt)
+          ImDrawList_AddRect(overlay_draw_list, (ImVec2){preview_min_x, preview_min_y}, (ImVec2){preview_max_x, preview_max_y},
+                             IM_COL32(100, 240, 150, 210), 4.0f * dpi_scale, ImDrawFlags_RoundCornersAll, 2.0f * dpi_scale);
+      }
+    }
+    ImDrawList_PopClipRect(overlay_draw_list);
+
+    free(hypothetical_snippets);
+    free(solver_list);
+  }
+}
+
+void renderer_draw_selection_box(timeline_state_t *ts, ImDrawList *overlay_draw_list) {
+  float dpi_scale = gfx_get_ui_scale();
+  if (!ts->selection_box_active) return;
+  ImRect rect = {{fminf(ts->selection_box_start.x, ts->selection_box_end.x), fminf(ts->selection_box_start.y, ts->selection_box_end.y)},
+                 {fmaxf(ts->selection_box_start.x, ts->selection_box_end.x), fmaxf(ts->selection_box_start.y, ts->selection_box_end.y)}};
+  ImDrawList_AddRectFilled(overlay_draw_list, rect.Min, rect.Max, IM_COL32(100, 150, 240, 80), 0.0f, 0);
+  ImDrawList_AddRect(overlay_draw_list, rect.Min, rect.Max, IM_COL32(100, 150, 240, 180), 0.0f, 0, 1.0f * dpi_scale);
+}
+
+// Static Render Helpers
+
+static void render_player_track(timeline_state_t *ts, int track_index, ImDrawList *draw_list, ImRect timeline_bb, float track_top, float track_bottom,
+                                bool is_selected) {
+  float dpi_scale = gfx_get_ui_scale();
+  player_track_t *track = &ts->player_tracks[track_index];
+
+  ImU32 track_bg_col;
+  if (is_selected) {
+    track_bg_col = igGetColorU32_Col(ImGuiCol_FrameBgHovered, 1.0f);
+  } else {
+    track_bg_col = (track_index % 2 == 0) ? igGetColorU32_Col(ImGuiCol_TitleBg, 1.0f) : igGetColorU32_Col(ImGuiCol_WindowBg, 1.0f);
+  }
+
+  ImDrawList_AddRectFilled(draw_list, (ImVec2){timeline_bb.Min.x, track_top}, (ImVec2){timeline_bb.Max.x, track_bottom}, track_bg_col, 0.0f, 0);
+  ImDrawList_AddLine(draw_list, (ImVec2){timeline_bb.Min.x, track_bottom}, (ImVec2){timeline_bb.Max.x, track_bottom},
+                     igGetColorU32_Col(ImGuiCol_Border, 0.3f), 1.0f * dpi_scale);
+
+  for (int j = 0; j < track->snippet_count; ++j) {
+    render_input_snippet(ts, track, &track->snippets[j], draw_list, timeline_bb, track_top, false);
+  }
+
+  if (ts->recording) {
+    for (int j = 0; j < track->recording_snippet_count; ++j) {
+      render_input_snippet(ts, track, &track->recording_snippets[j], draw_list, timeline_bb, track_top, true);
+    }
+  }
+}
+
+static ImU32 scaled_color(const float *rgb, float scale, float lift, float alpha) {
+  ImVec4 c = {rgb[0] * scale + (1.f - rgb[0] * scale) * lift, rgb[1] * scale + (1.f - rgb[1] * scale) * lift,
+              rgb[2] * scale + (1.f - rgb[2] * scale) * lift, alpha};
+  return igGetColorU32_Vec4(c);
+}
+
+// Runs of ticks in [first, first + count) of a playback snippet whose flags match `mask` == `want`,
+// drawn as rects between y0 and y1.
+static void draw_flag_runs(const timeline_state_t *ts, ImDrawList *draw_list, const uint8_t *flags, int first, int count, uint8_t mask,
+                           uint8_t want, float timeline_x, float clip_min_x, float clip_max_x, float y0, float y1, ImU32 color) {
+  int run_start = -1;
+  for (int i = 0; i <= count; ++i) {
+    const bool in_run = i < count && (flags[i] & mask) == want;
+    if (in_run && run_start < 0) run_start = i;
+    if (!in_run && run_start >= 0) {
+      float x0 = renderer_tick_to_screen_x(ts, first + run_start, timeline_x);
+      float x1 = renderer_tick_to_screen_x(ts, first + i, timeline_x);
+      if (x1 - x0 < 1.f) x1 = x0 + 1.f; // a single tick stays visible when zoomed out
+      x0 = fmaxf(x0, clip_min_x);
+      x1 = fminf(x1, clip_max_x);
+      if (x1 > x0) ImDrawList_AddRectFilled(draw_list, (ImVec2){x0, y0}, (ImVec2){x1, y1}, color, 0.f, 0);
+      run_start = -1;
+    }
+  }
+}
+
+// A playback snippet replays a demo instead of holding inputs, so it looks like a strip of film:
+// a darker body with sprocket holes along both edges and the demo's name. Ticks the player is not
+// in the demo are dimmed, ticks the demo had to be guessed at are tinted amber.
+static void render_playback_snippet(timeline_state_t *ts, player_track_t *track, input_snippet_t *snippet, ImDrawList *draw_list, ImVec2 min,
+                                    ImVec2 max, float snippet_x, bool is_selected) {
+  const float dpi = gfx_get_ui_scale();
+  const float rounding = 3.f * dpi;
+  const timeline_group_t *group = ts->groups[track->group_index];
+  timeline_recording_t *recording = recordings_find(ts, snippet->recording_id);
+  float progress = 0.f;
+  const recording_status_t status = recording ? recordings_status(recording, &progress, NULL, 0) : RECORDING_FAILED;
+  const float timeline_x = snippet_x - (snippet->start_tick - ts->view_start_tick) * ts->zoom;
+
+  const float body_scale = snippet->is_active ? 0.42f : 0.2f;
+  ImDrawList_AddRectFilled(draw_list, min, max, scaled_color(group->color, body_scale, is_selected ? 0.12f : 0.f, 0.96f), rounding,
+                           ImDrawFlags_RoundCornersAll);
+
+  // Sprocket holes, when the strip is tall enough to carry them.
+  const float height = max.y - min.y;
+  const bool sprockets = height >= 20.f * dpi;
+  const float hole_h = 2.5f * dpi, hole_w = 3.5f * dpi, margin = 2.5f * dpi;
+  if (sprockets) {
+    const float pitch = 9.f * dpi;
+    // Holes stay fixed to the film, not to the screen, so they slide with the snippet.
+    float x = snippet_x + 4.f * dpi;
+    if (x < min.x + 3.f * dpi) x += ceilf((min.x + 3.f * dpi - x) / pitch) * pitch;
+    const ImU32 hole = IM_COL32(8, 8, 10, 170);
+    for (; x + hole_w < max.x - 2.f * dpi; x += pitch) {
+      ImDrawList_AddRectFilled(draw_list, (ImVec2){x, min.y + margin}, (ImVec2){x + hole_w, min.y + margin + hole_h}, hole, 0.8f * dpi, 0);
+      ImDrawList_AddRectFilled(draw_list, (ImVec2){x, max.y - margin - hole_h}, (ImVec2){x + hole_w, max.y - margin}, hole, 0.8f * dpi, 0);
+    }
+  }
+  const float band_top = sprockets ? min.y + margin * 2.f + hole_h : min.y + 1.f * dpi;
+  const float band_bottom = sprockets ? max.y - margin * 2.f - hole_h : max.y - 1.f * dpi;
+
+  // Per-tick trust, for the visible part of the snippet only.
+  if (status == RECORDING_READY && recording->announced && recording->handle && ts->zoom > 0.f) {
+    const int visible_first = imax(snippet->start_tick, renderer_screen_x_to_tick(ts, min.x, timeline_x) - 1);
+    const int visible_end = imin(snippet->end_tick, renderer_screen_x_to_tick(ts, max.x, timeline_x) + 2);
+    const int count = visible_end - visible_first;
+    int recording_tick = 0;
+    if (count > 0 && recordings_snippet_tick(ts, snippet, visible_first, &recording_tick)) {
+      uint8_t stack_flags[2048];
+      uint8_t *flags = count <= (int)sizeof(stack_flags) ? stack_flags : malloc((size_t)count);
+      if (flags) {
+        gh_recording_tick_flags(&ts->ui->gfx_handler->game_host, recording->handle, snippet->recording_player, recording_tick,
+                                (unsigned)count, flags);
+        draw_flag_runs(ts, draw_list, flags, visible_first, count, FT_RECORDING_TICK_PRESENT, 0, timeline_x, min.x, max.x, band_top,
+                       band_bottom, IM_COL32(0, 0, 0, 120));
+        draw_flag_runs(ts, draw_list, flags, visible_first, count, FT_RECORDING_TICK_PRESENT | FT_RECORDING_TICK_APPROXIMATED,
+                       FT_RECORDING_TICK_PRESENT | FT_RECORDING_TICK_APPROXIMATED, timeline_x, min.x, max.x, band_top, band_bottom,
+                       IM_COL32(255, 170, 40, 95));
+        draw_flag_runs(ts, draw_list, flags, visible_first, count, FT_RECORDING_TICK_PRESENT | FT_RECORDING_TICK_APPROXIMATED,
+                       FT_RECORDING_TICK_PRESENT | FT_RECORDING_TICK_APPROXIMATED, timeline_x, min.x, max.x, band_bottom - 2.f * dpi,
+                       band_bottom, IM_COL32(255, 170, 40, 230));
+        if (flags != stack_flags) free(flags);
+      }
+    }
+  } else if (status == RECORDING_LOADING) {
+    const float bar_top = band_bottom - 3.f * dpi;
+    ImDrawList_AddRectFilled(draw_list, (ImVec2){min.x, bar_top}, (ImVec2){max.x, band_bottom}, IM_COL32(0, 0, 0, 90), 0.f, 0);
+    ImDrawList_AddRectFilled(draw_list, (ImVec2){min.x, bar_top}, (ImVec2){min.x + (max.x - min.x) * progress, band_bottom},
+                             scaled_color(group->color, 1.f, 0.35f, 0.9f), 0.f, 0);
+  }
+
+  // The label rides along the visible part of the strip.
+  char label[192];
+  const char *name = recording ? recording->name : "missing demo";
+  if (status == RECORDING_LOADING)
+    snprintf(label, sizeof(label), ICON_FA_FILM " %s  %.0f%%", name, progress * 100.f);
+  else if (status == RECORDING_FAILED)
+    snprintf(label, sizeof(label), ICON_FA_TRIANGLE_EXCLAMATION " %s", name);
+  else
+    snprintf(label, sizeof(label), ICON_FA_FILM " %s", name);
+  const ImVec2 text = igCalcTextSize(label, NULL, false, 0.f);
+  if (band_bottom - band_top >= text.y * 0.8f && max.x - min.x > 16.f * dpi) {
+    ImDrawList_PushClipRect(draw_list, (ImVec2){min.x + 3.f * dpi, band_top}, (ImVec2){max.x - 3.f * dpi, band_bottom}, true);
+    const ImU32 text_color = status == RECORDING_FAILED ? IM_COL32(255, 130, 120, 255) : IM_COL32(235, 235, 240, snippet->is_active ? 235 : 140);
+    ImDrawList_AddText_Vec2(draw_list, (ImVec2){min.x + 6.f * dpi, band_top + (band_bottom - band_top - text.y) * 0.5f}, text_color, label, NULL);
+    ImDrawList_PopClipRect(draw_list);
+  }
+
+  const ImU32 border = status == RECORDING_FAILED ? IM_COL32(230, 80, 70, 255)
+                       : is_selected               ? scaled_color(group->color, 1.f, 0.55f, 1.f)
+                                                   : scaled_color(group->color, 1.f, 0.1f, 0.85f);
+  ImDrawList_AddRect(draw_list, min, max, border, rounding, ImDrawFlags_RoundCornersAll, (is_selected ? 2.f : 1.f) * dpi);
+}
+
+// A snippet whose inputs the tick under the playhead uses, enabled or not, a shade lighter: where
+// one ends is where recording can start without a gap.
+static void highlight_under_playhead(timeline_state_t *ts, const player_track_t *track, const input_snippet_t *snippet,
+                                     ImDrawList *draw_list, ImVec2 min, ImVec2 max) {
+  const int tick = model_group_playhead_tick(ts, track->group_index);
+  if (tick < snippet->start_tick || tick >= snippet->end_tick) return;
+  ImDrawList_AddRectFilled(draw_list, min, max, IM_COL32(255, 255, 255, 30), 4.0f * gfx_get_ui_scale(), ImDrawFlags_RoundCornersAll);
+}
+
+static void render_input_snippet(timeline_state_t *ts, player_track_t *track, input_snippet_t *snippet, ImDrawList *draw_list, ImRect timeline_bb,
+                                 float track_top, bool is_recording_snippet) {
+  float dpi_scale = gfx_get_ui_scale();
+  float start_x = renderer_tick_to_screen_x(ts, snippet->start_tick, timeline_bb.Min.x);
+  float end_x = renderer_tick_to_screen_x(ts, snippet->end_tick, timeline_bb.Min.x);
+  if (end_x < timeline_bb.Min.x || start_x > timeline_bb.Max.x) return;
+
+  int stack_size = model_get_stack_size_at_tick_range(track, snippet->start_tick, snippet->end_tick);
+  float sub_lane_height = (ts->track_height * dpi_scale) / (float)fmax(1, stack_size);
+
+  ImVec2 min = {fmaxf(start_x, timeline_bb.Min.x), track_top + snippet->layer * sub_lane_height + 2.0f * dpi_scale};
+  ImVec2 max = {fminf(end_x, timeline_bb.Max.x), min.y + sub_lane_height - 4.0f * dpi_scale};
+  if (max.y <= min.y) return;
+
+  bool is_selected = interaction_is_snippet_selected(ts, snippet->id);
+  timeline_group_t *group = ts->groups[track->group_index];
+  ImVec4 selected_color = {
+      group->color[0] + (1.0f - group->color[0]) * 0.24f,
+      group->color[1] + (1.0f - group->color[1]) * 0.24f,
+      group->color[2] + (1.0f - group->color[2]) * 0.24f,
+      1.0f,
+  };
+  ImVec4 selected_border = {
+      group->color[0] + (1.0f - group->color[0]) * 0.52f,
+      group->color[1] + (1.0f - group->color[1]) * 0.52f,
+      group->color[2] + (1.0f - group->color[2]) * 0.52f,
+      1.0f,
+  };
+  if (!is_recording_snippet && snippet_is_playback(snippet)) {
+    render_playback_snippet(ts, track, snippet, draw_list, min, max, start_x, is_selected);
+    highlight_under_playhead(ts, track, snippet, draw_list, min, max);
+    return;
+  }
+
+  ImU32 color;
+  if (is_recording_snippet) {
+    color = IM_COL32(255, 30, 0, 100);
+  } else {
+    ImVec4 group_color = {group->color[0], group->color[1], group->color[2], 0.86f};
+    color = snippet->is_active
+                ? (is_selected ? igGetColorU32_Vec4(selected_color) : igGetColorU32_Vec4(group_color))
+                : (is_selected ? igGetColorU32_Vec4((ImVec4){group->color[0] * 0.55f, group->color[1] * 0.55f, group->color[2] * 0.55f, 1.0f})
+                               : igGetColorU32_Vec4((ImVec4){0.25f, 0.25f, 0.25f, 0.9f}));
+  }
+
+  ImDrawList_AddRectFilled(draw_list, min, max, color, 4.0f * dpi_scale, ImDrawFlags_RoundCornersAll);
+  if (!is_recording_snippet) highlight_under_playhead(ts, track, snippet, draw_list, min, max);
+  ImDrawList_AddRect(draw_list, min, max,
+                     is_selected ? igGetColorU32_Vec4(selected_border) : igGetColorU32_Col(ImGuiCol_Border, 0.6f), 4.0f * dpi_scale,
+                     ImDrawFlags_RoundCornersAll, (is_selected ? 2.0f : 1.0f) * dpi_scale);
+
+  if (!is_recording_snippet && snippet->effect_count > 0 && max.x - min.x >= 22.f * dpi_scale) {
+    const bool any_enabled = input_effects_enabled_count(snippet) > 0;
+    char badge[32];
+    snprintf(badge, sizeof(badge), "%s %d", ICON_FA_WAND_MAGIC_SPARKLES, snippet->effect_count);
+    const ImVec2 text_size = igCalcTextSize(badge, NULL, false, 0.f);
+    const float pad = 4.f * dpi_scale;
+    ImVec2 badge_min = {max.x - text_size.x - pad * 2.f, min.y};
+    if (badge_min.x < min.x) badge_min.x = min.x;
+    ImVec2 badge_max = {max.x, fminf(max.y, min.y + text_size.y + pad)};
+    ImDrawList_AddRectFilled(draw_list, badge_min, badge_max,
+                             any_enabled ? IM_COL32(35, 35, 45, 190) : IM_COL32(70, 70, 70, 150),
+                             4.f * dpi_scale, ImDrawFlags_RoundCornersTopRight | ImDrawFlags_RoundCornersBottomLeft);
+    ImDrawList_AddText_Vec2(draw_list, (ImVec2){badge_min.x + pad, badge_min.y + (badge_max.y - badge_min.y - text_size.y) * 0.5f},
+                            any_enabled ? IM_COL32(255, 225, 115, 255) : IM_COL32(190, 190, 190, 220), badge, NULL);
+  }
+}

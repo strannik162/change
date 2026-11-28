@@ -1,0 +1,33 @@
+build
+debug
+build-sm64
+build-tmuf
+release
+build-bench
+.cache
+compile_commands.json
+imgui.ini
+.vscode
+*.diff
+*.xml
+*.tasp
+*.spv
+\#*\#
+todo.txt
+.claude
+build-pgo
+perfwork
+discord*
+plugins/u*
+
+# Rust example game module build output
+games/*/target/
+data/games/tmuf/Packs
+data/games/tmuf/GameData
+
+# Untracked project checkouts
+*.auto
+!tests/ddnet_project_roundtrip.auto
+*.log
+
+docs/branding

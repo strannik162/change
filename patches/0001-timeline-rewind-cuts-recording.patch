@@ -1,0 +1,35 @@
+From 6d16aba834f771579fc1d0cec898b6c23b48a902 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sat, 28 Nov 2026 10:21:10 +0000
+Subject: [PATCH] timeline: cut the take back to the playhead when rewinding
+ while recording
+
+Holding the rewind key (C) while recording now trims the takes to the
+playhead, the same cut the Trim Recording shortcut makes, so the ticks the
+rewind goes back over are recorded afresh instead of replayed from the take.
+The cut runs before the inputs are sampled and the ticks advance, so the
+tick the playhead lands on belongs to the new take.
+---
+ src/user_interface/timeline/timeline_interaction.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/user_interface/timeline/timeline_interaction.c b/src/user_interface/timeline/timeline_interaction.c
+index 50302de..905db83 100644
+--- a/src/user_interface/timeline/timeline_interaction.c
++++ b/src/user_interface/timeline/timeline_interaction.c
+@@ -284,6 +284,12 @@ void interaction_handle_playback_and_shortcuts(timeline_state_t *ts) {
+   ts->is_reversing = reverse_down;
+   if (ts->is_reversing) ts->is_playing = false;
+ 
++  // Rewinding while recording cuts the takes back to the playhead, tick by tick, so the ticks the
++  // rewind goes back over are recorded afresh instead of replayed from the take. It runs before the
++  // inputs are sampled and the ticks advance, so the tick the playhead lands on is part of the new
++  // take. (No only_controlled: the linked tees record the same passage and are cut with it.)
++  if (ts->is_reversing) interaction_trim_recording_snippet(ts, false);
++
+   // Always update inputs for ALL tracks (selected + dummies) to ensure smooth prediction rendering
+   if (ts->recording) {
+     interaction_update_recording_input(ts->ui);
+-- 
+2.39.5
+

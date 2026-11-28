@@ -1,0 +1,2180 @@
+#include <user_interface/timeline/timeline_recordings.h>
+#include "save.h"
+
+#include "fs.h"
+#include <engine/engine_api.h>
+#include <system/config.h>
+#include <engine/game_host.h>
+#include <engine/int_math.h>
+#include <limits.h>
+#include <logger/logger.h>
+#include <math.h>
+#include <renderer/graphics_backend.h>
+#include <renderer/renderer.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <user_interface/camera/camera_rig.h>
+#include <user_interface/snippet_editor.h>
+#include <user_interface/timeline/timeline.h>
+#include <user_interface/timeline/timeline_model.h>
+#include <user_interface/timeline_events.h>
+
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+static const char *LOG_SOURCE = "SaveFile";
+
+enum {
+  PROJECT_MAX_GROUPS = 65536,
+  PROJECT_MAX_TRACKS = 65536,
+  PROJECT_MAX_EVENTS = 1000000,
+  PROJECT_MAX_SOURCE_TICKS = 10000000,
+  PROJECT_MAX_EFFECT_PAYLOAD = 4096,
+};
+
+#define PROJECT_MAX_FILE_SIZE ((size_t)1024 * 1024 * 1024)
+#define PROJECT_MAX_BLOB_SIZE ((size_t)512 * 1024 * 1024)
+#define PROJECT_MAX_RECORDINGS 256
+
+typedef struct byte_buffer_t {
+  uint8_t *data;
+  size_t size;
+  size_t capacity;
+  bool ok;
+} byte_buffer_t;
+
+typedef struct byte_reader_t {
+  const uint8_t *data;
+  size_t size;
+  size_t pos;
+  bool ok;
+} byte_reader_t;
+
+typedef struct project_group_t {
+  char name[MAX_TIMELINE_GROUP_NAME];
+  float color[4];
+  bool visible;
+  bool export_enabled;
+  bool prediction_enabled;
+  int start_offset;
+  uint8_t *world_data;
+  size_t world_size;
+} project_group_t;
+
+// A recording file the project carries, e.g. an imported demo (version 25).
+typedef struct project_recording_t {
+  int id;
+  char name[128];
+  uint8_t *data;
+  size_t size;
+} project_recording_t;
+
+typedef struct project_document_t {
+  uint32_t version;
+  camera_timeline_t camera_timeline;
+  render_profile_t video_profile;
+  video_export_options_t video_options;
+  bool has_video_options;
+  uint8_t *group_video_visible;
+  float *group_opacities; // viewport and video opacity per group, in pairs (version 26)
+  uint32_t group_volume_count;
+  float *group_volumes; // viewport and video volume per group, in pairs (version 28)
+  uint32_t group_opacity_count;
+  uint32_t group_video_count;
+  char game_id[FT_ID_MAX];
+  char game_version[FT_NAME_MAX];
+  char variant_id[FT_ID_MAX];
+  char level_name[128];
+  char level_path[1024];
+  char camera_mode_id[FT_ID_MAX];
+  uint64_t input_schema_hash;
+  uint32_t input_record_size;
+
+  float camera_pos[2];
+  float camera_zoom;
+  int current_tick;
+  int active_group_index;
+  int selected_track_index;
+  bool linked_copy_input;
+
+  uint8_t *level_data;
+  size_t level_size;
+  uint8_t *project_data;
+  size_t project_size;
+  project_group_t *groups;
+  int group_count;
+  player_track_t *tracks;
+  int track_count;
+  timeline_event_t *events;
+  int event_count;
+  project_recording_t *recordings;
+  int recording_count;
+} project_document_t;
+
+static bool buffer_u32(byte_buffer_t *buffer, uint32_t value);
+static bool buffer_i32(byte_buffer_t *buffer, int32_t value);
+static bool buffer_f32(byte_buffer_t *buffer, float value);
+static bool reader_u32(byte_reader_t *reader, uint32_t *out);
+static bool reader_i32(byte_reader_t *reader, int32_t *out);
+static bool reader_f32(byte_reader_t *reader, float *out);
+
+static bool buffer_f64(byte_buffer_t *buffer, double value);
+static bool reader_f64(byte_reader_t *reader, double *out);
+static bool buffer_u8(byte_buffer_t *buffer, uint8_t value);
+static bool reader_u8(byte_reader_t *reader, uint8_t *out);
+
+static bool write_camera_keys_header(byte_buffer_t *buffer, double time, int interp, const camera_ease_t *ease) {
+  return buffer_f64(buffer, time) && buffer_i32(buffer, interp) && buffer_i32(buffer, ease->mode) &&
+         buffer_f32(buffer, ease->in_slope) && buffer_f32(buffer, ease->out_slope) &&
+         buffer_f32(buffer, ease->in_influence) && buffer_f32(buffer, ease->out_influence);
+}
+
+static bool write_camera_timeline(byte_buffer_t *buffer, const camera_timeline_t *camera) {
+  if (!buffer_u32(buffer, camera->range_set ? 1u : 0u) || !buffer_f64(buffer, camera->range_start) ||
+      !buffer_f64(buffer, camera->range_end) || !buffer_u32(buffer, (uint32_t)camera->subject_count))
+    return false;
+  for (int i = 0; i < camera->subject_count; ++i)
+    if (!buffer_i32(buffer, camera->subject_tracks[i])) return false;
+  for (int v = 0; v < 3; ++v)
+    if (!buffer_f32(buffer, camera->subject_offset[v])) return false;
+  if (!buffer_u32(buffer, camera->fit_subjects ? 1u : 0u) || !buffer_f32(buffer, camera->fit_fill) ||
+      !buffer_i32(buffer, camera->follow_style))
+    return false;
+
+  if (!buffer_u32(buffer, (uint32_t)camera->time_count)) return false;
+  for (int i = 0; i < camera->time_count; ++i) {
+    const camera_time_key_t *key = &camera->time_keys[i];
+    if (!write_camera_keys_header(buffer, key->time, key->interp, &key->ease) || !buffer_f64(buffer, key->game_tick)) return false;
+  }
+  if (!buffer_u32(buffer, (uint32_t)camera->pose_count)) return false;
+  for (int i = 0; i < camera->pose_count; ++i) {
+    const camera_pose_key_t *key = &camera->pose_keys[i];
+    if (!write_camera_keys_header(buffer, key->time, key->interp, &key->ease)) return false;
+    for (int v = 0; v < 3; ++v)
+      if (!buffer_f32(buffer, key->pose.eye[v]) || !buffer_f32(buffer, key->pose.target[v])) return false;
+    if (!buffer_f32(buffer, key->pose.roll) || !buffer_f32(buffer, key->pose.fov_y) || !buffer_f32(buffer, key->pose.zoom) ||
+        !buffer_i32(buffer, key->spatial.mode))
+      return false;
+    const float *handles[4] = {key->spatial.eye_in, key->spatial.eye_out, key->spatial.target_in, key->spatial.target_out};
+    for (int h = 0; h < 4; ++h)
+      for (int v = 0; v < 3; ++v)
+        if (!buffer_f32(buffer, handles[h][v])) return false;
+    // Version 31: timed by the path.
+    if (!buffer_u8(buffer, key->rove ? 1 : 0)) return false;
+  }
+  const camera_influence_key_t *influence[2] = {camera->follow_keys, camera->aim_keys};
+  const int counts[2] = {camera->follow_count, camera->aim_count};
+  for (int channel = 0; channel < 2; ++channel) {
+    if (!buffer_u32(buffer, (uint32_t)counts[channel])) return false;
+    for (int i = 0; i < counts[channel]; ++i) {
+      const camera_influence_key_t *key = &influence[channel][i];
+      if (!write_camera_keys_header(buffer, key->time, key->interp, &key->ease) || !buffer_f32(buffer, key->value)) return false;
+    }
+  }
+  // Version 30: who the shot is about.
+  if (!buffer_u32(buffer, (uint32_t)camera->focus_count)) return false;
+  for (int i = 0; i < camera->focus_count; ++i) {
+    const camera_focus_key_t *key = &camera->focus_keys[i];
+    if (!write_camera_keys_header(buffer, key->time, key->interp, &key->ease) || !buffer_i32(buffer, key->track)) return false;
+  }
+  return true;
+}
+
+// Keys come back sorted, finite and within the channel's capacity, or the
+// file is malformed. Handles arrived in version 21; older keys get automatic ones.
+static bool read_camera_key_header(byte_reader_t *reader, uint32_t version, double previous, int index, double *time,
+                                   int *interp, camera_ease_t *ease) {
+  if (!reader_f64(reader, time) || !isfinite(*time) || (index != 0 && *time <= previous) || !reader_i32(reader, interp) ||
+      *interp < 0 || *interp >= CAMERA_INTERP_COUNT)
+    return false;
+  memset(ease, 0, sizeof(*ease));
+  if (version < 21) return true;
+  return reader_i32(reader, &ease->mode) && ease->mode >= 0 && ease->mode < CAMERA_HANDLE_COUNT &&
+         reader_f32(reader, &ease->in_slope) && reader_f32(reader, &ease->out_slope) &&
+         reader_f32(reader, &ease->in_influence) && reader_f32(reader, &ease->out_influence) &&
+         isfinite(ease->in_slope) && isfinite(ease->out_slope) && isfinite(ease->in_influence) &&
+         isfinite(ease->out_influence);
+}
+
+static bool read_camera_timeline(byte_reader_t *reader, camera_timeline_t *camera, uint32_t version) {
+  camera_timeline_default(camera);
+  uint32_t range_set, count;
+  if (!reader_u32(reader, &range_set) || range_set > 1 || !reader_f64(reader, &camera->range_start) ||
+      !reader_f64(reader, &camera->range_end) || !isfinite(camera->range_start) || !isfinite(camera->range_end))
+    return false;
+  camera->range_set = range_set != 0;
+  // Version 22 tracks a set of characters; earlier files name one.
+  if (version >= 22) {
+    if (!reader_u32(reader, &count) || count > CAMERA_MAX_SUBJECTS) return false;
+    camera->subject_count = (int)count;
+    for (int i = 0; i < camera->subject_count; ++i)
+      if (!reader_i32(reader, &camera->subject_tracks[i])) return false;
+  } else {
+    camera->subject_count = 1;
+    if (!reader_i32(reader, &camera->subject_tracks[0])) return false;
+  }
+  for (int v = 0; v < 3; ++v)
+    if (!reader_f32(reader, &camera->subject_offset[v]) || !isfinite(camera->subject_offset[v])) return false;
+  if (version >= 22) {
+    uint32_t fit;
+    if (!reader_u32(reader, &fit) || fit > 1 || !reader_f32(reader, &camera->fit_fill) || !isfinite(camera->fit_fill))
+      return false;
+    camera->fit_subjects = fit != 0;
+  }
+  if (version >= 24 && (!reader_i32(reader, &camera->follow_style) || camera->follow_style < 0 ||
+                        camera->follow_style >= CAMERA_FOLLOW_COUNT))
+    return false;
+
+  if (!reader_u32(reader, &count) || count > CAMERA_MAX_TIME_KEYS) return false;
+  camera->time_count = (int)count;
+  for (int i = 0; i < camera->time_count; ++i) {
+    camera_time_key_t *key = &camera->time_keys[i];
+    if (!read_camera_key_header(reader, version, i ? camera->time_keys[i - 1].time : 0.0, i, &key->time, &key->interp,
+                                &key->ease) ||
+        !reader_f64(reader, &key->game_tick) || !isfinite(key->game_tick))
+      return false;
+  }
+  if (!reader_u32(reader, &count) || count > CAMERA_MAX_POSE_KEYS) return false;
+  camera->pose_count = (int)count;
+  for (int i = 0; i < camera->pose_count; ++i) {
+    camera_pose_key_t *key = &camera->pose_keys[i];
+    if (!read_camera_key_header(reader, version, i ? camera->pose_keys[i - 1].time : 0.0, i, &key->time, &key->interp,
+                                &key->ease))
+      return false;
+    for (int v = 0; v < 3; ++v)
+      if (!reader_f32(reader, &key->pose.eye[v]) || !reader_f32(reader, &key->pose.target[v]) ||
+          !isfinite(key->pose.eye[v]) || !isfinite(key->pose.target[v]))
+        return false;
+    if (!reader_f32(reader, &key->pose.roll) || !reader_f32(reader, &key->pose.fov_y) ||
+        !reader_f32(reader, &key->pose.zoom) || !isfinite(key->pose.roll) || !isfinite(key->pose.fov_y) ||
+        !isfinite(key->pose.zoom) || key->pose.zoom <= 0.f)
+      return false;
+    if (version >= 21) {
+      if (!reader_i32(reader, &key->spatial.mode) || key->spatial.mode < 0 || key->spatial.mode >= CAMERA_HANDLE_COUNT)
+        return false;
+      float *handles[4] = {key->spatial.eye_in, key->spatial.eye_out, key->spatial.target_in, key->spatial.target_out};
+      for (int h = 0; h < 4; ++h)
+        for (int v = 0; v < 3; ++v)
+          if (!reader_f32(reader, &handles[h][v]) || !isfinite(handles[h][v])) return false;
+    }
+    uint8_t rove = 0;
+    if (version >= 31 && (!reader_u8(reader, &rove) || rove > 1)) return false;
+    key->rove = rove != 0;
+  }
+  camera_influence_key_t *influence[2] = {camera->follow_keys, camera->aim_keys};
+  int *counts[2] = {&camera->follow_count, &camera->aim_count};
+  for (int channel = 0; channel < 2; ++channel) {
+    if (!reader_u32(reader, &count) || count > CAMERA_MAX_INFLUENCE_KEYS) return false;
+    *counts[channel] = (int)count;
+    for (int i = 0; i < *counts[channel]; ++i) {
+      camera_influence_key_t *key = &influence[channel][i];
+      if (!read_camera_key_header(reader, version, i ? influence[channel][i - 1].time : 0.0, i, &key->time, &key->interp,
+                                  &key->ease) ||
+          !reader_f32(reader, &key->value) || !(key->value >= 0.f && key->value <= 1.f))
+        return false;
+    }
+  }
+  if (version == 21) camera_pose_eases_from_absolute(camera);
+  // Before version 31 automatic keys at the ends of a shot came to rest; such a project keeps them so.
+  if (version < 31) camera_pose_stop_open_ends(camera);
+  if (version < 30) return true;
+  if (!reader_u32(reader, &count) || count > CAMERA_MAX_FOCUS_KEYS) return false;
+  camera->focus_count = (int)count;
+  for (int i = 0; i < camera->focus_count; ++i) {
+    camera_focus_key_t *key = &camera->focus_keys[i];
+    if (!read_camera_key_header(reader, version, i ? camera->focus_keys[i - 1].time : 0.0, i, &key->time, &key->interp,
+                                &key->ease) ||
+        !reader_i32(reader, &key->track))
+      return false;
+    key->interp = CAMERA_INTERP_HOLD;
+    if (key->track < 0) key->track = -1;
+  }
+  return true;
+}
+
+static bool buffer_string(byte_buffer_t *buffer, const char *text);
+static bool reader_string(byte_reader_t *reader, char *out, size_t capacity);
+static bool buffer_i64(byte_buffer_t *buffer, int64_t value);
+static bool reader_i64(byte_reader_t *reader, int64_t *out);
+static bool buffer_u8(byte_buffer_t *buffer, uint8_t value);
+static bool reader_u8(byte_reader_t *reader, uint8_t *out);
+
+// How the project's video looks: the game's render settings, the editor's
+// overlays and which groups appear. Version 23 on.
+static bool write_render_video(byte_buffer_t *buffer, ui_handler_t *ui) {
+  const render_profile_t *profile = &ui->render.video;
+  if (!buffer_u8(buffer, profile->valid ? 1 : 0) || !buffer_u32(buffer, (uint32_t)profile->setting_count)) return false;
+  for (int i = 0; i < profile->setting_count; ++i) {
+    const render_setting_value_t *setting = &profile->settings[i];
+    if (!buffer_string(buffer, setting->id) || !buffer_u32(buffer, (uint32_t)setting->value.kind)) return false;
+    bool ok = true;
+    switch (setting->value.kind) {
+    case FT_VALUE_BOOL: ok = buffer_u8(buffer, setting->value.as.b ? 1 : 0); break;
+    case FT_VALUE_INT: ok = buffer_i64(buffer, setting->value.as.i); break;
+    case FT_VALUE_FLOAT: ok = buffer_f64(buffer, setting->value.as.f); break;
+    default: ok = false; break;
+    }
+    if (!ok) return false;
+  }
+  if (!buffer_u32(buffer, RENDER_LAYER_COUNT)) return false;
+  for (int layer = 0; layer < RENDER_LAYER_COUNT; ++layer)
+    if (!buffer_u8(buffer, profile->layers[layer] ? 1 : 0)) return false;
+  const timeline_state_t *ts = &ui->timeline;
+  if (!buffer_u32(buffer, (uint32_t)ts->group_count)) return false;
+  for (int g = 0; g < ts->group_count; ++g)
+    if (!buffer_u8(buffer, ts->groups[g]->video_visible ? 1 : 0)) return false;
+  // The output: size, rate and encoding. The range is the camera's.
+  const video_export_options_t *o = &ui->video_options;
+  const int32_t fields[] = {o->width, o->height, o->fps_num, o->fps_den, o->codec, o->quality_mode,
+                            o->quality, o->bitrate_kbps, o->preset, o->bit_depth, o->hardware};
+  if (!buffer_u32(buffer, (uint32_t)(sizeof(fields) / sizeof(fields[0])))) return false;
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+    if (!buffer_i32(buffer, fields[i])) return false;
+  // Version 26: what the video is about, and how opaque each group is drawn.
+  if (!buffer_i32(buffer, profile->valid ? profile->focus : RENDER_FOCUS_CAMERA) || !buffer_u32(buffer, (uint32_t)ts->group_count))
+    return false;
+  for (int g = 0; g < ts->group_count; ++g)
+    if (!buffer_f32(buffer, ts->groups[g]->opacity) || !buffer_f32(buffer, ts->groups[g]->video_opacity)) return false;
+  // Version 28: how loud each group is heard.
+  for (int g = 0; g < ts->group_count; ++g)
+    if (!buffer_f32(buffer, ts->groups[g]->volume) || !buffer_f32(buffer, ts->groups[g]->video_volume)) return false;
+  return true;
+}
+
+static bool read_render_video(byte_reader_t *reader, project_document_t *document, uint32_t version) {
+  render_profile_t *profile = &document->video_profile;
+  memset(profile, 0, sizeof(*profile));
+  uint8_t valid, flag;
+  uint32_t count;
+  if (!reader_u8(reader, &valid) || valid > 1 || !reader_u32(reader, &count) || count > RENDER_PROFILE_MAX_SETTINGS)
+    return false;
+  profile->valid = valid != 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    char id[RENDER_SETTING_ID_MAX];
+    uint32_t kind;
+    ft_value value = {0};
+    if (!reader_string(reader, id, sizeof(id)) || !reader_u32(reader, &kind)) return false;
+    value.kind = (ft_value_kind)kind;
+    switch (kind) {
+    case FT_VALUE_BOOL:
+      if (!reader_u8(reader, &flag) || flag > 1) return false;
+      value.as.b = flag != 0;
+      break;
+    case FT_VALUE_INT:
+      if (!reader_i64(reader, &value.as.i)) return false;
+      break;
+    case FT_VALUE_FLOAT:
+      if (!reader_f64(reader, &value.as.f) || !isfinite(value.as.f)) return false;
+      break;
+    default: return false;
+    }
+    render_profile_set(profile, id, &value);
+  }
+  // Layers the file does not know stay off; ones this build does not know are skipped.
+  if (!reader_u32(reader, &count) || count > 64) return false;
+  for (uint32_t layer = 0; layer < count; ++layer) {
+    if (!reader_u8(reader, &flag) || flag > 1) return false;
+    if (layer < RENDER_LAYER_COUNT) profile->layers[layer] = flag != 0;
+  }
+  if (!reader_u32(reader, &count) || count > PROJECT_MAX_GROUPS) return false;
+  document->group_video_visible = count ? malloc(count) : NULL;
+  if (count && !document->group_video_visible) return false;
+  document->group_video_count = count;
+  for (uint32_t g = 0; g < count; ++g)
+    if (!reader_u8(reader, &document->group_video_visible[g]) || document->group_video_visible[g] > 1) return false;
+  // Version 27 adds the hardware encoder switch.
+  int32_t fields[11] = {0};
+  if (!reader_u32(reader, &count) || count != (version >= 27 ? 11u : 10u)) return false;
+  for (uint32_t i = 0; i < count; ++i)
+    if (!reader_i32(reader, &fields[i])) return false;
+  video_export_options_t *o = &document->video_options;
+  video_export_defaults(o);
+  o->width = fields[0];
+  o->height = fields[1];
+  o->fps_num = fields[2];
+  o->fps_den = fields[3];
+  o->codec = fields[4];
+  o->quality_mode = fields[5];
+  o->quality = fields[6];
+  o->bitrate_kbps = fields[7];
+  o->preset = fields[8];
+  o->bit_depth = fields[9];
+  o->hardware = fields[10];
+  // Anything out of range falls back to the defaults rather than failing the load.
+  if (o->width < 2 || o->height < 2 || o->width > 16384 || o->height > 16384 || o->fps_num <= 0 || o->fps_den <= 0 ||
+      o->codec < 0 || o->codec > 2 || o->quality_mode < 0 || o->quality_mode > 1 || o->quality < 0 || o->quality > 51 ||
+      o->bitrate_kbps <= 0 || o->preset < 0 || o->preset > 2 || (o->bit_depth != 8 && o->bit_depth != 10) ||
+      o->hardware < 0 || o->hardware > 1)
+    video_export_defaults(o);
+  document->has_video_options = true;
+  profile->focus = RENDER_FOCUS_CAMERA;
+  if (version < 26) return true;
+  int32_t focus;
+  if (!reader_i32(reader, &focus) || !reader_u32(reader, &count) || count > PROJECT_MAX_GROUPS) return false;
+  // Before version 30 a video could name a group; the camera's focus decides that now.
+  if (focus == RENDER_FOCUS_MERGED) profile->focus = focus;
+  document->group_opacities = count ? malloc(sizeof(float) * 2 * count) : NULL;
+  if (count && !document->group_opacities) return false;
+  document->group_opacity_count = count;
+  for (uint32_t i = 0; i < count * 2; ++i) {
+    float value;
+    if (!reader_f32(reader, &value)) return false;
+    document->group_opacities[i] = isfinite(value) ? (value < 0.f ? 0.f : value > 1.f ? 1.f : value) : 1.f;
+  }
+  if (version < 28) return true;
+  document->group_volumes = count ? malloc(sizeof(float) * 2 * count) : NULL;
+  if (count && !document->group_volumes) return false;
+  document->group_volume_count = count;
+  for (uint32_t i = 0; i < count * 2; ++i) {
+    float value;
+    if (!reader_f32(reader, &value)) return false;
+    document->group_volumes[i] = isfinite(value) ? (value < 0.f ? 0.f : value > 1.f ? 1.f : value) : 1.f;
+  }
+  return true;
+}
+
+static bool checked_multiply(size_t a, size_t b, size_t *out) {
+  if (a != 0 && b > SIZE_MAX / a) return false;
+  *out = a * b;
+  return true;
+}
+
+static bool buffer_reserve(byte_buffer_t *buffer, size_t extra) {
+  if (!buffer->ok || extra > PROJECT_MAX_FILE_SIZE || buffer->size > PROJECT_MAX_FILE_SIZE - extra) {
+    buffer->ok = false;
+    return false;
+  }
+  const size_t needed = buffer->size + extra;
+  if (needed <= buffer->capacity) return true;
+  size_t capacity = buffer->capacity ? buffer->capacity : 4096;
+  while (capacity < needed) {
+    if (capacity > PROJECT_MAX_FILE_SIZE / 2) {
+      capacity = PROJECT_MAX_FILE_SIZE;
+      break;
+    }
+    capacity *= 2;
+  }
+  uint8_t *grown = realloc(buffer->data, capacity);
+  if (!grown) {
+    buffer->ok = false;
+    return false;
+  }
+  buffer->data = grown;
+  buffer->capacity = capacity;
+  return true;
+}
+
+static bool buffer_write(byte_buffer_t *buffer, const void *data, size_t size) {
+  if (!buffer_reserve(buffer, size)) return false;
+  if (size > 0) memcpy(buffer->data + buffer->size, data, size);
+  buffer->size += size;
+  return true;
+}
+
+static bool buffer_u8(byte_buffer_t *buffer, uint8_t value) { return buffer_write(buffer, &value, 1); }
+
+static bool buffer_u32(byte_buffer_t *buffer, uint32_t value) {
+  uint8_t bytes[4] = {(uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24)};
+  return buffer_write(buffer, bytes, sizeof(bytes));
+}
+
+static bool buffer_i32(byte_buffer_t *buffer, int32_t value) { return buffer_u32(buffer, (uint32_t)value); }
+
+static bool buffer_u64(byte_buffer_t *buffer, uint64_t value) {
+  uint8_t bytes[8];
+  for (unsigned i = 0; i < 8; ++i)
+    bytes[i] = (uint8_t)(value >> (i * 8));
+  return buffer_write(buffer, bytes, sizeof(bytes));
+}
+
+static bool buffer_i64(byte_buffer_t *buffer, int64_t value) { return buffer_u64(buffer, (uint64_t)value); }
+
+static bool buffer_f32(byte_buffer_t *buffer, float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return buffer_u32(buffer, bits);
+}
+
+static bool buffer_f64(byte_buffer_t *buffer, double value) {
+  uint64_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return buffer_u64(buffer, bits);
+}
+
+static bool buffer_string(byte_buffer_t *buffer, const char *text) {
+  const size_t length = text ? strlen(text) : 0;
+  if (length > UINT32_MAX) {
+    buffer->ok = false;
+    return false;
+  }
+  return buffer_u32(buffer, (uint32_t)length) && buffer_write(buffer, text, length);
+}
+
+static bool buffer_patch_u64(byte_buffer_t *buffer, size_t offset, uint64_t value) {
+  if (!buffer->ok || offset > buffer->size || buffer->size - offset < 8) return false;
+  for (unsigned i = 0; i < 8; ++i)
+    buffer->data[offset + i] = (uint8_t)(value >> (i * 8));
+  return true;
+}
+
+static bool reader_bytes(byte_reader_t *reader, void *out, size_t size) {
+  if (!reader->ok || reader->pos > reader->size || size > reader->size - reader->pos) {
+    reader->ok = false;
+    return false;
+  }
+  if (size > 0 && out) memcpy(out, reader->data + reader->pos, size);
+  reader->pos += size;
+  return true;
+}
+
+static bool reader_u8(byte_reader_t *reader, uint8_t *out) { return reader_bytes(reader, out, 1); }
+
+static bool reader_u32(byte_reader_t *reader, uint32_t *out) {
+  uint8_t bytes[4];
+  if (!reader_bytes(reader, bytes, sizeof(bytes))) return false;
+  *out = (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 | (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+  return true;
+}
+
+static bool reader_i32(byte_reader_t *reader, int32_t *out) {
+  uint32_t value;
+  if (!reader_u32(reader, &value)) return false;
+  *out = (int32_t)value;
+  return true;
+}
+
+static bool reader_u64(byte_reader_t *reader, uint64_t *out) {
+  uint8_t bytes[8];
+  if (!reader_bytes(reader, bytes, sizeof(bytes))) return false;
+  uint64_t value = 0;
+  for (unsigned i = 0; i < 8; ++i)
+    value |= (uint64_t)bytes[i] << (i * 8);
+  *out = value;
+  return true;
+}
+
+static bool reader_i64(byte_reader_t *reader, int64_t *out) {
+  uint64_t value;
+  if (!reader_u64(reader, &value)) return false;
+  *out = (int64_t)value;
+  return true;
+}
+
+static bool reader_f32(byte_reader_t *reader, float *out) {
+  uint32_t bits;
+  if (!reader_u32(reader, &bits)) return false;
+  memcpy(out, &bits, sizeof(bits));
+  return isfinite(*out);
+}
+
+static bool reader_f64(byte_reader_t *reader, double *out) {
+  uint64_t bits;
+  if (!reader_u64(reader, &bits)) return false;
+  memcpy(out, &bits, sizeof(bits));
+  return isfinite(*out);
+}
+
+static bool reader_string(byte_reader_t *reader, char *out, size_t capacity) {
+  uint32_t length;
+  if (!reader_u32(reader, &length) || capacity == 0 || length >= capacity) {
+    reader->ok = false;
+    return false;
+  }
+  if (!reader_bytes(reader, out, length)) return false;
+  out[length] = '\0';
+  return true;
+}
+
+static bool reader_blob(byte_reader_t *reader, uint64_t encoded_size, uint8_t **out, size_t *out_size) {
+  if (reader->pos > reader->size || encoded_size > PROJECT_MAX_BLOB_SIZE || encoded_size > SIZE_MAX ||
+      encoded_size > reader->size - reader->pos) {
+    reader->ok = false;
+    return false;
+  }
+  const size_t size = (size_t)encoded_size;
+  uint8_t *data = size ? malloc(size) : NULL;
+  if (size && !data) {
+    reader->ok = false;
+    return false;
+  }
+  if (!reader_bytes(reader, data, size)) {
+    free(data);
+    return false;
+  }
+  *out = data;
+  *out_size = size;
+  return true;
+}
+
+static bool reader_skip_blob(byte_reader_t *reader, uint64_t encoded_size) {
+  if (reader->pos > reader->size || encoded_size > PROJECT_MAX_BLOB_SIZE || encoded_size > SIZE_MAX ||
+      encoded_size > reader->size - reader->pos) {
+    reader->ok = false;
+    return false;
+  }
+  return reader_bytes(reader, NULL, (size_t)encoded_size);
+}
+
+static void project_document_free(project_document_t *document) {
+  if (!document) return;
+  if (document->tracks) {
+    for (int i = 0; i < document->track_count; ++i) {
+      player_track_t *track = &document->tracks[i];
+      for (int j = 0; j < track->snippet_count; ++j)
+        model_free_snippet_inputs(&track->snippets[j]);
+      free(track->snippets);
+    }
+  }
+  if (document->groups)
+    for (int i = 0; i < document->group_count; ++i)
+      free(document->groups[i].world_data);
+  free(document->groups);
+  free(document->group_video_visible);
+  free(document->group_opacities);
+  free(document->group_volumes);
+  free(document->tracks);
+  free(document->events);
+  for (int i = 0; i < document->recording_count; ++i)
+    free(document->recordings[i].data);
+  free(document->recordings);
+  free(document->level_data);
+  free(document->project_data);
+  memset(document, 0, sizeof(*document));
+}
+
+static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size) {
+  const uint8_t *bytes = data;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static uint64_t hash_u32(uint64_t hash, uint32_t value) {
+  uint8_t bytes[4] = {(uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24)};
+  return hash_bytes(hash, bytes, sizeof(bytes));
+}
+
+static uint64_t hash_string(uint64_t hash, const char *text) {
+  if (!text) text = "";
+  return hash_bytes(hash, text, strlen(text) + 1);
+}
+
+static uint64_t schema_hash(const ft_input_schema *schema) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  if (!schema) return hash;
+  hash = hash_u32(hash, schema->record_size);
+  hash = hash_u32(hash, schema->record_align);
+  hash = hash_u32(hash, schema->field_count);
+  for (uint32_t i = 0; i < schema->field_count; ++i) {
+    const ft_input_field *field = &schema->fields[i];
+    hash = hash_string(hash, field->id);
+    hash = hash_u32(hash, (uint32_t)field->kind);
+    /* Editor visibility does not alter the stored record or its semantics and
+     * must therefore not invalidate an otherwise compatible project. */
+    hash = hash_u32(hash, field->flags & ~FT_INPUT_FLAG_EDITOR_HIDDEN);
+    hash = hash_u32(hash, (uint32_t)field->min_value);
+    hash = hash_u32(hash, (uint32_t)field->max_value);
+    hash = hash_u32(hash, (uint32_t)field->default_value);
+    uint32_t bits;
+    memcpy(&bits, &field->min_float, sizeof(bits));
+    hash = hash_u32(hash, bits);
+    memcpy(&bits, &field->max_float, sizeof(bits));
+    hash = hash_u32(hash, bits);
+    memcpy(&bits, &field->default_float, sizeof(bits));
+    hash = hash_u32(hash, bits);
+    hash = hash_u32(hash, field->enum_count);
+    for (uint32_t label = 0; label < field->enum_count; ++label)
+      hash = hash_string(hash, field->enum_labels ? field->enum_labels[label] : "");
+  }
+  return hash;
+}
+
+/* Version 17 projects originally included the key-control table in the input
+ * schema hash. Controls are editor bindings, not bytes stored in a project;
+ * keep accepting those hashes so a binding-only change cannot strand a file. */
+static uint64_t legacy_control_schema_hash(const ft_input_schema *schema) {
+  uint64_t hash = schema_hash(schema);
+  if (!schema) return hash;
+  hash = hash_u32(hash, schema->control_count);
+  for (uint32_t i = 0; i < schema->control_count; ++i) {
+    const ft_input_control *control = &schema->controls[i];
+    hash = hash_string(hash, control->id);
+    hash = hash_u32(hash, control->field);
+    hash = hash_u32(hash, (uint32_t)control->value);
+    hash = hash_u32(hash, (uint32_t)((uint64_t)control->value >> 32));
+    hash = hash_u32(hash, control->flags);
+  }
+  return hash;
+}
+
+/* The multiple-binding migration collapsed controls named "foo" and
+ * "foo_alt" into one "foo" control whose default binding contains '|'.
+ * Reconstruct that one historical hash without restoring duplicate actions. */
+static uint64_t legacy_split_control_schema_hash(const ft_input_schema *schema) {
+  uint64_t hash = schema_hash(schema);
+  if (!schema) return hash;
+
+  uint32_t legacy_count = 0;
+  for (uint32_t i = 0; i < schema->control_count; ++i) {
+    ++legacy_count;
+    const char *binding = schema->controls[i].default_binding;
+    while (binding && (binding = strchr(binding, '|')) != NULL) {
+      ++legacy_count;
+      ++binding;
+    }
+  }
+  hash = hash_u32(hash, legacy_count);
+
+  for (uint32_t i = 0; i < schema->control_count; ++i) {
+    const ft_input_control *control = &schema->controls[i];
+    const char *binding = control->default_binding;
+    uint32_t binding_index = 0;
+    do {
+      char alternate_id[FT_NAME_MAX];
+      const char *id = control->id;
+      if (binding_index == 1) {
+        if (snprintf(alternate_id, sizeof(alternate_id), "%s_alt", control->id) >= (int)sizeof(alternate_id))
+          return UINT64_MAX;
+        id = alternate_id;
+      } else if (binding_index > 1) {
+        if (snprintf(alternate_id, sizeof(alternate_id), "%s_alt%u", control->id, binding_index) >=
+            (int)sizeof(alternate_id))
+          return UINT64_MAX;
+        id = alternate_id;
+      }
+      hash = hash_string(hash, id);
+      hash = hash_u32(hash, control->field);
+      hash = hash_u32(hash, (uint32_t)control->value);
+      hash = hash_u32(hash, (uint32_t)((uint64_t)control->value >> 32));
+      hash = hash_u32(hash, control->flags);
+
+      binding = binding ? strchr(binding, '|') : NULL;
+      if (binding) ++binding;
+      ++binding_index;
+    } while (binding);
+  }
+  return hash;
+}
+
+static uint64_t input_schema_hash(const game_host_t *host) { return schema_hash(game_input_schema(host)); }
+
+static bool schema_has_hash(const ft_input_schema *schema, uint64_t hash) {
+  return hash == schema_hash(schema) || hash == legacy_control_schema_hash(schema) ||
+         hash == legacy_split_control_schema_hash(schema);
+}
+
+// Whether records saved under `hash` with `record_size` bytes each are this game's records: the
+// schema it has now, or one of the earlier ones it still reads as they are.
+static bool input_schema_compatible(const game_host_t *host, uint64_t hash, uint32_t record_size) {
+  const ft_input_schema *schema = game_input_schema(host);
+  if (!schema) return false;
+  if (record_size == schema->record_size && schema_has_hash(schema, hash)) return true;
+  for (uint32_t i = 0; i < schema->legacy_schema_count; ++i) {
+    const ft_input_schema *legacy = schema->legacy_schemas[i];
+    if (record_size == legacy->record_size && legacy->record_size == schema->record_size && schema_has_hash(legacy, hash))
+      return true;
+  }
+  return false;
+}
+
+static bool collect_level_data(ui_handler_t *ui, uint8_t **out, size_t *out_size) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const size_t needed = gh_level_serialize(host, ui->gfx_handler->level, NULL, 0);
+  *out = NULL;
+  *out_size = 0;
+  if (needed == 0) return true;
+  if (needed > PROJECT_MAX_BLOB_SIZE) return false;
+  uint8_t *data = malloc(needed);
+  if (!data) return false;
+  if (gh_level_serialize(host, ui->gfx_handler->level, data, needed) != needed) {
+    free(data);
+    return false;
+  }
+  *out = data;
+  *out_size = needed;
+  return true;
+}
+
+static bool collect_project_data(game_host_t *host, uint8_t **out, size_t *out_size) {
+  const size_t needed = gh_project_save(host, NULL, 0);
+  *out = NULL;
+  *out_size = 0;
+  if (needed == 0) return true;
+  if (needed > PROJECT_MAX_BLOB_SIZE) return false;
+  uint8_t *data = malloc(needed);
+  if (!data) return false;
+  if (gh_project_save(host, data, needed) != needed) {
+    free(data);
+    return false;
+  }
+  *out = data;
+  *out_size = needed;
+  return true;
+}
+
+static bool write_world_blob(byte_buffer_t *buffer, game_host_t *host, const ft_world *world) {
+  const size_t needed = gh_world_serialize(host, world, NULL, 0);
+  if (needed > PROJECT_MAX_BLOB_SIZE || (game_has_cap(host, FT_CAP_WORLD_SERIALIZE) && needed == 0)) {
+    buffer->ok = false;
+    return false;
+  }
+  if (!buffer_u64(buffer, needed) || !buffer_reserve(buffer, needed)) return false;
+  if (needed > 0 && gh_world_serialize(host, world, buffer->data + buffer->size, needed) != needed) {
+    buffer->ok = false;
+    return false;
+  }
+  buffer->size += needed;
+  return true;
+}
+
+static bool write_value(byte_buffer_t *buffer, const starting_override_t *override) {
+  const ft_value *value = &override->value;
+  if (!buffer_u32(buffer, (uint32_t)value->kind)) return false;
+  switch (value->kind) {
+  case FT_VALUE_BOOL:
+    return buffer_u8(buffer, value->as.b ? 1 : 0);
+  case FT_VALUE_INT:
+    return buffer_i64(buffer, value->as.i);
+  case FT_VALUE_FLOAT:
+    return buffer_f64(buffer, value->as.f);
+  case FT_VALUE_VEC2:
+    return buffer_f32(buffer, value->as.v.x) && buffer_f32(buffer, value->as.v.y);
+  case FT_VALUE_VEC3:
+    return buffer_f32(buffer, value->as.v3.x) && buffer_f32(buffer, value->as.v3.y) && buffer_f32(buffer, value->as.v3.z);
+  case FT_VALUE_STRING: {
+    const char *text = value->as.s ? value->as.s : override->string_value;
+    if (strlen(text) >= MAX_STARTING_STRING) return false;
+    return buffer_string(buffer, text);
+  }
+  default:
+    buffer->ok = false;
+    return false;
+  }
+}
+
+static bool recording_is_referenced(const timeline_state_t *timeline, int id) {
+  for (int t = 0; t < timeline->player_track_count; ++t)
+    for (int s = 0; s < timeline->player_tracks[t].snippet_count; ++s) {
+      const input_snippet_t *snippet = &timeline->player_tracks[t].snippets[s];
+      if (snippet_is_playback(snippet) && snippet->recording_id == id) return true;
+    }
+  return false;
+}
+
+// `every_recording`: the recordings no snippet replays go along too (see below).
+static bool write_timeline(byte_buffer_t *buffer, ui_handler_t *ui, bool every_recording) {
+  timeline_state_t *timeline = &ui->timeline;
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const uint32_t input_size = game_input_size(host);
+
+  if (!buffer_i32(buffer, timeline->current_tick) || !buffer_i32(buffer, timeline->active_group_index) ||
+      !buffer_i32(buffer, timeline->selected_player_track_index) || !buffer_u8(buffer, timeline->linked_copy_input ? 1 : 0))
+    return false;
+
+  for (int i = 0; i < timeline->group_count; ++i) {
+    const timeline_group_t *group = timeline->groups[i];
+    if (!buffer_string(buffer, group->name)) return false;
+    for (int c = 0; c < 4; ++c)
+      if (!buffer_f32(buffer, group->color[c])) return false;
+    if (!buffer_u8(buffer, group->visible ? 1 : 0) || !buffer_u8(buffer, group->export_enabled ? 1 : 0) ||
+        !buffer_u8(buffer, group->prediction_enabled ? 1 : 0) || !buffer_i32(buffer, group->start_offset) ||
+        !write_world_blob(buffer, host, group->initial_world))
+      return false;
+  }
+
+  for (int i = 0; i < timeline->player_track_count; ++i) {
+    const player_track_t *track = &timeline->player_tracks[i];
+    // The game's profile bytes travel as a length-delimited blob, exactly as the
+    // game wrote them. The editor has no idea what is in there and never needs
+    // to: a project opened by a different game simply hands it bytes it will
+    // reject, which the game-id check above has already caught.
+    if (!buffer_u32(buffer, track->player_profile.size) ||
+        !buffer_write(buffer, track->player_profile.data, track->player_profile.size) ||
+        !buffer_u8(buffer, track->is_linked ? 1 : 0) || !buffer_i32(buffer, track->linked_source_player) ||
+        !buffer_u64(buffer, track->linked_copy_fields) || !buffer_u32(buffer, track->linked_transform_flags) ||
+        !buffer_u8(buffer, track->starting_config.enabled ? 1 : 0))
+      return false;
+
+    int override_count = track->starting_config.override_count;
+    if (override_count < 0 || override_count > MAX_STARTING_OVERRIDES || !buffer_u32(buffer, (uint32_t)override_count)) return false;
+    for (int override_index = 0; override_index < override_count; ++override_index) {
+      const starting_override_t *override = &track->starting_config.overrides[override_index];
+      if (!buffer_string(buffer, override->prop_id) || !write_value(buffer, override)) return false;
+    }
+
+    if (!buffer_i32(buffer, track->group_index) || !buffer_string(buffer, track->name) ||
+        !buffer_u8(buffer, track->export_enabled ? 1 : 0) || !buffer_u8(buffer, track->prediction_enabled ? 1 : 0) ||
+        !buffer_u32(buffer, (uint32_t)track->snippet_count))
+      return false;
+
+    if (track->snippet_count < 0 || track->snippet_count > MAX_SNIPPETS_PER_PLAYER) return false;
+    for (int j = 0; j < track->snippet_count; ++j) {
+      const input_snippet_t *snippet = &track->snippets[j];
+      if (snippet->source_count < 0 || snippet->source_count > PROJECT_MAX_SOURCE_TICKS || snippet->source_offset < 0 ||
+          snippet->input_count < 0 || snippet->source_offset > snippet->source_count ||
+          snippet->input_count > snippet->source_count - snippet->source_offset)
+        return false;
+      if (!buffer_i32(buffer, snippet->id) || !buffer_i32(buffer, snippet->start_tick) ||
+          !buffer_u8(buffer, snippet->is_active ? 1 : 0) || !buffer_i32(buffer, snippet->layer) ||
+          !buffer_i32(buffer, snippet->input_count) || !buffer_i32(buffer, snippet->source_offset) ||
+          !buffer_i32(buffer, snippet->source_count) || !buffer_u8(buffer, (uint8_t)snippet->kind))
+        return false;
+      if (snippet_is_playback(snippet)) {
+        // Its source is the recording, stored once below.
+        if (!buffer_i32(buffer, snippet->recording_id) || !buffer_i32(buffer, snippet->recording_player)) return false;
+      } else {
+        for (int tick = 0; tick < snippet->source_count; ++tick)
+          if (!buffer_write(buffer, snippet->inputs[tick].bytes, input_size)) return false;
+      }
+      if (snippet->effect_count < 0 || snippet->effect_count > MAX_SNIPPET_INPUT_EFFECTS ||
+          !buffer_u32(buffer, (uint32_t)snippet->effect_count))
+        return false;
+      for (int effect_index = 0; effect_index < snippet->effect_count; ++effect_index) {
+        const input_effect_t *effect = &snippet->effects[effect_index];
+        if (effect->parameter_size > PROJECT_MAX_EFFECT_PAYLOAD || !buffer_string(buffer, effect->type_id) ||
+            !buffer_u8(buffer, effect->enabled ? 1 : 0) || !buffer_u32(buffer, effect->parameter_size) ||
+            !buffer_write(buffer, effect->parameters, effect->parameter_size))
+          return false;
+      }
+    }
+  }
+
+  if (timeline->event_count < 0 || timeline->event_count > PROJECT_MAX_EVENTS ||
+      !buffer_u32(buffer, (uint32_t)timeline->event_count))
+    return false;
+  for (int i = 0; i < timeline->event_count; ++i) {
+    const timeline_event_t *event = &timeline->events[i];
+    if (!buffer_i32(buffer, event->tick) || !buffer_i32(buffer, event->group_index) || !buffer_i32(buffer, event->player) ||
+        !buffer_string(buffer, event->category) || !buffer_string(buffer, event->message))
+      return false;
+    for (int c = 0; c < 4; ++c)
+      if (!buffer_f32(buffer, event->color[c])) return false;
+    if (event->data_size > FT_TIMELINE_EVENT_DATA_MAX || !buffer_u32(buffer, event->data_size) ||
+        !buffer_write(buffer, event->data, event->data_size))
+      return false;
+  }
+
+  // Recordings some snippet replays. The others only stay open so undo can bring their snippets
+  // back; a saved project has no undo history. The project moving to another backend of its game
+  // keeps its history, and with it all of them.
+  uint32_t recording_count = 0;
+  for (int i = 0; i < timeline->recording_count; ++i)
+    if (every_recording || recording_is_referenced(timeline, timeline->recordings[i]->id)) ++recording_count;
+  if (!buffer_u32(buffer, recording_count)) return false;
+  for (int i = 0; i < timeline->recording_count; ++i) {
+    const timeline_recording_t *recording = timeline->recordings[i];
+    if (!every_recording && !recording_is_referenced(timeline, recording->id)) continue;
+    if (!buffer_i32(buffer, recording->id) || !buffer_string(buffer, recording->name) || !buffer_u64(buffer, recording->size) ||
+        !buffer_write(buffer, recording->data, recording->size))
+      return false;
+  }
+  return buffer->ok;
+}
+
+static bool write_project_file(ui_handler_t *ui, const char *path, bool every_recording) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  uint8_t *level_data = NULL;
+  size_t level_size = 0;
+  uint8_t *project_data = NULL;
+  size_t project_size = 0;
+  byte_buffer_t buffer = {.ok = true};
+  bool ok = false;
+
+  if (!collect_level_data(ui, &level_data, &level_size) || !collect_project_data(host, &project_data, &project_size)) goto done;
+  if (level_size == 0 && ui->loaded_level_path[0] == '\0') {
+    log_error(LOG_SOURCE, "Game '%s' cannot serialize this level and no reloadable level path is available.", game_host_active_id(host));
+    goto done;
+  }
+
+  if (!ui->loaded_level_name[0] || strcmp(ui->loaded_level_name, "unnamed_level") == 0 || strcmp(ui->loaded_level_name, "map") == 0) {
+    ft_level_info info;
+    if (gh_level_info(host, ui->gfx_handler->level, &info) && info.name && info.name[0] &&
+        strcmp(info.name, "map") != 0 && strcmp(info.name, "unnamed_level") != 0) {
+      snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", info.name);
+    } else if (ui->loaded_level_path[0]) {
+      char stem[sizeof(ui->loaded_level_name)];
+      const char *slash = strrchr(ui->loaded_level_path, '/');
+#ifdef _WIN32
+      const char *back = strrchr(ui->loaded_level_path, '\\');
+      if (back && (!slash || back > slash)) slash = back;
+#endif
+      const char *file = slash ? slash + 1 : ui->loaded_level_path;
+      snprintf(stem, sizeof(stem), "%s", file);
+      char *dot = strrchr(stem, '.');
+      if (dot && dot != stem) *dot = '\0';
+      if (stem[0]) snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", stem);
+    }
+  }
+
+  const camera_t *camera = &ui->gfx_handler->renderer.camera;
+  const ft_camera_mode *camera_mode = game_camera_mode(host, camera->mode);
+  if (!buffer_write(&buffer, TAS_PROJECT_FILE_MAGIC, 4) || !buffer_u32(&buffer, TAS_PROJECT_FILE_VERSION) ||
+      !buffer_u32(&buffer, 0) || !buffer_u64(&buffer, input_schema_hash(host)) ||
+      !buffer_u32(&buffer, game_input_size(host)) || !buffer_u32(&buffer, (uint32_t)ui->timeline.group_count) ||
+      !buffer_u32(&buffer, (uint32_t)ui->timeline.player_track_count) || !buffer_u64(&buffer, level_size) ||
+      !buffer_u64(&buffer, project_size))
+    goto done;
+  const size_t timeline_size_offset = buffer.size;
+  if (!buffer_u64(&buffer, 0) || !buffer_string(&buffer, game_host_active_id(host)) ||
+      !buffer_string(&buffer, game_host_active_version(host)) || !buffer_string(&buffer, game_host_variant(host)) ||
+      !buffer_string(&buffer, ui->loaded_level_name) || !buffer_string(&buffer, ui->loaded_level_path) ||
+      !buffer_string(&buffer, camera_mode && camera_mode->id ? camera_mode->id : "free") ||
+      !buffer_f32(&buffer, camera->pos[0]) || !buffer_f32(&buffer, camera->pos[1]) || !buffer_f32(&buffer, camera->zoom) ||
+      !buffer_write(&buffer, level_data, level_size) || !buffer_write(&buffer, project_data, project_size))
+    goto done;
+
+  const size_t timeline_start = buffer.size;
+  if (!write_timeline(&buffer, ui, every_recording) || !buffer_patch_u64(&buffer, timeline_size_offset, buffer.size - timeline_start) ||
+      !write_camera_timeline(&buffer, &ui->camera_timeline) || !write_render_video(&buffer, ui)) goto done;
+
+  char temporary_path[1200];
+  if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", path) >= (int)sizeof(temporary_path)) goto done;
+  FILE *file = fs_open(temporary_path, "wb");
+  if (!file) {
+    log_error(LOG_SOURCE, "Failed to open temporary project for writing: '%s'", temporary_path);
+    goto done;
+  }
+  setvbuf(file, NULL, _IOFBF, 64 * 1024);
+  const bool wrote = buffer.size == 0 || fwrite(buffer.data, buffer.size, 1, file) == 1;
+  const bool flushed = fflush(file) == 0;
+  const bool closed = fclose(file) == 0;
+  if (!wrote || !flushed || !closed || !fs_replace(temporary_path, path)) {
+    fs_remove(temporary_path);
+    log_error(LOG_SOURCE, "Failed to finish writing project: '%s'", path);
+    goto done;
+  }
+  ok = true;
+
+done:
+  free(level_data);
+  free(project_data);
+  free(buffer.data);
+  return ok;
+}
+
+bool save_project(ui_handler_t *ui, const char *path) {
+  if (!ui || !path || !*path || !ui->gfx_handler || !ui->gfx_handler->level || !game_host_ready(&ui->gfx_handler->game_host))
+    return false;
+
+  // Ctrl+S passes current_project_path itself.  snprintf has undefined
+  // behaviour when its source and destination overlap, and on glibc this was
+  // clearing the path after the file had been written.
+  char stable_path[sizeof(ui->current_project_path)];
+  int path_length = snprintf(stable_path, sizeof(stable_path), "%s", path);
+  if (path_length <= 0 || (size_t)path_length >= sizeof(stable_path)) {
+    log_error(LOG_SOURCE, "Project path is too long.");
+    return false;
+  }
+
+  const double start = glfwGetTime();
+  if (!write_project_file(ui, stable_path, false)) return false;
+
+  snprintf(ui->current_project_path, sizeof(ui->current_project_path), "%s", stable_path);
+  ui->has_unsaved_changes = false;
+  ui_add_recent_project(ui, stable_path);
+  log_info(LOG_SOURCE, "Project saved successfully to '%s' (%.2f ms)", stable_path, (glfwGetTime() - start) * 1000.0);
+  return true;
+}
+
+bool save_project_snapshot(ui_handler_t *ui, const char *path) {
+  if (!ui || !path || !*path || !ui->gfx_handler || !ui->gfx_handler->level ||
+      !game_host_ready(&ui->gfx_handler->game_host)) return false;
+  return write_project_file(ui, path, false);
+}
+
+static bool read_value(byte_reader_t *reader, starting_override_t *override) {
+  uint32_t kind;
+  if (!reader_u32(reader, &kind) || kind > FT_VALUE_STRING) return false;
+  override->value.kind = (ft_value_kind)kind;
+  switch (override->value.kind) {
+  case FT_VALUE_BOOL: {
+    uint8_t value;
+    if (!reader_u8(reader, &value) || value > 1) return false;
+    override->value.as.b = value != 0;
+    return true;
+  }
+  case FT_VALUE_INT:
+    return reader_i64(reader, &override->value.as.i);
+  case FT_VALUE_FLOAT:
+    return reader_f64(reader, &override->value.as.f);
+  case FT_VALUE_VEC2:
+    return reader_f32(reader, &override->value.as.v.x) && reader_f32(reader, &override->value.as.v.y);
+  case FT_VALUE_VEC3:
+    return reader_f32(reader, &override->value.as.v3.x) && reader_f32(reader, &override->value.as.v3.y) &&
+           reader_f32(reader, &override->value.as.v3.z);
+  case FT_VALUE_STRING:
+    if (!reader_string(reader, override->string_value, sizeof(override->string_value))) return false;
+    override->value.as.s = override->string_value;
+    return true;
+  }
+  return false;
+}
+
+static bool read_timeline(byte_reader_t *reader, project_document_t *document, bool keep_world_data, uint32_t version) {
+  uint8_t boolean;
+  uint32_t count;
+  if (!reader_i32(reader, &document->current_tick) || !reader_i32(reader, &document->active_group_index) ||
+      !reader_i32(reader, &document->selected_track_index) || !reader_u8(reader, &boolean) || boolean > 1)
+    return false;
+  document->linked_copy_input = boolean != 0;
+
+  for (int i = 0; i < document->group_count; ++i) {
+    project_group_t *group = &document->groups[i];
+    if (!reader_string(reader, group->name, sizeof(group->name))) return false;
+    for (int c = 0; c < 4; ++c)
+      if (!reader_f32(reader, &group->color[c])) return false;
+    uint8_t visible, export_enabled, prediction_enabled;
+    uint64_t world_size;
+    if (!reader_u8(reader, &visible) || visible > 1 || !reader_u8(reader, &export_enabled) || export_enabled > 1 ||
+        !reader_u8(reader, &prediction_enabled) || prediction_enabled > 1 || !reader_i32(reader, &group->start_offset) ||
+        !reader_u64(reader, &world_size))
+      return false;
+    if (keep_world_data) {
+      if (!reader_blob(reader, world_size, &group->world_data, &group->world_size)) return false;
+    } else if (!reader_skip_blob(reader, world_size)) {
+      return false;
+    }
+    group->visible = visible != 0;
+    group->export_enabled = export_enabled != 0;
+    group->prediction_enabled = prediction_enabled != 0;
+  }
+
+  for (int i = 0; i < document->track_count; ++i) {
+    player_track_t *track = &document->tracks[i];
+    uint8_t is_linked, starting_enabled, export_enabled, prediction_enabled;
+    uint32_t profile_size;
+    if (!reader_u32(reader, &profile_size) || profile_size > FT_PLAYER_PROFILE_MAX ||
+        !reader_bytes(reader, track->player_profile.data, profile_size))
+      return false;
+    track->player_profile.size = profile_size;
+    if (!reader_u8(reader, &is_linked) || is_linked > 1 || !reader_i32(reader, &track->linked_source_player) ||
+        !reader_u64(reader, &track->linked_copy_fields) || !reader_u32(reader, &track->linked_transform_flags) ||
+        !reader_u8(reader, &starting_enabled) || starting_enabled > 1 || !reader_u32(reader, &count) ||
+        count > MAX_STARTING_OVERRIDES)
+      return false;
+    track->is_linked = is_linked != 0;
+    // Before version 29 a link's source was always a player, 0 unless chosen;
+    // -1 (whoever is being controlled) is what that default meant in practice.
+    if (version < 29 && track->linked_source_player == 0) track->linked_source_player = -1;
+    track->starting_config.enabled = starting_enabled != 0;
+    track->starting_config.override_count = (int)count;
+    for (uint32_t override_index = 0; override_index < count; ++override_index) {
+      starting_override_t *override = &track->starting_config.overrides[override_index];
+      if (!reader_string(reader, override->prop_id, sizeof(override->prop_id)) || !read_value(reader, override)) return false;
+    }
+    if (!reader_i32(reader, &track->group_index) || track->group_index < 0 || track->group_index >= document->group_count ||
+        !reader_string(reader, track->name, sizeof(track->name)) || !reader_u8(reader, &export_enabled) || export_enabled > 1 ||
+        !reader_u8(reader, &prediction_enabled) || prediction_enabled > 1 || !reader_u32(reader, &count) ||
+        count > MAX_SNIPPETS_PER_PLAYER)
+      return false;
+    track->export_enabled = export_enabled != 0;
+    track->prediction_enabled = prediction_enabled != 0;
+    track->snippet_count = (int)count;
+    track->snippet_capacity = (int)count;
+    if (count > 0) {
+      track->snippets = calloc(count, sizeof(*track->snippets));
+      if (!track->snippets) return false;
+    }
+    for (uint32_t j = 0; j < count; ++j) {
+      input_snippet_t *snippet = &track->snippets[j];
+      uint8_t active;
+      if (!reader_i32(reader, &snippet->id) || !reader_i32(reader, &snippet->start_tick) ||
+          !reader_u8(reader, &active) || active > 1 || !reader_i32(reader, &snippet->layer) ||
+          !reader_i32(reader, &snippet->input_count) || !reader_i32(reader, &snippet->source_offset) ||
+          !reader_i32(reader, &snippet->source_count))
+        return false;
+      snippet->is_active = active != 0;
+      if (snippet->layer < 0 || snippet->layer >= MAX_SNIPPET_LAYERS || snippet->input_count < 0 ||
+          snippet->source_count < 0 || snippet->source_count > PROJECT_MAX_SOURCE_TICKS || snippet->source_offset < 0 ||
+          snippet->source_offset > snippet->source_count ||
+          snippet->input_count > snippet->source_count - snippet->source_offset)
+        return false;
+      uint8_t kind = SNIPPET_INPUT;
+      if (version >= 25 && (!reader_u8(reader, &kind) || kind > SNIPPET_PLAYBACK)) return false;
+      snippet->kind = (snippet_kind_t)kind;
+      if (snippet_is_playback(snippet)) {
+        if (!reader_i32(reader, &snippet->recording_id) || !reader_i32(reader, &snippet->recording_player) ||
+            snippet->recording_id < 0 || snippet->recording_player < 0)
+          return false;
+      } else {
+        size_t allocation_size;
+        if (!checked_multiply((size_t)snippet->source_count, sizeof(*snippet->inputs), &allocation_size)) return false;
+        snippet->inputs = snippet->source_count ? calloc(1, allocation_size) : NULL;
+        if (snippet->source_count && !snippet->inputs) return false;
+        for (int tick = 0; tick < snippet->source_count; ++tick)
+          if (!reader_bytes(reader, snippet->inputs[tick].bytes, document->input_record_size)) return false;
+      }
+      uint32_t effect_count;
+      if (!reader_u32(reader, &effect_count) || effect_count > MAX_SNIPPET_INPUT_EFFECTS) return false;
+      snippet->effect_count = (int)effect_count;
+      snippet->effect_capacity = (int)effect_count;
+      snippet->effects = effect_count ? calloc(effect_count, sizeof(*snippet->effects)) : NULL;
+      if (effect_count && !snippet->effects) return false;
+      for (uint32_t effect_index = 0; effect_index < effect_count; ++effect_index) {
+        input_effect_t *effect = &snippet->effects[effect_index];
+        uint8_t enabled;
+        uint32_t payload_size;
+        if (!reader_string(reader, effect->type_id, sizeof(effect->type_id)) || !reader_u8(reader, &enabled) ||
+            enabled > 1 || !reader_u32(reader, &payload_size) || payload_size > PROJECT_MAX_EFFECT_PAYLOAD ||
+            payload_size > FT_INPUT_EFFECT_PARAMETER_MAX)
+          return false;
+        effect->enabled = enabled != 0;
+        effect->parameter_size = payload_size;
+        effect->parameters = payload_size ? malloc(payload_size) : NULL;
+        if (payload_size > 0 && (!effect->parameters || !reader_bytes(reader, effect->parameters, payload_size)))
+          return false;
+      }
+      model_snippet_normalize(snippet);
+    }
+    model_rebind_starting_strings(&track->starting_config);
+  }
+
+  if (!reader_u32(reader, &count) || count > PROJECT_MAX_EVENTS) return false;
+  document->event_count = (int)count;
+  document->events = count ? calloc(count, sizeof(*document->events)) : NULL;
+  if (count && !document->events) return false;
+  for (uint32_t i = 0; i < count; ++i) {
+    timeline_event_t *event = &document->events[i];
+    if (!reader_i32(reader, &event->tick) || !reader_i32(reader, &event->group_index) || event->group_index < 0 ||
+        event->group_index >= document->group_count || !reader_i32(reader, &event->player) ||
+        !reader_string(reader, event->category, sizeof(event->category)) ||
+        !reader_string(reader, event->message, sizeof(event->message)))
+      return false;
+    for (int c = 0; c < 4; ++c)
+      if (!reader_f32(reader, &event->color[c])) return false;
+    if (!reader_u32(reader, &event->data_size) || event->data_size > FT_TIMELINE_EVENT_DATA_MAX ||
+        !reader_bytes(reader, event->data, event->data_size))
+      return false;
+  }
+
+  // Recordings are read even when world data is not kept: an imported group's playback snippets
+  // need them.
+  if (version >= 25) {
+    if (!reader_u32(reader, &count) || count > PROJECT_MAX_RECORDINGS) return false;
+    document->recording_count = (int)count;
+    document->recordings = count ? calloc(count, sizeof(*document->recordings)) : NULL;
+    if (count && !document->recordings) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+      project_recording_t *recording = &document->recordings[i];
+      uint64_t size;
+      if (!reader_i32(reader, &recording->id) || recording->id < 0 ||
+          !reader_string(reader, recording->name, sizeof(recording->name)) || !reader_u64(reader, &size) || size == 0 ||
+          !reader_blob(reader, size, &recording->data, &recording->size))
+        return false;
+      for (uint32_t j = 0; j < i; ++j)
+        if (document->recordings[j].id == recording->id) return false;
+    }
+  }
+  // Every playback snippet must name a recording the file carries.
+  for (int t = 0; t < document->track_count; ++t)
+    for (int s = 0; s < document->tracks[t].snippet_count; ++s) {
+      const input_snippet_t *snippet = &document->tracks[t].snippets[s];
+      if (!snippet_is_playback(snippet)) continue;
+      bool found = false;
+      for (int r = 0; r < document->recording_count && !found; ++r) found = document->recordings[r].id == snippet->recording_id;
+      if (!found) return false;
+    }
+  return reader->ok && reader->pos == reader->size;
+}
+
+// `converting`: the project is moved to the active game from another backend of its game
+// (switch_project_backend), which takes the same input records and has a version of its own.
+static bool validate_document_compatibility(const project_document_t *document, game_host_t *host, const char *path,
+                                            bool converting) {
+  if (converting) {
+    if (!game_host_same_game(host, game_host_find_id(host, document->game_id), host->active)) {
+      log_error(LOG_SOURCE, "Project '%s' of game '%s' cannot move to game '%s'.", path, document->game_id,
+                game_host_active_id(host));
+      return false;
+    }
+    if (document->input_record_size != game_input_size(host)) {
+      log_error(LOG_SOURCE, "Project '%s' has input records of %u bytes; game '%s' takes %u.", path,
+                document->input_record_size, game_host_active_id(host), game_input_size(host));
+      return false;
+    }
+    return true;
+  }
+  if (strcmp(document->game_id, game_host_active_id(host)) != 0) {
+    log_error(LOG_SOURCE, "Project '%s' belongs to game '%s'; start a project with that game first.", path, document->game_id);
+    return false;
+  }
+  if (strcmp(document->game_version, game_host_active_version(host)) != 0) {
+    log_error(LOG_SOURCE, "Project '%s' targets %s v%s, but v%s is active.", path, document->game_id,
+              document->game_version, game_host_active_version(host));
+    return false;
+  }
+  if (!input_schema_compatible(host, document->input_schema_hash, document->input_record_size)) {
+    log_error(LOG_SOURCE, "Project '%s' uses a different input schema for game '%s'.", path, document->game_id);
+    return false;
+  }
+  return true;
+}
+
+// The game id sits in the fixed part of the header, before any blob, so the
+// game a project needs can be known without parsing (or being able to parse)
+// the rest of it. Reads the prefix only.
+static bool peek_project_game_id(const char *path, char *out_id, size_t out_size) {
+  // Everything ahead of the id is fixed width, and the id itself is a short
+  // length-prefixed string, so the whole prefix fits comfortably in this.
+  enum { HEADER_PREFIX_MAX = 512 };
+  FILE *file = fs_open(path, "rb");
+  if (!file) {
+    log_error(LOG_SOURCE, "Failed to open project for reading: '%s'", path);
+    return false;
+  }
+  uint8_t header[HEADER_PREFIX_MAX];
+  const size_t read = fread(header, 1, sizeof(header), file);
+  fclose(file);
+
+  byte_reader_t reader = {.data = header, .size = read, .ok = true};
+  char magic[4];
+  uint32_t version, flags, record_size, group_count, track_count;
+  uint64_t schema_hash, level_size, project_size, timeline_size;
+  if (!reader_bytes(&reader, magic, sizeof(magic)) || memcmp(magic, TAS_PROJECT_FILE_MAGIC, 4) != 0 ||
+      !reader_u32(&reader, &version)) {
+    log_error(LOG_SOURCE, "Not a FrameTee project: '%s'", path);
+    return false;
+  }
+  if (version < 17 || version > TAS_PROJECT_FILE_VERSION) {
+    log_error(LOG_SOURCE, "Project '%s' is version %u; this build requires version %u.", path, version,
+              TAS_PROJECT_FILE_VERSION);
+    return false;
+  }
+  if (!reader_u32(&reader, &flags) || !reader_u64(&reader, &schema_hash) || !reader_u32(&reader, &record_size) ||
+      !reader_u32(&reader, &group_count) || !reader_u32(&reader, &track_count) || !reader_u64(&reader, &level_size) ||
+      !reader_u64(&reader, &project_size) || !reader_u64(&reader, &timeline_size) ||
+      !reader_string(&reader, out_id, out_size)) {
+    log_error(LOG_SOURCE, "Malformed or incomplete v%u project: '%s'", TAS_PROJECT_FILE_VERSION, path);
+    return false;
+  }
+  return true;
+}
+
+// A project names the game it was authored under, and only that game can read
+// it. Opening one is allowed to switch to that game: the splash screen used to
+// be the only way in, which is the only reason this ever had to be the user's
+// job. Import does not go through here, because a foreign game's project has
+// nothing to contribute to the timeline this one is building.
+static bool activate_project_game(ui_handler_t *ui, const char *path) {
+  char game_id[FT_ID_MAX];
+  if (!peek_project_game_id(path, game_id, sizeof(game_id))) return false;
+
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const char *active = game_host_active_id(host);
+  if (active && strcmp(active, game_id) == 0) return true;
+
+  const int index = game_host_find_id(host, game_id);
+  if (index < 0) {
+    log_error(LOG_SOURCE, "Project '%s' needs game '%s', which is not installed.", path, game_id);
+    return false;
+  }
+  // Switching clears the level and timeline, so a load that fails after this
+  // leaves an empty project under the new game and the splash comes back up.
+  if (!gfx_activate_game(ui->gfx_handler, index)) {
+    log_error(LOG_SOURCE, "Could not switch to game '%s' to open '%s'.", game_id, path);
+    return false;
+  }
+  log_info(LOG_SOURCE, "Switched to game '%s' to open '%s'.", game_id, path);
+  return true;
+}
+
+static bool read_project_file(ui_handler_t *ui, const char *path, project_document_t *document, bool keep_session_data,
+                              bool converting) {
+  memset(document, 0, sizeof(*document));
+  FILE *file = fs_open(path, "rb");
+  if (!file) {
+    log_error(LOG_SOURCE, "Failed to open project for reading: '%s'", path);
+    return false;
+  }
+  bool ok = false;
+  uint8_t *file_data = NULL;
+  if (fseek(file, 0, SEEK_END) != 0) goto done;
+  const long file_length = ftell(file);
+  if (file_length < 0 || (size_t)file_length > PROJECT_MAX_FILE_SIZE || fseek(file, 0, SEEK_SET) != 0) goto done;
+  file_data = file_length ? malloc((size_t)file_length) : NULL;
+  if (file_length && (!file_data || fread(file_data, (size_t)file_length, 1, file) != 1)) goto done;
+
+  byte_reader_t reader = {.data = file_data, .size = (size_t)file_length, .ok = true};
+  char magic[4];
+  uint32_t version, flags, group_count, track_count;
+  uint64_t level_size, project_size, timeline_size;
+  if (!reader_bytes(&reader, magic, sizeof(magic)) || memcmp(magic, TAS_PROJECT_FILE_MAGIC, 4) != 0 ||
+      !reader_u32(&reader, &version)) {
+    log_error(LOG_SOURCE, "Not a FrameTee project: '%s'", path);
+    goto done;
+  }
+  if (version < 17 || version > TAS_PROJECT_FILE_VERSION) {
+    log_error(LOG_SOURCE, "Project '%s' is version %u; this build requires version %u.", path, version,
+              TAS_PROJECT_FILE_VERSION);
+    goto done;
+  }
+  document->version = version;
+  if (!reader_u32(&reader, &flags) || flags != 0 || !reader_u64(&reader, &document->input_schema_hash) ||
+      !reader_u32(&reader, &document->input_record_size) || !reader_u32(&reader, &group_count) ||
+      group_count == 0 || group_count > PROJECT_MAX_GROUPS || !reader_u32(&reader, &track_count) ||
+      track_count > PROJECT_MAX_TRACKS || !reader_u64(&reader, &level_size) || !reader_u64(&reader, &project_size) ||
+      !reader_u64(&reader, &timeline_size) || !reader_string(&reader, document->game_id, sizeof(document->game_id)) ||
+      !reader_string(&reader, document->game_version, sizeof(document->game_version)) ||
+      !reader_string(&reader, document->variant_id, sizeof(document->variant_id)) ||
+      !reader_string(&reader, document->level_name, sizeof(document->level_name)) ||
+      !reader_string(&reader, document->level_path, sizeof(document->level_path)) ||
+      !reader_string(&reader, document->camera_mode_id, sizeof(document->camera_mode_id)) ||
+      !reader_f32(&reader, &document->camera_pos[0]) || !reader_f32(&reader, &document->camera_pos[1]) ||
+      !reader_f32(&reader, &document->camera_zoom) || document->camera_zoom <= 0.f)
+    goto malformed;
+
+  document->group_count = (int)group_count;
+  document->track_count = (int)track_count;
+  if ((!document->level_name[0] || strcmp(document->level_name, "unnamed_level") == 0 || strcmp(document->level_name, "map") == 0) &&
+      document->level_path[0]) {
+    char stem[sizeof(document->level_name)];
+    const char *slash = strrchr(document->level_path, '/');
+#ifdef _WIN32
+    const char *back = strrchr(document->level_path, '\\');
+    if (back && (!slash || back > slash)) slash = back;
+#endif
+    const char *file = slash ? slash + 1 : document->level_path;
+    snprintf(stem, sizeof(stem), "%s", file);
+    char *dot = strrchr(stem, '.');
+    if (dot && dot != stem) *dot = '\0';
+    if (stem[0]) snprintf(document->level_name, sizeof(document->level_name), "%s", stem);
+  }
+  if (!validate_document_compatibility(document, &ui->gfx_handler->game_host, path, converting)) goto done;
+  if (level_size == 0 && document->level_path[0] == '\0') goto malformed;
+  if (keep_session_data) {
+    if (!reader_blob(&reader, level_size, &document->level_data, &document->level_size) ||
+        !reader_blob(&reader, project_size, &document->project_data, &document->project_size))
+      goto malformed;
+  } else if (!reader_skip_blob(&reader, level_size) || !reader_skip_blob(&reader, project_size)) {
+    goto malformed;
+  }
+  if (timeline_size > reader.size - reader.pos) goto malformed;
+
+  document->groups = calloc(group_count, sizeof(*document->groups));
+  document->tracks = track_count ? calloc(track_count, sizeof(*document->tracks)) : NULL;
+  if (!document->groups || (track_count && !document->tracks)) goto malformed;
+
+  byte_reader_t timeline_reader = {.data = reader.data + reader.pos, .size = (size_t)timeline_size, .ok = true};
+  reader.pos += (size_t)timeline_size;
+  if (!read_timeline(&timeline_reader, document, keep_session_data, version)) goto malformed;
+  if (version >= 20) {
+    if (!read_camera_timeline(&reader, &document->camera_timeline, version)) goto malformed;
+    if (version >= 23 && !read_render_video(&reader, document, version)) goto malformed;
+  } else {
+    // 18 and 19 carried an earlier camera format at the end of the file. It
+    // was never released; the camera starts empty and the rest loads.
+    camera_timeline_default(&document->camera_timeline);
+    if (version != 17) reader.pos = reader.size;
+  }
+  if (reader.pos != reader.size) goto malformed;
+
+  if (document->active_group_index < 0 || document->active_group_index >= document->group_count ||
+      document->selected_track_index < -1 || document->selected_track_index >= document->track_count)
+    goto malformed;
+  for (int group = 0; group < document->group_count; ++group) {
+    int players = 0;
+    for (int track = 0; track < document->track_count; ++track)
+      if (document->tracks[track].group_index == group) ++players;
+    // (a project moved from another backend too: switch_project_backend checks this before it
+    // moves one, and puts nothing where it does not fit)
+    const int max_players = game_max_players(&ui->gfx_handler->game_host);
+    if ((max_players > 0 && players > max_players) || players < game_min_players(&ui->gfx_handler->game_host))
+      goto malformed;
+  }
+  ok = true;
+  goto done;
+
+malformed:
+  log_error(LOG_SOURCE, "Malformed or incomplete v%u project: '%s'", TAS_PROJECT_FILE_VERSION, path);
+done:
+  free(file_data);
+  fclose(file);
+  if (!ok) project_document_free(document);
+  return ok;
+}
+
+static int document_group_track_count(const project_document_t *document, int group_index) {
+  int count = 0;
+  for (int i = 0; i < document->track_count; ++i)
+    if (document->tracks[i].group_index == group_index) ++count;
+  return count;
+}
+
+// What an open project holds beyond its file, kept while it moves to another backend of its game and
+// when it is put back (switch_project_backend). The undo history names tracks by their place and their
+// uid, and snippets and recordings by their id: the timeline the other game builds keeps all of them,
+// and the ids it gives out next. The selection and the view stay as they were.
+typedef struct project_session_t {
+  uint32_t *track_uids; // in the order of the tracks, which is the file's
+  int track_count;
+  int *selected_snippet_ids;
+  int selected_snippet_count;
+  int active_snippet_id;
+  int next_snippet_id;
+  int next_recording_id;
+  float zoom, track_height;
+  int view_start_tick;
+} project_session_t;
+
+static bool project_session_capture(const timeline_state_t *timeline, project_session_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->track_count = timeline->player_track_count;
+  out->selected_snippet_count = timeline->selected_snippets.count;
+  out->track_uids = out->track_count ? malloc(sizeof(*out->track_uids) * (size_t)out->track_count) : NULL;
+  out->selected_snippet_ids =
+      out->selected_snippet_count ? malloc(sizeof(*out->selected_snippet_ids) * (size_t)out->selected_snippet_count) : NULL;
+  if ((out->track_count && !out->track_uids) || (out->selected_snippet_count && !out->selected_snippet_ids)) {
+    free(out->track_uids);
+    free(out->selected_snippet_ids);
+    return false;
+  }
+  for (int i = 0; i < out->track_count; ++i)
+    out->track_uids[i] = timeline->player_tracks[i].uid;
+  if (out->selected_snippet_count)
+    memcpy(out->selected_snippet_ids, timeline->selected_snippets.ids,
+           sizeof(*out->selected_snippet_ids) * (size_t)out->selected_snippet_count);
+  out->active_snippet_id = timeline->active_snippet_id;
+  out->next_snippet_id = timeline->next_snippet_id;
+  out->next_recording_id = timeline->next_recording_id;
+  out->zoom = timeline->zoom;
+  out->track_height = timeline->track_height;
+  out->view_start_tick = timeline->view_start_tick;
+  return true;
+}
+
+static void project_session_free(project_session_t *session) {
+  free(session->track_uids);
+  free(session->selected_snippet_ids);
+  memset(session, 0, sizeof(*session));
+}
+
+// `session`: the project is moved here from another backend of its game, or put back after that
+// failed (switch_project_backend), and the timeline keeps what the session held (see
+// project_session_t). The undo history names tracks by their place, so the file's order of them, a
+// group's after another's, has to be the one they get here.
+static bool populate_timeline_from_document(timeline_state_t *timeline, project_document_t *document,
+                                            const project_session_t *session) {
+  ui_handler_t *ui = timeline->ui;
+  game_host_t *host = &ui->gfx_handler->game_host;
+
+  if (session) {
+    if (session->track_count != document->track_count) return false;
+    for (int i = 1; i < document->track_count; ++i)
+      if (document->tracks[i].group_index < document->tracks[i - 1].group_index) return false;
+  }
+
+  for (int i = timeline->player_track_count - 1; i >= 0; --i)
+    model_remove_track_logic(timeline, i);
+  while (timeline->group_count < document->group_count)
+    if (!model_add_group(timeline, document->groups[timeline->group_count].name)) return false;
+
+  for (int i = 0; i < document->group_count; ++i) {
+    const project_group_t *source = &document->groups[i];
+    timeline_group_t *destination = timeline->groups[i];
+    snprintf(destination->name, sizeof(destination->name), "%s", source->name);
+    memcpy(destination->color, source->color, sizeof(destination->color));
+    destination->visible = source->visible;
+    destination->export_enabled = source->export_enabled;
+    destination->prediction_enabled = source->prediction_enabled;
+    destination->start_offset = source->start_offset;
+    if (source->world_size > 0 &&
+        (!gh_world_deserialize(host, destination->initial_world, source->world_data, source->world_size) ||
+         gh_world_player_count(host, destination->initial_world) != document_group_track_count(document, i)))
+      return false;
+  }
+
+  int max_snippet_id = 0;
+  for (int group = 0; group < document->group_count; ++group) {
+    timeline->active_group_index = group;
+    for (int i = 0; i < document->track_count; ++i) {
+      player_track_t *source = &document->tracks[i];
+      if (source->group_index != group) continue;
+      player_track_t *destination = model_add_new_track(timeline, 1);
+      if (!destination) return false;
+      const int destination_group = destination->group_index;
+      const uint32_t uid = session ? session->track_uids[i] : destination->uid;
+      *destination = *source;
+      destination->group_index = destination_group;
+      destination->uid = uid;
+      destination->recording_snippets = NULL;
+      destination->recording_snippet_count = 0;
+      destination->recording_snippet_capacity = 0;
+      model_rebind_starting_strings(&destination->starting_config);
+      source->snippets = NULL;
+      source->snippet_count = 0;
+      source->snippet_capacity = 0;
+      for (int j = 0; j < destination->snippet_count; ++j)
+        if (destination->snippets[j].id > max_snippet_id) max_snippet_id = destination->snippets[j].id;
+    }
+  }
+
+  for (int i = 0; i < timeline->player_track_count; ++i) {
+    const int group = timeline->player_tracks[i].group_index;
+    if (document->groups[group].world_size == 0 && timeline->player_tracks[i].starting_config.enabled)
+      model_apply_starting_config(timeline, i);
+  }
+
+  timeline->event_count = document->event_count;
+  timeline->event_capacity = document->event_count;
+  ++timeline->event_revision;
+  timeline->events = document->event_count ? malloc(sizeof(*timeline->events) * (size_t)document->event_count) : NULL;
+  if (document->event_count && !timeline->events) return false;
+  if (document->event_count)
+    memcpy(timeline->events, document->events, sizeof(*timeline->events) * (size_t)document->event_count);
+
+  for (int i = 0; i < document->recording_count; ++i) {
+    const project_recording_t *recording = &document->recordings[i];
+    if (!recordings_add(timeline, recording->id, recording->name, recording->data, recording->size)) return false;
+  }
+
+  timeline->next_snippet_id = max_snippet_id + 1;
+  timeline->current_tick = document->current_tick;
+  timeline->active_group_index = document->active_group_index;
+  timeline->selected_player_track_index = document->selected_track_index;
+  if (session) {
+    // (an id the history holds may be past every snippet and recording there is now: one deleted, or
+    // a demo import undone, is brought back by it, and must not have been given to another meanwhile)
+    if (session->next_snippet_id > timeline->next_snippet_id) timeline->next_snippet_id = session->next_snippet_id;
+    if (session->next_recording_id > timeline->next_recording_id) timeline->next_recording_id = session->next_recording_id;
+    for (int i = 0; i < session->selected_snippet_count; ++i)
+      if (model_find_snippet_by_id(timeline, session->selected_snippet_ids[i], NULL))
+        snippet_id_vector_add(&timeline->selected_snippets, session->selected_snippet_ids[i]);
+    timeline->active_snippet_id = session->active_snippet_id;
+    timeline->zoom = session->zoom;
+    timeline->track_height = session->track_height;
+    timeline->view_start_tick = session->view_start_tick;
+  }
+  // (linked_copy_input is the user's setting, kept in the config; the copy in
+  // the file is left as it is)
+  model_recalc_physics(timeline, 0);
+  return true;
+}
+
+static ft_level *load_document_level(game_host_t *host, const project_document_t *document) {
+  if (document->level_size > 0) return gh_level_load_memory(host, document->level_data, document->level_size);
+  return gh_level_load_path(host, document->level_path);
+}
+
+static void update_level_metadata(ui_handler_t *ui, const project_document_t *document) {
+  gfx_handler_t *handler = ui->gfx_handler;
+  ft_level_info info;
+  if (gh_level_info(&handler->game_host, handler->level, &info) && info.bounds.w > 0.f && info.bounds.h > 0.f)
+    engine_api_set_world_extent(handler, info.bounds.w, info.bounds.h);
+  else
+    engine_api_set_world_extent(handler, 1.f, 1.f);
+  snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", document->level_name);
+  snprintf(ui->loaded_level_path, sizeof(ui->loaded_level_path), "%s", document->level_path);
+}
+
+// Before version 32 a 2D zoom scaled the level: it showed 2 / zoom thousandths of the level's longer
+// side across, keys as at 16:9. Now it is the game's own (game_view_size).
+static float zoom_from_level_scale(gfx_handler_t *h, float old, float aspect) {
+  const float width = 2.f * h->world_width / (old * fmaxf(h->world_width, h->world_height) * 0.001f);
+  return game_zoom_for_width(&h->game_host, aspect, width);
+}
+
+static void convert_level_zooms(ui_handler_t *ui, project_document_t *document) {
+  gfx_handler_t *h = ui->gfx_handler;
+  if (document->version >= 32 || game_is_3d(&h->game_host) || h->world_width <= 0.f || h->world_height <= 0.f) return;
+  const float aspect = h->viewport[1] > 0.f ? h->viewport[0] / h->viewport[1] : 16.f / 9.f;
+  document->camera_zoom = zoom_from_level_scale(h, document->camera_zoom, aspect);
+  camera_timeline_t *camera = &document->camera_timeline;
+  for (int i = 0; i < camera->pose_count; ++i)
+    camera->pose_keys[i].pose.zoom = zoom_from_level_scale(h, camera->pose_keys[i].pose.zoom, 16.f / 9.f);
+}
+
+static void restore_camera(ui_handler_t *ui, const project_document_t *document) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  camera_t *camera = &ui->gfx_handler->renderer.camera;
+  camera->mode = 0;
+  for (unsigned i = 0; i < game_camera_mode_count(host); ++i) {
+    const ft_camera_mode *mode = game_camera_mode(host, i);
+    if (mode && mode->id && strcmp(mode->id, document->camera_mode_id) == 0) {
+      camera->mode = i;
+      break;
+    }
+  }
+  camera->pos[0] = document->camera_pos[0];
+  camera->pos[1] = document->camera_pos[1];
+  camera->zoom = document->camera_zoom;
+  camera->zoom_wanted = document->camera_zoom;
+  camera->is_dragging = false;
+}
+
+// Reads the project at `path` into the active game. `session`: it is moved there from another backend
+// of its game, or put back after that failed (switch_project_backend), and keeps what the session held
+// (project_session_t) and its undo history; the caller owns where it is saved.
+static bool load_project_document(ui_handler_t *ui, const char *path, const project_session_t *session) {
+  const bool converting = session != NULL;
+  project_document_t document;
+  if (!read_project_file(ui, path, &document, true, converting)) return false;
+
+  game_host_t *host = &ui->gfx_handler->game_host;
+  // (a game without variants has none: NULL)
+  char old_variant[FT_ID_MAX];
+  snprintf(old_variant, sizeof(old_variant), "%s", game_host_variant(host) ? game_host_variant(host) : "");
+  uint8_t *old_project_data = NULL;
+  size_t old_project_size = 0;
+  if (!collect_project_data(host, &old_project_data, &old_project_size)) {
+    project_document_free(&document);
+    return false;
+  }
+
+  // Written by the other backend (only ever when converting): what it stored of its own is read as
+  // this game reads it, or is left behind.
+  const bool foreign = strcmp(document.game_id, game_host_active_id(host)) != 0;
+  const int foreign_index = foreign ? game_host_find_id(host, document.game_id) : -1;
+  const char *foreign_name = foreign_index >= 0 ? host->slots[foreign_index].display_name : document.game_id;
+  const char *own_name = host->active >= 0 ? host->slots[host->active].display_name : game_host_active_id(host);
+  if (foreign) {
+    // A stored starting world is the other game's own, but never more than its level's with the tracks'
+    // overrides applied (model_rebuild_group_start), which this game's worlds get here instead. The
+    // overrides stay on the tracks as they are, those of properties this game lacks included: they set
+    // nothing here, and set them again once the project goes back.
+    for (int g = 0; g < document.group_count; ++g) {
+      free(document.groups[g].world_data);
+      document.groups[g].world_data = NULL;
+      document.groups[g].world_size = 0;
+    }
+  }
+
+  game_host_set_variant(host, document.variant_id[0] ? document.variant_id : NULL);
+  if (foreign) {
+    // A ruleset this game lacks becomes its first, which is what a game without rulesets gives a
+    // project going back to one that has them (DDNet's "ddrace", from Unique Race).
+    if (document.variant_id[0] && game_host_variant(host) && strcmp(game_host_variant(host), document.variant_id) != 0)
+      log_warn(LOG_SOURCE, "%s has no ruleset '%s'; the project plays its '%s'.", own_name, document.variant_id,
+               game_host_variant(host));
+  } else if (document.variant_id[0] && !game_host_variant(host)) {
+    // (a game that has since dropped its rulesets, as Unique Race did for the modes its maps name)
+    log_info(LOG_SOURCE, "Game '%s' has no rulesets; the project's '%s' is ignored.", document.game_id, document.variant_id);
+  } else if (document.variant_id[0] && strcmp(game_host_variant(host), document.variant_id) != 0) {
+    log_error(LOG_SOURCE, "Project '%s' requests unknown variant '%s'.", path, document.variant_id);
+    goto failed_before_timeline;
+  }
+  if (!gh_project_load(host, document.project_data, document.project_size)) {
+    if (!foreign) {
+      log_error(LOG_SOURCE, "Game '%s' rejected its project data in '%s'.", document.game_id, path);
+      goto failed_before_timeline;
+    }
+    // (the backends of a game mostly store the same; what this one cannot read is left out)
+    log_warn(LOG_SOURCE, "%s could not read the settings %s kept in the project (%zu bytes), so they are left out.",
+             own_name, foreign_name, document.project_size);
+    if (!gh_project_load(host, NULL, 0)) {
+      log_error(LOG_SOURCE, "Game '%s' could not start from empty project data.", game_host_active_id(host));
+      goto failed_before_timeline;
+    }
+  }
+
+  char previous_level_name[128];
+  char previous_level_path[1024];
+  snprintf(previous_level_name, sizeof(previous_level_name), "%s", ui->loaded_level_name);
+  snprintf(previous_level_path, sizeof(previous_level_path), "%s", ui->loaded_level_path);
+  snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", document.level_name);
+  snprintf(ui->loaded_level_path, sizeof(ui->loaded_level_path), "%s", document.level_path);
+
+  ft_level *new_level = load_document_level(host, &document);
+  if (!new_level) {
+    snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", previous_level_name);
+    snprintf(ui->loaded_level_path, sizeof(ui->loaded_level_path), "%s", previous_level_path);
+    log_error(LOG_SOURCE, "Game '%s' could not load the level stored by '%s'.", document.game_id, path);
+    goto failed_before_timeline;
+  }
+
+  gfx_handler_t *handler = ui->gfx_handler;
+  ft_level *old_level = handler->level;
+  handler->level = new_level;
+  timeline_state_t loaded = {0};
+  model_init(&loaded, ui);
+  if (!populate_timeline_from_document(&loaded, &document, session)) {
+    model_cleanup(&loaded);
+    handler->level = old_level;
+    gh_level_destroy(host, new_level);
+    log_error(LOG_SOURCE, "Game '%s' rejected a stored world or player layout in '%s'.", document.game_id, path);
+    goto failed_before_timeline;
+  }
+
+  timeline_state_t previous = ui->timeline;
+  // (a moved project keeps its history, which the caller holds meanwhile: activating the game emptied
+  // this one, and the snippet editor's view of the snippet)
+  if (!converting) {
+    snippet_editor_reset();
+    undo_manager_cleanup(&ui->undo_manager);
+    undo_manager_init(&ui->undo_manager);
+  }
+  ui->timeline = loaded;
+  model_cleanup(&previous);
+  gh_level_destroy(host, old_level);
+
+  update_level_metadata(ui, &document);
+  convert_level_zooms(ui, &document);
+  restore_camera(ui, &document);
+  ui->camera_timeline = document.camera_timeline;
+  // (the Camera tab of a moved project stays where it was; only the paths it drew are the old game's)
+  if (converting) camera_rig_forget();
+  else camera_editor_reset(ui);
+  // The video's look travels with the project; groups the file does not list
+  // appear in it.
+  ui->render.video = document.video_profile;
+  if (document.has_video_options) ui->video_options = document.video_options;
+  for (int g = 0; g < ui->timeline.group_count; ++g)
+  {
+    ui->timeline.groups[g]->video_visible =
+        (uint32_t)g >= document.group_video_count || document.group_video_visible[g] != 0;
+    const bool listed = (uint32_t)g < document.group_opacity_count;
+    ui->timeline.groups[g]->opacity = listed ? document.group_opacities[2 * g] : 1.f;
+    ui->timeline.groups[g]->video_opacity = listed ? document.group_opacities[2 * g + 1] : 1.f;
+    const bool loud = (uint32_t)g < document.group_volume_count;
+    ui->timeline.groups[g]->volume = loud ? document.group_volumes[2 * g] : 1.f;
+    ui->timeline.groups[g]->video_volume = loud ? document.group_volumes[2 * g + 1] : 1.f;
+  }
+  if (!converting) {
+    snprintf(ui->current_project_path, sizeof(ui->current_project_path), "%s", path);
+    ui->has_unsaved_changes = false;
+    ui_add_recent_project(ui, path);
+    log_info(LOG_SOURCE, "Project loaded successfully from '%s'", path);
+  }
+
+  free(old_project_data);
+  project_document_free(&document);
+  return true;
+
+failed_before_timeline:
+  game_host_set_variant(host, old_variant[0] ? old_variant : NULL);
+  if (!gh_project_load(host, old_project_data, old_project_size))
+    log_error(LOG_SOURCE, "Game '%s' could not restore its previous project state after a failed load.", game_host_active_id(host));
+  free(old_project_data);
+  project_document_free(&document);
+  return false;
+}
+
+bool load_project(ui_handler_t *ui, const char *path) {
+  if (!ui || !path || !ui->gfx_handler) return false;
+  if (!activate_project_game(ui, path)) return false;
+  return load_project_document(ui, path, NULL);
+}
+
+static void backend_switch_path(char *out, size_t size, const char *name) {
+  if (!fs_get_config_dir(out, size)) {
+    out[0] = '\0';
+    return;
+  }
+  // (made on first use: the preferences may not have been saved yet)
+  fs_mkdir(out);
+  const size_t length = strlen(out);
+  snprintf(out + length, size - length, "%c%s", PATH_SEP, name);
+}
+
+// Whether the game in slot `target` can take the open project as it is; if not, why, in `error`. Asked
+// before anything changes, so that a switch it refuses leaves the project, its undo history and the
+// plugins as they were (activating the other game would reopen every plugin of the game, and the undo
+// steps a plugin made go with it).
+static bool backend_takes_project(ui_handler_t *ui, int target, char *error, size_t error_size) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const timeline_state_t *timeline = &ui->timeline;
+  const ft_game_module *module = host->slots[target].module;
+  const char *name = host->slots[target].display_name;
+  const char *own_name = host->slots[host->active].display_name;
+  if (timeline->recording) {
+    snprintf(error, error_size, "The physics cannot be switched while recording. Stop the recording first.");
+    return false;
+  }
+  if (!module->input_schema || module->input_schema->record_size != game_input_size(host)) {
+    snprintf(error, error_size, "%s takes other inputs than %s.", name, own_name);
+    return false;
+  }
+  // Every recording goes along, also those only the undo history still uses.
+  if (timeline->recording_count > 0 && !(module->constraints.caps & FT_CAP_RECORDINGS)) {
+    bool replayed = false;
+    for (int i = 0; i < timeline->recording_count && !replayed; ++i)
+      replayed = recording_is_referenced(timeline, timeline->recordings[i]->id);
+    snprintf(error, error_size, "%s cannot play demos, and this project holds %d.%s", name, timeline->recording_count,
+             replayed ? ""
+                      : " No snippet replays them now, but undo can bring such snippets back: saving the project and "
+                        "opening it again lets the demos go.");
+    return false;
+  }
+  if (timeline->recording_count > PROJECT_MAX_RECORDINGS) {
+    snprintf(error, error_size, "The project holds %d demos, more than a project carries (%d).", timeline->recording_count,
+             PROJECT_MAX_RECORDINGS);
+    return false;
+  }
+  const int min_players = module->constraints.min_players, max_players = module->constraints.max_players;
+  for (int g = 0; g < timeline->group_count; ++g) {
+    const int players = model_group_track_count(timeline, g);
+    if (players >= min_players && (max_players <= 0 || players <= max_players)) continue;
+    if (max_players > 0)
+      snprintf(error, error_size, "Group '%s' has %d players, and %s takes %d to %d in a group.", timeline->groups[g]->name,
+               players, name, min_players, max_players);
+    else
+      snprintf(error, error_size, "Group '%s' has %d players, and %s takes at least %d in a group.", timeline->groups[g]->name,
+               players, name, min_players);
+    return false;
+  }
+  return true;
+}
+
+bool switch_project_backend(ui_handler_t *ui, int game_index, char *error, size_t error_size) {
+  if (error_size) error[0] = '\0';
+  if (!ui || !ui->gfx_handler || !ui->gfx_handler->level) return false;
+  gfx_handler_t *handler = ui->gfx_handler;
+  game_host_t *host = &handler->game_host;
+  const int source = host->active;
+  if (game_index == source) return true;
+  if (!game_host_same_game(host, source, game_index)) return false;
+  const char *target_id = host->slots[game_index].id;
+  const char *target_name = host->slots[game_index].display_name;
+
+  // (warnings and the first error from here on are what the dialog tells; what the game says first
+  // when it does not take the project, a level of the other game say, is its reason)
+  logger_clear_first_error();
+  if (!backend_takes_project(ui, game_index, error, error_size)) {
+    log_error(LOG_SOURCE, "%s", error);
+    return false;
+  }
+
+  // The project goes through a file of its own, which the other game reads as it reads any project,
+  // and is put back from it if that game does not take it. The file holds every recording, and both
+  // reads are moves: they keep the path, the recent projects and what the session holds besides the
+  // file (project_session_t). Activating a game empties the undo history, which is held aside
+  // meanwhile and comes back after. Nothing is converted on the way: what only the old game can read
+  // (load_project_document) is left out of what the other one gets, with a warning each
+  // (logger_warnings), and its tracks keep what it is made from, so the way back restores it.
+  char path[1024];
+  backend_switch_path(path, sizeof(path), "backend_switch.tasp");
+  if (!path[0]) return false;
+  project_session_t session;
+  if (!project_session_capture(&ui->timeline, &session)) {
+    snprintf(error, error_size, "Out of memory.");
+    return false;
+  }
+  char saved_path[sizeof(ui->current_project_path)];
+  snprintf(saved_path, sizeof(saved_path), "%s", ui->current_project_path);
+  const bool had_unsaved_changes = ui->has_unsaved_changes;
+  // (the preferences go along too: written now, they are what the other backend of the game reads)
+  config_save(ui);
+  if (!write_project_file(ui, path, true)) {
+    snprintf(error, error_size, "The project could not be written to '%s' to move it.", path);
+    log_error(LOG_SOURCE, "%s", error);
+    project_session_free(&session);
+    return false;
+  }
+
+  // (a plugin unloaded meanwhile takes its steps out of it, as out of the history in use)
+  ui->parked_undo_manager = ui->undo_manager;
+  undo_manager_init(&ui->undo_manager);
+
+  const bool moved = gfx_activate_game(handler, game_index) && load_project_document(ui, path, &session);
+  bool restored = moved;
+  if (!moved) {
+    if (logger_first_error()[0]) snprintf(error, error_size, "%s", logger_first_error());
+    else snprintf(error, error_size, "%s could not open the project.", target_name);
+    log_error(LOG_SOURCE, "Game '%s' could not take the project; it stays with game '%s'.", target_id, host->slots[source].id);
+    restored = gfx_activate_game(handler, source) && load_project_document(ui, path, &session);
+    if (!restored) {
+      const size_t used = strlen(error);
+      snprintf(error + used, error_size - used, "\n\nThe project could not be restored either; it is in '%s'.", path);
+      log_error(LOG_SOURCE, "The project could not be restored either; it is still in '%s'.", path);
+    }
+  }
+  // (whatever was registered while the games changed is about the empty project activating one made)
+  undo_manager_cleanup(&ui->undo_manager);
+  ui->undo_manager = ui->parked_undo_manager;
+  undo_manager_init(&ui->parked_undo_manager);
+  // A history without its project would undo into whatever is open instead.
+  if (!restored) {
+    undo_manager_cleanup(&ui->undo_manager);
+    undo_manager_init(&ui->undo_manager);
+  }
+  project_session_free(&session);
+
+  snprintf(ui->current_project_path, sizeof(ui->current_project_path), "%s", saved_path);
+  // (the file on disk is the old game's until it is saved again)
+  ui->has_unsaved_changes = moved || had_unsaved_changes;
+  if (restored) fs_remove(path);
+  if (moved) log_info(LOG_SOURCE, "The project now runs on game '%s'.", target_id);
+  return moved;
+}
+
+static const char *project_file_stem(const char *path, char *buffer, size_t buffer_size) {
+  const char *name = path;
+  for (const char *cursor = path; *cursor; ++cursor)
+    if (*cursor == '/' || *cursor == '\\') name = cursor + 1;
+  snprintf(buffer, buffer_size, "%s", *name ? name : "Imported group");
+  char *dot = strrchr(buffer, '.');
+  if (dot && dot != buffer) *dot = '\0';
+  return buffer;
+}
+
+static bool prepare_imported_events(const timeline_state_t *timeline, const project_document_t *document,
+                                    timeline_event_t **out_events, int *out_count) {
+  // Payload-free events are observations from simulating the source map. They
+  // must be regenerated on the current map; only game-authored events travel
+  // with the imported timeline.
+  int authored_count = 0;
+  for (int i = 0; i < document->event_count; ++i)
+    if (document->events[i].data_size > 0) ++authored_count;
+
+  if (timeline->event_count > PROJECT_MAX_EVENTS - authored_count) return false;
+  const int count = timeline->event_count + authored_count;
+  size_t allocation_size;
+  if (!checked_multiply((size_t)count, sizeof(**out_events), &allocation_size)) return false;
+
+  timeline_event_t *events = count > 0 ? malloc(allocation_size) : NULL;
+  if (count > 0 && !events) return false;
+  if (timeline->event_count > 0)
+    memcpy(events, timeline->events, sizeof(*events) * (size_t)timeline->event_count);
+
+  int destination = timeline->event_count;
+  for (int i = 0; i < document->event_count; ++i) {
+    if (document->events[i].data_size == 0) continue;
+    events[destination] = document->events[i];
+    events[destination].group_index += timeline->group_count;
+    ++destination;
+  }
+  *out_events = events;
+  *out_count = count;
+  return true;
+}
+
+static bool validate_import_capacity(const timeline_state_t *timeline, const project_document_t *document,
+                                     int *out_snippet_count) {
+  if (timeline->group_count > PROJECT_MAX_GROUPS - document->group_count ||
+      timeline->player_track_count > PROJECT_MAX_TRACKS - document->track_count)
+    return false;
+
+  int snippet_count = 0;
+  for (int track = 0; track < document->track_count; ++track) {
+    const int count = document->tracks[track].snippet_count;
+    if (count > INT_MAX - snippet_count) return false;
+    snippet_count += count;
+  }
+  if (timeline->next_snippet_id <= 0 || snippet_count > INT_MAX - timeline->next_snippet_id) return false;
+  *out_snippet_count = snippet_count;
+  return true;
+}
+
+bool import_project_as_group(ui_handler_t *ui, const char *path) {
+  if (!ui || !path || !*path || !ui->gfx_handler || !ui->gfx_handler->level ||
+      !game_host_ready(&ui->gfx_handler->game_host) || ui->timeline.recording)
+    return false;
+  project_document_t document;
+  // Import only needs portable timeline data. The source level, game-owned
+  // project state and serialized worlds are validated and skipped by the reader
+  // rather than allocated, loaded or compared with the active session.
+  if (!read_project_file(ui, path, &document, false, false)) return false;
+
+  timeline_state_t *timeline = &ui->timeline;
+  const int original_group_count = timeline->group_count;
+  const int original_active_group = timeline->active_group_index;
+  const int original_selected_track = timeline->selected_player_track_index;
+  const int original_next_snippet_id = timeline->next_snippet_id;
+  int imported_snippet_count = 0;
+  timeline_event_t *merged_events = NULL;
+  int merged_event_count = 0;
+  bool ok = false;
+  char stem[MAX_TIMELINE_GROUP_NAME];
+  project_file_stem(path, stem, sizeof(stem));
+
+  if (!validate_import_capacity(timeline, &document, &imported_snippet_count) ||
+      !prepare_imported_events(timeline, &document, &merged_events, &merged_event_count)) {
+    log_error(LOG_SOURCE, "Cannot import '%s': the combined project is too large.", path);
+    free(merged_events);
+    project_document_free(&document);
+    return false;
+  }
+
+  int next_snippet_id = original_next_snippet_id;
+
+  // The imported project's recordings come along under new ids. Should the import fail, they stay
+  // unreferenced and are simply not saved.
+  int *recording_ids = document.recording_count ? malloc(sizeof(int) * (size_t)document.recording_count) : NULL;
+  if (document.recording_count && !recording_ids) goto done;
+  for (int i = 0; i < document.recording_count; ++i) {
+    const project_recording_t *recording = &document.recordings[i];
+    timeline_recording_t *added = recordings_add(timeline, -1, recording->name, recording->data, recording->size);
+    if (!added) goto done;
+    recording_ids[i] = added->id;
+  }
+
+  for (int source_group = 0; source_group < document.group_count; ++source_group) {
+    project_group_t *source_group_data = &document.groups[source_group];
+    timeline_group_t *group = model_add_group(timeline, source_group_data->name[0] ? source_group_data->name : stem);
+    if (!group || !group->initial_world) goto done;
+    memcpy(group->color, source_group_data->color, sizeof(group->color));
+    group->visible = source_group_data->visible;
+    group->export_enabled = source_group_data->export_enabled;
+    group->prediction_enabled = source_group_data->prediction_enabled;
+    group->start_offset = source_group_data->start_offset;
+    const int destination_group = timeline->group_count - 1;
+
+    // model_add_group created every runtime world from the active level and
+    // variant. A source-map world snapshot is intentionally never restored.
+
+    timeline->active_group_index = destination_group;
+    for (int source_track = 0; source_track < document.track_count; ++source_track) {
+      player_track_t *from = &document.tracks[source_track];
+      if (from->group_index != source_group) continue;
+      player_track_t *to = model_add_new_track(timeline, 1);
+      if (!to) goto done;
+      const int preserved_group = to->group_index;
+      const uint32_t uid = to->uid;
+      *to = *from;
+      to->group_index = preserved_group;
+      to->uid = uid;
+      to->recording_snippets = NULL;
+      to->recording_snippet_count = 0;
+      to->recording_snippet_capacity = 0;
+      model_rebind_starting_strings(&to->starting_config);
+      for (int snippet = 0; snippet < to->snippet_count; ++snippet) {
+        input_snippet_t *moved = &to->snippets[snippet];
+        moved->id = next_snippet_id++;
+        if (!snippet_is_playback(moved)) continue;
+        for (int r = 0; r < document.recording_count; ++r)
+          if (document.recordings[r].id == moved->recording_id) {
+            moved->recording_id = recording_ids[r];
+            break;
+          }
+      }
+      from->snippets = NULL;
+      from->snippet_count = 0;
+      from->snippet_capacity = 0;
+      if (to->starting_config.enabled)
+        model_apply_starting_config(timeline, (int)(to - timeline->player_tracks));
+    }
+  }
+
+  free(timeline->events);
+  timeline->events = merged_events;
+  timeline->event_count = merged_event_count;
+  timeline->event_capacity = merged_event_count;
+  merged_events = NULL;
+  timeline_events_sort(timeline);
+  timeline->next_snippet_id = next_snippet_id;
+  timeline->active_group_index = original_group_count;
+  timeline->selected_player_track_index = model_group_track_index(timeline, original_group_count, 0);
+  model_recalc_physics(timeline, 0);
+  ui_mark_unsaved(ui);
+  log_info(LOG_SOURCE, "Imported %d group(s), %d track(s), and %d snippet(s) from '%s' onto the current level",
+           document.group_count, document.track_count, imported_snippet_count, path);
+  ok = true;
+
+done:
+  if (!ok) {
+    while (timeline->group_count > original_group_count)
+      model_remove_group(timeline, timeline->group_count - 1);
+    timeline->active_group_index = original_active_group;
+    timeline->selected_player_track_index = original_selected_track;
+    timeline->next_snippet_id = original_next_snippet_id;
+    model_recalc_physics(timeline, 0);
+    log_error(LOG_SOURCE, "Could not import all project groups from '%s'.", path);
+  }
+  free(recording_ids);
+  free(merged_events);
+  project_document_free(&document);
+  return ok;
+}

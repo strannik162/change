@@ -1,1 +1,200 @@
-# change
+# FrameTee
+
+FrameTee is a game-agnostic **Tool-Assisted Speedrun (TAS) editor and simulation engine** for games whose physics can be reproduced outside the original game.
+The core engine is written in **C99** using **Dear ImGui** and **Vulkan**. Game-specific physics, inputs, rendering, level loading and exporting are provided through separate game modules.
+Currently supported games are [Teeworlds](https://teeworlds.com/) / [DDNet](https://ddnet.org/) and [TrackMania United Forever](https://store.steampowered.com/app/7200/TrackMania_United/). Super Mario 64 support is currently in development.
+
+> FrameTee is a **Work In Progress**. Expect bugs, crashes and breaking changes. Physics integrations, APIs and project file formats are subject to change. macOS is currently not supported.
+
+<p align="center">
+<img width="45%" height="350" alt="ddnet_gif" src="https://github.com/user-attachments/assets/40258457-b4ea-45a1-8a4b-d95f2fdd2f36" />
+<img align="top" width="48%" alt="tmuf_gif_didiking" src="https://github.com/user-attachments/assets/a92af5fa-13a6-4d25-bbe1-c822161b2209" />
+<img height="530px" alt="ddnet_image" src="https://github.com/user-attachments/assets/91449a7d-6be8-4d88-b9ff-294106f90a28" />
+<p/>
+  
+## Games
+
+Game integrations are implemented as modules behind a versioned C ABI. A module provides simulation, input definitions, state reflection, level loading, rendering and exporters while FrameTee handles the editor and TAS workflow.
+
+### DDNet / Teeworlds
+
+The DDNet module uses [`ddnet_physics`](https://github.com/Teero888/ddnet_physics) and loads regular DDNet `.map` files.
+The following gamemodes are supported: DDRace, Race, FastCap, FastCap no weapons.
+Exporting to .demo or ghost files is also supported. `ddnet_physics` is still incomplete so some features such as draggers or plasma turrets won't work but will be implemented in the future.
+To prevent cheating on official DDNet servers, the physics have been slightly altered and exporting input sequences to cheat clients is **NOT** supported and never will be. Don't even try.
+
+### TrackMania United Forever
+
+The TrackMania module uses [`tmuf_physics`](https://github.com/Teero888/tmuf_physics), the game's physics in C, bit-exact with TrackMania United Forever 2.11.26 in all seven environments.
+FrameTee can load TrackMania Forever challenges, simulate them and render them in the 3D editor from the game's own files.
+Replays open as levels (their map, car, seed and laps) or import as recordings to continue from, and runs export as `.Replay.Gbx` files the game validates. Skins and replay names are looked for in the game's data and in a player's TrackMania documents.
+TrackMania's proprietary assets are not distributed with FrameTee and must come from an existing TrackMania United Forever installation. See [installation guide](https://github.com/Teero888/frametee/blob/master/data/games/tmuf/README.txt).
+
+## Timeline
+
+The timeline is built around tracks and input snippets.
+Snippets contain authored input and can be moved, resized, split, duplicated and combined without flattening the run into a single input stream. The snippet editor exposes the active game's inputs per tick and supports direct editing of the underlying input data. Snippets can be manually created or be recorded live at variable speed. Snippets are non-destructive, resizing them or splitting them won't delete any information, just as in any video editor.
+
+<img height="300" alt="image" src="https://github.com/user-attachments/assets/33ffbf90-fe4b-475b-9370-e3aff492c803" />
+
+### Snippet Effects
+
+Snippet effects apply non-destructive transformations to authored input.
+Effects are processed in order and can be reordered, disabled or removed without modifying the original input data. Game modules define the available effects while FrameTee handles their storage, evaluation and undo history.
+
+<img height="300" alt="DDNet snippet effects image" src="https://github.com/user-attachments/assets/20427b2c-f38c-49be-846d-ee4e592edec6" />
+
+### Snippet Editor
+
+The Snippet Editor allows you to manually edit individual inputs or bulk edit edit inputs after they have been recorded/created. It's pretty easy to use and works with all games.
+
+<img height="300" alt="image" src="https://github.com/user-attachments/assets/4640ccfa-fcac-4cab-8f67-b38793299a2e" />
+<img height="300" alt="image" src="https://github.com/user-attachments/assets/aa564dca-f946-4913-af89-b2fe3a3ee12e" />
+
+## Prediction
+
+Prediction lines simulate future movement from the current state without modifying the timeline.
+The primary line follows the authored inputs. Additional lines can override selected inputs, allowing several possible continuations to be compared from the same simulation state.
+Prediction uses the same game simulation interface as normal playback, so it works across both 2D and 3D modules.
+
+<img align="top" height="350" alt="image" src="https://github.com/user-attachments/assets/570483fb-b86b-4dd3-82cc-499ae5bcf5d7" />
+<img height="350" alt="image" src="https://github.com/user-attachments/assets/17ed1ee7-6845-4a99-8e3f-8ecfde112941" />
+<img height="350" alt="image" src="https://github.com/user-attachments/assets/59a03977-95f2-48fe-a463-3f8f020711b8" />
+
+## Camera
+
+The Camera tab edits the camera like a video, with the game as its footage.
+Camera keys are interpolated along a spatial path with ease curves, similar to After Effects, and the camera can follow or aim at one or more characters. Keys inside a shot can be timed by the path (After Effects' roving keys), so the camera keeps one steady pace through them. A Focus lane cuts between characters the way a spectator switches whom they watch: each shot is about one character, whose HUD the video shows and whom Follow and Aim track. A separate game time curve remaps the game under the camera, so it can be slowed down, frozen or reversed while the camera keeps moving.
+<img width="2225" height="257" alt="image" src="https://github.com/user-attachments/assets/5b00cf97-3036-4314-b5f2-34a8a31cbb6c" />
+<img width="2227" height="259" alt="image" src="https://github.com/user-attachments/assets/5390d2a9-66c7-4d41-854f-eebd8b82aeaf" />
+
+## Rendering
+
+The Render tab decides what is drawn, separately for the editor viewport and for the video, and renders the camera to an MP4.
+While it is open, the viewport previews the video. Rendering runs in a separate process from a snapshot of the project, so editing can continue while it runs. FFmpeg development libraries are needed at build time to enable MP4 export.
+
+## Groups
+
+Groups represent independent simulation worlds.
+Tracks inside the same group share a world and interact normally. Separate groups maintain separate world states, which allows multiple independent runs to exist in the same project.
+
+<img height="230" alt="image" src="https://github.com/user-attachments/assets/9df14f5d-4da0-41fc-89d3-0ba8e4948e15" />
+<img height="230" alt="image" src="https://github.com/user-attachments/assets/fbcaeb56-9ba1-4c41-b0e7-9973e5449e07" />
+<img height="230" alt="image" src="https://github.com/user-attachments/assets/2a03a444-1a57-45c9-97c0-7d837286bea4" />
+
+## Starting-State Overrides
+
+Game modules can expose selected entity properties as editable starting-state values.
+These overrides are applied before timeline playback begins and can be used to change state such as position, velocity or other game-specific properties supported by the module.
+A start can also be handed on: `Add track with this start` creates a new track in the same group with the same starting state, and `Apply changes to tracks...` writes only the values that were just edited onto any number of existing tracks in one step, so every track can be given a weapon without moving any of them.
+
+<img height="400" alt="image" src="https://github.com/user-attachments/assets/5dda3e0e-3760-49b2-b40f-d05956b763ae" />
+<img align="top" height="400" alt="image" src="https://github.com/user-attachments/assets/d69e8d54-7732-41dc-a0c0-9169d0ce89d4" />
+
+## Plugins
+
+Plugins extend FrameTee without modifying the core engine.
+They can inspect and modify timeline data, generate inputs, add UI, draw viewport overlays, participate in undo/redo and expose command-line functionality.
+Plugins use a versioned C API and are configured through `plugin.toml`.
+See [`docs/plugins.md`](docs/plugins.md) for the plugin API and examples.
+
+## Command Line
+
+FrameTee can be started directly with a selected game and level:
+
+```bash
+./frametee --game ddnet --level path/to/map.map
+```
+
+Installed game modules can be listed with:
+
+```bash
+./frametee --list-games
+```
+
+A recording (a DDNet demo, a TrackMania replay) can be imported on start; it opens a project on its level:
+
+```bash
+./frametee --game tmuf --demo "path/to/run.Replay.Gbx"
+```
+
+Headless mode runs the simulation without creating a window and can be combined with plugins:
+
+```bash
+./frametee \
+    --headless \
+    --game ddnet \
+    --level path/to/map.map \
+    --plugin my_plugin
+```
+
+Additional arguments can be forwarded to active plugins.
+
+An MP4 can also be rendered from the command line (from a level or a saved project):
+
+```bash
+./frametee --game ddnet --project path/to/run.tasp \
+    --render-video path/to/render.mp4 --render-range 0:10 \
+    --render-size 1920x1080 --render-fps 60000/1001 \
+    --render-codec h264 --render-crf 18 --render-preset slow --render-depth 8
+```
+
+`--render-range` is in seconds of camera time and defaults to the project's export range. Use `--render-bitrate <kb/s>` instead of `--render-crf <value>` for target bitrate mode. The CLI render still needs a working Vulkan display.
+
+A demo can be played back as a renderer benchmark. Like DDNet's `benchmark_quit`, this plays it fullscreen with all its players, without vsync or a frame limit, and writes one `Frametime <n> us` line per frame for the given number of seconds:
+
+```bash
+./frametee --game ddnet --demo path/to/demo.demo --benchmark 30 frametimes.txt
+```
+
+Use:
+
+```bash
+./frametee --help
+```
+
+for the options supported by the current build.
+
+## Undo / Redo
+
+FrameTee uses a command-based undo system for timeline and state editing.
+Native editor operations and plugin-generated changes can participate in the same history, with simulation caches invalidated as required when changes are reverted or reapplied.
+
+## Game Modules
+
+New games are integrated through [`include/frametee/game_abi.h`](include/frametee/game_abi.h).
+The ABI covers simulation, input schemas, reflected state, rendering, level loading, cameras, exporters and other game-specific functionality. Modules are compiled as shared libraries and discovered at runtime.
+See [`docs/game-modules.md`](docs/game-modules.md) for more information.
+
+## Building
+
+Clone the repository with its submodules:
+
+```bash
+git clone --recursive https://github.com/Teero888/frametee.git
+cd frametee
+```
+
+Configure and build with CMake:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+```
+
+FrameTee requires CMake, a suitable C/C++ compiler, Vulkan development libraries and `glslangValidator`.
+
+On Linux, the bundled GLFW builds both native Wayland and X11 support. Install the Wayland and xkbcommon development packages (`libwayland-dev` and `libxkbcommon-dev` on Debian/Ubuntu). Native Wayland uses the compositor's keyboard repeat settings for mouse hold repeat; X11 reads them through XKB. GitHub Linux releases include GLFW statically with both backends.
+
+Windows and Linux are currently supported. (not msvc since it's garbage. use mingw)
+
+## Contributing
+
+Bug reports are welcome. Pull requests are currently disabled.
+
+For simulation issues, include the game, level, FrameTee revision and a minimal project or input sequence that reproduces the problem where possible.
+
+### Contact
+
+Discord: `teero777`
+Matrix: `@teero888:matrix.org`

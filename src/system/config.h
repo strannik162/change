@@ -1,0 +1,11 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <types.h>
+#include <user_interface/user_interface.h>
+
+void config_load(ui_handler_t *ui);
+void config_save(ui_handler_t *ui);
+void config_apply_game_editor_state(ui_handler_t *ui);
+
+#endif // CONFIG_H

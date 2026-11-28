@@ -1,0 +1,338 @@
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <include_cimgui.h>
+#include "plugin_api.h"
+
+#define MAX_FIELDS 64
+
+typedef struct {
+  const tas_api_t *api;
+  const tas_context_t *context;
+  bool show_window;
+  bool auto_create_track;
+  bool advance_seed;
+  int snippet_length;
+  int start_tick;
+  uint32_t seed;
+  char status_message[128];
+  // Which of the active game's input fields get random values; the others
+  // keep what the snippet holds. Kept by field id, so switching games and
+  // back remembers the choice for the fields both have.
+  uint32_t field_count;
+  char field_ids[MAX_FIELDS][64];
+  bool fill_field[MAX_FIELDS];
+} random_input_state_t;
+
+// Fields the editor lets you author, the only ones worth randomizing.
+static bool field_fillable(const ft_input_field *field) {
+  return field && !(field->flags & (FT_INPUT_FLAG_INTERNAL | FT_INPUT_FLAG_EDITOR_HIDDEN));
+}
+
+// Follows the active game's input schema: a field seen before keeps its
+// choice, a new one starts out filled unless it is a player state.
+static void sync_fields(random_input_state_t *state) {
+  uint32_t count = state->api->input_field_count();
+  if (count > MAX_FIELDS) count = MAX_FIELDS;
+  bool same = count == state->field_count;
+  for (uint32_t i = 0; same && i < count; ++i) {
+    const ft_input_field *field = state->api->input_field(i);
+    same = field && field->id && strcmp(field->id, state->field_ids[i]) == 0;
+  }
+  if (same) return;
+
+  char old_ids[MAX_FIELDS][64];
+  bool old_fill[MAX_FIELDS];
+  const uint32_t old_count = state->field_count;
+  memcpy(old_ids, state->field_ids, sizeof(old_ids));
+  memcpy(old_fill, state->fill_field, sizeof(old_fill));
+  for (uint32_t i = 0; i < count; ++i) {
+    const ft_input_field *field = state->api->input_field(i);
+    snprintf(state->field_ids[i], sizeof(state->field_ids[i]), "%s", field && field->id ? field->id : "");
+    // (what a player is in rather than presses, such as its team, only when asked for)
+    state->fill_field[i] = field && !(field->flags & FT_INPUT_FLAG_PLAYER_STATE);
+    for (uint32_t j = 0; j < old_count; ++j)
+      if (strcmp(old_ids[j], state->field_ids[i]) == 0) state->fill_field[i] = old_fill[j];
+  }
+  state->field_count = count;
+}
+
+static int selected_field_count(const random_input_state_t *state) {
+  int selected = 0;
+  for (uint32_t i = 0; i < state->field_count; ++i)
+    if (state->fill_field[i] && field_fillable(state->api->input_field(i))) ++selected;
+  return selected;
+}
+
+static uint32_t rng_next(uint32_t *state) {
+  uint32_t x = *state;
+  if (x == 0)
+    x = 0x6d2b79f5u;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  *state = x;
+  return x;
+}
+
+static void set_status(random_input_state_t *state, const char *message) {
+  snprintf(state->status_message, sizeof(state->status_message), "%s", message ? message : "");
+}
+
+static int random_int_inclusive(uint32_t *rng_state, int minimum, int maximum) {
+  if (maximum <= minimum) return minimum;
+  const uint64_t range = (uint64_t)((int64_t)maximum - (int64_t)minimum) + 1u;
+  return (int)((int64_t)minimum + (int64_t)((uint64_t)rng_next(rng_state) % range));
+}
+
+static float random_float(uint32_t *rng_state, float minimum, float maximum) {
+  if (maximum <= minimum) return minimum;
+  const float unit = (float)rng_next(rng_state) / (float)UINT32_MAX;
+  return minimum + (maximum - minimum) * unit;
+}
+
+static void randomize_record(random_input_state_t *state, uint32_t *rng_state, void *record) {
+  for (uint32_t index = 0; index < state->field_count; ++index) {
+    const ft_input_field *field = state->api->input_field(index);
+    if (!state->fill_field[index] || !field_fillable(field)) continue;
+
+    switch (field->kind) {
+    case FT_INPUT_BOOL:
+      state->api->input_set(record, (int)index, (long long)(rng_next(rng_state) >> 31));
+      break;
+    case FT_INPUT_INT:
+    case FT_INPUT_ENUM:
+      state->api->input_set(record, (int)index, random_int_inclusive(rng_state, field->min_value, field->max_value));
+      break;
+    case FT_INPUT_FLOAT:
+      state->api->input_set_float(record, (int)index, random_float(rng_state, field->min_float, field->max_float));
+      break;
+    case FT_INPUT_VEC2: {
+      const ft_vec2 value = {.x = random_float(rng_state, field->min_float, field->max_float),
+                             .y = random_float(rng_state, field->min_float, field->max_float)};
+      state->api->input_set_vec2(record, (int)index, value);
+      break;
+    }
+    }
+  }
+}
+
+static void fill_tracks_with_random_inputs(random_input_state_t *state) {
+  sync_fields(state);
+  if (selected_field_count(state) == 0) {
+    set_status(state, "No inputs selected to fill.");
+    return;
+  }
+  int track_count = state->api->get_track_count();
+  if (track_count <= 0) {
+    if (state->auto_create_track) {
+      int created_index = -1;
+      undo_command_t *create_cmd = state->api->do_create_track(NULL, &created_index);
+      if (create_cmd) {
+        state->api->register_undo_command(create_cmd);
+        track_count = state->api->get_track_count();
+        state->api->log(FT_LOG_INFO, "Random Input Filler", "Created a new track because none existed.");
+      }
+    }
+    if (track_count <= 0) {
+      set_status(state, "No tracks available to fill.");
+      return;
+    }
+  }
+
+  uint32_t rng_state = state->seed ? state->seed : 0x6d2b79f5u;
+  int created_snippets = 0;
+  int updated_snippets = 0;
+  int failed_tracks = 0;
+  int total_ticks_written = 0;
+
+  for (int track_index = 0; track_index < track_count; ++track_index) {
+    int snippet_id = -1;
+    int tick_offset = 0;
+    int fill_count = state->snippet_length;
+    undo_command_t *create_cmd =
+        state->api->do_create_snippet(track_index, state->start_tick, state->snippet_length, &snippet_id);
+
+    if (create_cmd) {
+      state->api->register_undo_command(create_cmd);
+      created_snippets++;
+      tick_offset = 0;
+      fill_count = state->snippet_length;
+    } else {
+      int available = 0;
+      if (!state->api->find_snippet_at(track_index, state->start_tick, &snippet_id, &tick_offset, &available)) {
+        state->api->log(FT_LOG_WARN, "Random Input Filler",
+                        "Could not create snippet due to overlap and no suitable snippet exists.");
+        failed_tracks++;
+        continue;
+      }
+      if (available <= 0) {
+        state->api->log(FT_LOG_WARN, "Random Input Filler", "Target snippet does not extend past the requested start tick.");
+        failed_tracks++;
+        continue;
+      }
+      if (fill_count > available) {
+        fill_count = available;
+        state->api->log(FT_LOG_WARN, "Random Input Filler",
+                        "Snippet shorter than requested length; filling available portion only.");
+      }
+      updated_snippets++;
+    }
+
+    if (fill_count <= 0 || snippet_id < 0) {
+      failed_tracks++;
+      continue;
+    }
+
+    const size_t record_size = state->api->input_record_size();
+    unsigned char *buffer = (unsigned char *)calloc((size_t)fill_count, record_size);
+    if (!buffer) {
+      state->api->log(FT_LOG_ERROR, "Random Input Filler", "Failed to allocate input buffer.");
+      failed_tracks++;
+      continue;
+    }
+
+    // Start from what the snippet holds, so the fields not selected stay as
+    // they are (a new snippet holds defaults).
+    if (!state->api->get_inputs(snippet_id, tick_offset, fill_count, buffer, record_size))
+      for (int tick = 0; tick < fill_count; ++tick)
+        state->api->input_default(buffer + (size_t)tick * record_size);
+    for (int tick = 0; tick < fill_count; ++tick)
+      randomize_record(state, &rng_state, buffer + (size_t)tick * record_size);
+
+    undo_command_t *set_cmd = state->api->do_set_inputs(snippet_id, tick_offset, fill_count, buffer, record_size);
+    if (set_cmd) {
+      state->api->register_undo_command(set_cmd);
+      total_ticks_written += fill_count;
+    } else {
+      state->api->log(FT_LOG_WARN, "Random Input Filler", "Failed to apply random inputs to a snippet.");
+      failed_tracks++;
+    }
+
+    free(buffer);
+  }
+
+  if (state->advance_seed)
+    state->seed = rng_state;
+
+  char summary[128];
+  snprintf(summary, sizeof(summary),
+           "Tracks: %d | New snippets: %d | Updated snippets: %d | Failures: %d | Ticks written: %d",
+           track_count, created_snippets, updated_snippets, failed_tracks, total_ticks_written);
+  set_status(state, summary);
+}
+
+FT_PLUGIN_ABI_EXPORT()
+
+// Now schema-driven, so it works under any game and stays global. Export
+// plugin_game_id() here to bind it to one instead.
+
+FT_API void *plugin_init(tas_context_t *context, const tas_api_t *api) {
+  random_input_state_t *state = (random_input_state_t *)calloc(1, sizeof(random_input_state_t));
+  if (!state)
+    return NULL;
+
+  state->api = api;
+  state->context = context;
+  state->show_window = true;
+  state->auto_create_track = true;
+  state->advance_seed = true;
+  state->snippet_length = 100;
+  state->start_tick = 0;
+  state->seed = (uint32_t)time(NULL);
+  set_status(state, "Ready.");
+  return state;
+}
+
+FT_API void plugin_update(void *plugin_data) {
+  random_input_state_t *state = (random_input_state_t *)plugin_data;
+  if (!state)
+    return;
+
+  igSetCurrentContext(state->context->imgui_context);
+
+  if (igBeginMainMenuBar()) {
+    if (igBeginMenu("Random Input Filler", true)) {
+      igMenuItem_BoolPtr("Show Window", NULL, &state->show_window, true);
+      igEndMenu();
+    }
+    igEndMainMenuBar();
+  }
+
+  // Down with the editor's interface (Tab), up with it: see tas_context_t.
+  if (!state->show_window || !state->context->ui_visible)
+    return;
+
+  if (igBegin("Random Input Filler", &state->show_window, ImGuiWindowFlags_None)) {
+    igText("Tracks detected: %d", state->api->get_track_count());
+    igSeparator();
+
+    igInputInt("Snippet Length", &state->snippet_length, 1, 10, ImGuiInputTextFlags_None);
+    if (state->snippet_length < 1)
+      state->snippet_length = 1;
+
+    igInputInt("Start Tick", &state->start_tick, 1, 10, ImGuiInputTextFlags_None);
+    if (state->start_tick < 0)
+      state->start_tick = 0;
+
+    int seed_input = (int)state->seed;
+    if (igInputInt("Seed", &seed_input, 1, 100, ImGuiInputTextFlags_None) && seed_input >= 0)
+      state->seed = (uint32_t)seed_input;
+
+    igCheckbox("Advance seed after fill", &state->advance_seed);
+    igCheckbox("Auto-create track when none exist", &state->auto_create_track);
+
+    if (igButton("Randomize Seed", (ImVec2){0, 0}))
+      state->seed = (uint32_t)time(NULL);
+
+    igSeparator();
+
+    // The fields that get random values; the rest keep what is there.
+    sync_fields(state);
+    igText("Inputs to fill");
+    igSameLine(0, -1);
+    if (igSmallButton("All"))
+      for (uint32_t i = 0; i < state->field_count; ++i) state->fill_field[i] = true;
+    igSameLine(0, -1);
+    if (igSmallButton("None"))
+      for (uint32_t i = 0; i < state->field_count; ++i) state->fill_field[i] = false;
+    // In columns, so a long list does not leave most of the window empty.
+    if (igBeginTable("##fields", 3, ImGuiTableFlags_None, (ImVec2){0, 0}, 0.f)) {
+      for (uint32_t i = 0; i < state->field_count; ++i) {
+        const ft_input_field *field = state->api->input_field(i);
+        if (!field_fillable(field)) continue;
+        igTableNextColumn();
+        igPushID_Int((int)i);
+        igCheckbox(field->display_name && field->display_name[0] ? field->display_name : state->field_ids[i], &state->fill_field[i]);
+        igPopID();
+      }
+      igEndTable();
+    }
+
+    igSeparator();
+
+    const bool any_selected = selected_field_count(state) > 0;
+    igBeginDisabled(!any_selected);
+    if (igButton("Fill Tracks", (ImVec2){0, 0})) {
+      fill_tracks_with_random_inputs(state);
+    }
+    igEndDisabled();
+
+    igSpacing();
+    igTextWrapped("%s", state->status_message);
+  }
+  igEnd();
+}
+
+FT_API void plugin_shutdown(void *plugin_data) {
+  random_input_state_t *state = (random_input_state_t *)plugin_data;
+  if (!state)
+    return;
+
+  state->api->log(FT_LOG_INFO, "Random Input Filler", "Plugin shutting down.");
+  free(state);
+}

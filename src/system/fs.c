@@ -1,0 +1,330 @@
+#include "fs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <direct.h>
+#include <wchar.h>
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <dirent.h>
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#else
+#include <unistd.h>
+#endif
+#endif
+
+FILE *fs_open(const char *path, const char *mode) {
+#ifdef _WIN32
+  wchar_t wpath[1024];
+  wchar_t wmode[16];
+
+  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) <= 0) {
+    return NULL;
+  }
+
+  if (MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, 16) <= 0) {
+    return NULL;
+  }
+
+  return _wfopen(wpath, wmode);
+#else
+  return fopen(path, mode);
+#endif
+}
+
+bool fs_get_config_dir(char *out_path, size_t size) {
+  if (!out_path || size == 0) return false;
+  out_path[0] = '\0';
+#ifdef _WIN32
+  const char *config_home = getenv("APPDATA");
+  if (!config_home) config_home = getenv("USERPROFILE");
+  if (config_home) {
+    const int needed = snprintf(out_path, size, "%s\\frametee", config_home);
+    return needed >= 0 && (size_t)needed < size;
+  }
+#else
+  const char *config_home = getenv("XDG_CONFIG_HOME");
+  if (config_home) {
+    const int needed = snprintf(out_path, size, "%s/frametee", config_home);
+    return needed >= 0 && (size_t)needed < size;
+  } else {
+    config_home = getenv("HOME");
+    if (config_home) {
+      const int needed = snprintf(out_path, size, "%s/.config/frametee", config_home);
+      return needed >= 0 && (size_t)needed < size;
+    }
+  }
+#endif
+  return false;
+}
+
+bool fs_get_config_subdir(const char *name, char *out_path, size_t size) {
+  char config_dir[1024];
+  if (!out_path || size == 0) return false;
+  out_path[0] = '\0';
+  if (!fs_get_config_dir(config_dir, sizeof(config_dir))) return false;
+  fs_mkdir(config_dir);
+  const int needed = snprintf(out_path, size, "%s%c%s", config_dir, PATH_SEP, name);
+  if (needed < 0 || (size_t)needed >= size) {
+    out_path[0] = '\0';
+    return false;
+  }
+  fs_mkdir(out_path);
+  return true;
+}
+
+bool fs_open_in_file_manager(const char *path) {
+  if (!path || !*path) return false;
+#ifdef _WIN32
+  return (INT_PTR)ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL) > 32;
+#else
+#ifdef __APPLE__
+  const char *opener = "open";
+#else
+  const char *opener = "xdg-open";
+#endif
+  // Forked twice: the opener ends up a child of init, so nothing here has to wait for it.
+  const pid_t child = fork();
+  if (child < 0) return false;
+  if (child == 0) {
+    setsid();
+    if (fork() == 0) {
+      execlp(opener, opener, path, (char *)NULL);
+      _exit(127);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+bool fs_get_executable_dir(char *out_path, size_t size) {
+  if (!out_path || size == 0) return false;
+  out_path[0] = '\0';
+
+#ifdef _WIN32
+  wchar_t wide_path[4096];
+  const DWORD length = GetModuleFileNameW(NULL, wide_path, (DWORD)(sizeof(wide_path) / sizeof(wide_path[0])));
+  if (length == 0 || length >= sizeof(wide_path) / sizeof(wide_path[0])) return false;
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, NULL, 0, NULL, NULL);
+  if (needed <= 0 || (size_t)needed > size) return false;
+  if (WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, out_path, (int)size, NULL, NULL) <= 0) return false;
+#elif defined(__APPLE__)
+  uint32_t path_size = (uint32_t)size;
+  if (_NSGetExecutablePath(out_path, &path_size) != 0) {
+    out_path[0] = '\0';
+    return false;
+  }
+#else
+  const ssize_t length = readlink("/proc/self/exe", out_path, size - 1);
+  if (length <= 0 || (size_t)length >= size - 1) return false;
+  out_path[length] = '\0';
+#endif
+
+  char *separator = strrchr(out_path, '/');
+#ifdef _WIN32
+  char *backslash = strrchr(out_path, '\\');
+  if (!separator || (backslash && backslash > separator)) separator = backslash;
+#endif
+  if (!separator) {
+    out_path[0] = '\0';
+    return false;
+  }
+#ifdef _WIN32
+  if (separator == out_path + 2 && out_path[1] == ':') separator[1] = '\0';
+  else
+#endif
+      if (separator == out_path)
+    separator[1] = '\0';
+  else *separator = '\0';
+  return true;
+}
+
+// Directory scanning structure definition
+struct fs_dir_t {
+#ifdef _WIN32
+  HANDLE handle;
+  WIN32_FIND_DATA find_data;
+  bool first;
+#else
+  DIR *dir;
+#endif
+  char path[1024];
+  fs_dirent_t entry;
+};
+
+fs_dir_t *fs_opendir(const char *path) {
+  fs_dir_t *dir = malloc(sizeof(fs_dir_t));
+  if (!dir) return NULL;
+#ifdef _WIN32
+  snprintf(dir->path, sizeof(dir->path), "%s\\*", path);
+  dir->handle = INVALID_HANDLE_VALUE;
+  dir->first = true;
+#else
+  snprintf(dir->path, sizeof(dir->path), "%s", path);
+  dir->dir = opendir(path);
+  if (!dir->dir) {
+    free(dir);
+    return NULL;
+  }
+#endif
+  return dir;
+}
+
+fs_dirent_t *fs_readdir(fs_dir_t *dir) {
+  if (!dir) return NULL;
+#ifdef _WIN32
+  if (dir->first) {
+    dir->handle = FindFirstFile(dir->path, &dir->find_data);
+    if (dir->handle == INVALID_HANDLE_VALUE) {
+      return NULL;
+    }
+    dir->first = false;
+  } else {
+    if (FindNextFile(dir->handle, &dir->find_data) == 0) {
+      return NULL;
+    }
+  }
+  snprintf(dir->entry.name, sizeof(dir->entry.name), "%s", dir->find_data.cFileName);
+  dir->entry.is_directory = (dir->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  return &dir->entry;
+#else
+  struct dirent *ent = readdir(dir->dir);
+  if (!ent) return NULL;
+  snprintf(dir->entry.name, sizeof(dir->entry.name), "%s", ent->d_name);
+  dir->entry.is_directory = (ent->d_type == DT_DIR);
+  if (ent->d_type == DT_UNKNOWN) {
+    // Not every filesystem fills in d_type, and a caller that walks
+    // directories cannot afford to read one as a file. Ask directly.
+    char full_path[2048];
+    struct stat info;
+    snprintf(full_path, sizeof(full_path), "%s/%s", dir->path, ent->d_name);
+    if (stat(full_path, &info) == 0) dir->entry.is_directory = S_ISDIR(info.st_mode);
+  }
+  return &dir->entry;
+#endif
+}
+
+void fs_closedir(fs_dir_t *dir) {
+  if (!dir) return;
+#ifdef _WIN32
+  if (dir->handle != INVALID_HANDLE_VALUE) {
+    FindClose(dir->handle);
+  }
+#else
+  closedir(dir->dir);
+#endif
+  free(dir);
+}
+
+int fs_mkdir(const char *path) {
+#ifdef _WIN32
+  return _mkdir(path);
+#else
+  return mkdir(path, 0755);
+#endif
+}
+
+void fs_remove(const char *path) {
+#ifdef _WIN32
+  wchar_t wpath[1024];
+  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) > 0) {
+    _wremove(wpath);
+  }
+#else
+  remove(path);
+#endif
+}
+
+bool fs_replace(const char *source, const char *destination) {
+#ifdef _WIN32
+  wchar_t wsource[1024];
+  wchar_t wdestination[1024];
+  if (MultiByteToWideChar(CP_UTF8, 0, source, -1, wsource, 1024) <= 0 ||
+      MultiByteToWideChar(CP_UTF8, 0, destination, -1, wdestination, 1024) <= 0) {
+    return false;
+  }
+  return MoveFileExW(wsource, wdestination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+  return rename(source, destination) == 0;
+#endif
+}
+
+void *fs_load_library(const char *path) {
+#ifdef _WIN32
+  // Wide, because paths carry the user's name and installs land wherever the
+  // user put them; and absolute with the altered search path, because a
+  // plugin lives in a directory of its own and may ship the libraries it
+  // depends on beside itself. Windows otherwise searches the directory of the
+  // executable and never the one the module came out of, and the flag is only
+  // defined for an absolute path.
+  wchar_t wide_path[1024];
+  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide_path, 1024) <= 0) return NULL;
+
+  // The altered search path skips the executable's directory, where the
+  // release keeps the libraries everyone shares (FFmpeg, curl, the C++
+  // runtime), and the games' own libraries live beside the game modules
+  // (games/), where a plugin may link one of them (the physics profiler links
+  // SM64's, sharing the copy the game loaded). PATH is searched, so both go
+  // in front of it. (SetDllDirectory would take the place of the current
+  // directory, which is how the executable's was found before.)
+  static bool path_set;
+  if (!path_set) {
+    path_set = true;
+    char exe_dir[1024];
+    wchar_t wide_exe[1024];
+    static wchar_t old_path[32768], new_path[32768 + 2200];
+    if (fs_get_executable_dir(exe_dir, sizeof(exe_dir)) &&
+        MultiByteToWideChar(CP_UTF8, 0, exe_dir, -1, wide_exe, 1024) > 0) {
+      const DWORD old_length = GetEnvironmentVariableW(L"PATH", old_path, 32768);
+      if (old_length < 32768 && swprintf(new_path, sizeof(new_path) / sizeof(*new_path), L"%ls;%ls\\games;%ls",
+                                         wide_exe, wide_exe, old_length ? old_path : L"") > 0)
+        SetEnvironmentVariableW(L"PATH", new_path);
+    }
+  }
+
+  wchar_t full_path[1024];
+  const DWORD length = GetFullPathNameW(wide_path, 1024, full_path, NULL);
+  if (length == 0 || length >= 1024) return LoadLibraryW(wide_path);
+  return LoadLibraryExW(full_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+#else
+  return dlopen(path, RTLD_LAZY);
+#endif
+}
+
+void *fs_get_symbol(void *handle, const char *name) {
+#ifdef _WIN32
+  // ISO C keeps data and function pointers distinct, while Win32's loader
+  // represents both with pointer-sized addresses. A union contains that
+  // platform conversion without an invalid direct cast.
+  union {
+    FARPROC function;
+    void *object;
+  } symbol = {0};
+  symbol.function = GetProcAddress((HMODULE)handle, name);
+  return symbol.object;
+#else
+  return dlsym(handle, name);
+#endif
+}
+
+void fs_free_library(void *handle) {
+  if (!handle) return;
+#ifdef _WIN32
+  FreeLibrary((HMODULE)handle);
+#else
+  dlclose(handle);
+#endif
+}

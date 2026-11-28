@@ -1,0 +1,1109 @@
+// The engine's half of the game module ABI: everything a game is allowed to ask
+// the editor to do. Each function here translates one ABI call into engine
+// internals, and nothing above this file leaks into a module.
+//
+// The ABI deliberately passes no context pointer, because a module should never
+// be able to reach an engine struct. There is exactly one engine per process, so
+// this file keeps the handler in a static and resolves it on every call.
+
+#include "engine_api.h"
+
+#include <audio/audio.h>
+
+#include <frametee/game_abi.h>
+#include <logger/logger.h>
+#include <math.h>
+#include <renderer/graphics_backend.h>
+#include <renderer/renderer.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <system/config.h>
+#include <system/file_dialog.h>
+#include <system/fs.h>
+#include <user_interface/starting_state.h>
+#include <stdint.h>
+#include <user_interface/undo_redo.h>
+#include <user_interface/timeline/timeline_commands.h>
+#include <user_interface/input_effects.h>
+#include <user_interface/timeline/timeline_model.h>
+#include <user_interface/timeline/timeline_recordings.h>
+#include <user_interface/timeline_events.h>
+#include <user_interface/user_interface.h>
+
+extern bool g_is_headless;
+
+static gfx_handler_t *g_engine = NULL;
+static bool g_presentation_effects = true;
+static const char *LOG_SOURCE = "GameAPI";
+
+// Handles handed across the ABI are the engine's own resource types. They stay
+// opaque to the module, so the casts are contained entirely in this file.
+#define AS_TEXTURE(p) ((texture_t *)(p))
+#define AS_ATLAS(p) ((atlas_renderer_t *)(p))
+#define AS_PIPELINE(p) ((custom_pipeline_t *)(p))
+#define AS_MESH(p) ((mesh_t *)(p))
+
+static bool have_graphics(void) { return g_engine && !g_is_headless; }
+
+// --- diagnostics -------------------------------------------------------------
+
+static void api_log(ft_log_level level, const char *category, const char *message) {
+  const char *cat = category ? category : "Game";
+  switch (level) {
+  case FT_LOG_ERROR:
+    log_error(cat, "%s", message);
+    break;
+  case FT_LOG_WARN:
+    log_warn(cat, "%s", message);
+    break;
+  case FT_LOG_TRACE:
+  case FT_LOG_INFO:
+  default:
+    log_info(cat, "%s", message);
+    break;
+  }
+}
+
+// --- filesystem --------------------------------------------------------------
+
+static size_t api_format_path(char *out, size_t out_size, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  const int needed = vsnprintf(out, out ? out_size : 0, format, args);
+  va_end(args);
+  return needed > 0 ? (size_t)needed : 0;
+}
+
+static size_t api_resolve_data_path(const char *relative, char *out, size_t out_size) {
+  // Every game keeps its assets under data/games/<id>/, so a module can ship
+  // textures and shaders without knowing where the editor was installed. The
+  // data directory belongs to the executable, not to whichever working
+  // directory happened to launch it. The id is the caller's, not the active
+  // game's: a game the start screen is only showing still reads its own files.
+  const char *id = game_host_calling_id(&g_engine->game_host);
+  char executable_dir[GAME_HOST_MAX_PATH];
+  if (!fs_get_executable_dir(executable_dir, sizeof(executable_dir))) snprintf(executable_dir, sizeof(executable_dir), ".");
+  return api_format_path(out, out_size, "%s%cdata%cgames%c%s%c%s", executable_dir, PATH_SEP, PATH_SEP, PATH_SEP, id,
+                         PATH_SEP, relative ? relative : "");
+}
+
+static bool api_read_file(const char *path, void **out_data, size_t *out_size) {
+  if (!path || !out_data || !out_size) return false;
+  *out_data = NULL;
+  *out_size = 0;
+
+  FILE *f = fs_open(path, "rb");
+  if (!f) return false;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return false;
+  }
+  const long size = ftell(f);
+  if (size < 0) {
+    fclose(f);
+    return false;
+  }
+  rewind(f);
+
+  void *data = malloc((size_t)size + 1);
+  if (!data) {
+    fclose(f);
+    return false;
+  }
+  const size_t read = fread(data, 1, (size_t)size, f);
+  fclose(f);
+  ((char *)data)[read] = '\0';
+
+  *out_data = data;
+  *out_size = read;
+  return true;
+}
+
+static void api_free_file_data(void *data) { free(data); }
+
+// Downloads and generated files belong beside the user's config, not in the
+// install directory, which may not even be writable.
+static size_t api_resolve_cache_path(const char *relative, char *out, size_t out_size) {
+  const char *id = game_host_calling_id(&g_engine->game_host);
+  char base[GAME_HOST_MAX_PATH];
+  if (!fs_get_config_dir(base, sizeof(base))) snprintf(base, sizeof(base), ".");
+
+  char directory[GAME_HOST_MAX_PATH];
+  const size_t directory_size = api_format_path(directory, sizeof(directory), "%s%cgames%c%s", base, PATH_SEP, PATH_SEP, id);
+
+  // Create the chain lazily; a game should not have to think about it.
+  char partial[GAME_HOST_MAX_PATH];
+  const size_t partial_size = api_format_path(partial, sizeof(partial), "%s%cgames", base, PATH_SEP);
+  if (partial_size < sizeof(partial)) fs_mkdir(partial);
+  if (directory_size < sizeof(directory)) fs_mkdir(directory);
+
+  return api_format_path(out, out_size, "%s%cgames%c%s%c%s", base, PATH_SEP, PATH_SEP, id, PATH_SEP,
+                         relative ? relative : "");
+}
+
+// --- resources ---------------------------------------------------------------
+
+static VkFormat abi_texture_format(ft_texture_format format) {
+  switch (format) {
+  case FT_TEXTURE_RG8:
+    return VK_FORMAT_R8G8_UNORM;
+  case FT_TEXTURE_RGBA8:
+  default:
+    return VK_FORMAT_R8G8B8A8_UNORM;
+  }
+}
+
+static ft_texture *api_texture_create(const ft_texture_desc *desc) {
+  if (!have_graphics() || !desc) return NULL;
+  const uint32_t layers = desc->layers ? desc->layers : 1;
+  texture_t *tex = renderer_create_texture_layered(g_engine, (const unsigned char *)desc->pixels, desc->width, desc->height, layers,
+                                                   abi_texture_format(desc->format), desc->mipmaps, desc->linear_filter);
+  if (tex && desc->repeat) {
+    // A 3D game repeats a texture across world surfaces, seen at grazing angles; a 2D game's face
+    // the screen, where anisotropy only multiplies the samples (DDNet's own client has it off).
+    vkDestroySampler(g_engine->g_device, tex->sampler, g_engine->g_allocator);
+    tex->sampler = create_texture_sampler_wrapped(g_engine, desc->mipmaps ? tex->mip_levels : 1,
+                                                  desc->linear_filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                                                  VK_SAMPLER_ADDRESS_MODE_REPEAT, game_is_3d(&g_engine->game_host));
+  }
+  return (ft_texture *)tex;
+}
+
+static bool api_texture_update_layer(ft_texture *texture, uint32_t layer, const void *pixels, uint32_t width, uint32_t height) {
+  if (!have_graphics() || !texture || !pixels) return false;
+  return renderer_update_texture_layer(g_engine, AS_TEXTURE(texture), layer, pixels, width, height);
+}
+
+static void api_texture_destroy(ft_texture *texture) {
+  if (!have_graphics() || !texture) return;
+  renderer_destroy_texture(g_engine, AS_TEXTURE(texture));
+}
+
+static ft_texture *api_render_instances_preview(const ft_instance_preview_desc *desc) {
+  if (!have_graphics() || !desc || desc->struct_size < sizeof(*desc) || !desc->pipeline || !desc->instances ||
+      desc->instance_count == 0 || desc->update_count > MAX_TEXTURES_PER_DRAW || (desc->update_count > 0 && !desc->updates))
+    return NULL;
+  renderer_texture_layer_update_t updates[MAX_TEXTURES_PER_DRAW];
+  for (uint32_t i = 0; i < desc->update_count; ++i) {
+    updates[i] = (renderer_texture_layer_update_t){.texture = AS_TEXTURE(desc->updates[i].texture),
+                                                   .layer = desc->updates[i].layer,
+                                                   .pixels = desc->updates[i].pixels,
+                                                   .width = desc->updates[i].width,
+                                                   .height = desc->updates[i].height};
+  }
+  vec4 clear = {desc->clear_color.r, desc->clear_color.g, desc->clear_color.b, desc->clear_color.a};
+  return (ft_texture *)renderer_render_instances_preview(g_engine, AS_PIPELINE(desc->pipeline), (texture_t *const *)desc->textures,
+                                                         desc->texture_count, desc->instances, desc->instance_count, desc->width,
+                                                         desc->height, clear, updates, desc->update_count, AS_TEXTURE(desc->destination),
+                                                         desc->destination_x, desc->destination_y);
+}
+
+static const ft_gpu_device *api_gpu_device(void) {
+  if (!have_graphics()) return NULL;
+
+  // Filled once and handed out by pointer: the handles live as long as the
+  // engine's device does, which outlives every module that asks for them.
+  static ft_gpu_device device;
+  device = (ft_gpu_device){.struct_size = sizeof(device),
+                           .api = FT_GPU_API_VULKAN,
+                           .instance = (void *)g_engine->g_instance,
+                           .physical_device = (void *)g_engine->g_physical_device,
+                           .device = (void *)g_engine->g_device,
+                           .queue = (void *)g_engine->g_queue,
+                           .queue_family_index = g_engine->g_queue_family,
+                           .api_version = VK_API_VERSION_1_0};
+  return &device;
+}
+
+static bool api_texture_gpu_image(ft_texture *texture, ft_gpu_image *out) {
+  if (!have_graphics() || !texture || !out || out->struct_size < sizeof(*out)) return false;
+
+  texture_t *tex = AS_TEXTURE(texture);
+  if (!tex->active || tex->image == VK_NULL_HANDLE) return false;
+  // Asking for the image is what transfers ownership of the contents, so the
+  // engine only starts working around this texture once a module commits to
+  // drawing into it.
+  if (!renderer_mark_texture_external(g_engine, tex)) return false;
+
+  out->image = (void *)tex->image;
+  out->format = (uint64_t)tex->format;
+  out->width = tex->width;
+  out->height = tex->height;
+  out->layers = tex->layer_count;
+  out->layout = (uint32_t)VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  return true;
+}
+
+static ft_atlas *api_atlas_create(const ft_atlas_desc *desc) {
+  if (!have_graphics() || !desc || !desc->texture) return NULL;
+  // ft_sprite_rect and sprite_definition_t are the same four uint32s, but the
+  // copy keeps the ABI free to diverge from the renderer's own type later.
+  sprite_definition_t *sprites = malloc(sizeof(sprite_definition_t) * (desc->sprite_count ? desc->sprite_count : 1));
+  if (!sprites) return NULL;
+  for (uint32_t i = 0; i < desc->sprite_count; ++i) {
+    sprites[i] = (sprite_definition_t){desc->sprites[i].x, desc->sprites[i].y, desc->sprites[i].w, desc->sprites[i].h};
+  }
+  atlas_renderer_t *atlas =
+      renderer_create_atlas(g_engine, AS_TEXTURE(desc->texture), sprites, desc->sprite_count, desc->max_instances_per_frame);
+  free(sprites);
+  return (ft_atlas *)atlas;
+}
+
+static void api_atlas_destroy(ft_atlas *atlas) {
+  if (!have_graphics() || !atlas) return;
+  renderer_destroy_atlas(g_engine, AS_ATLAS(atlas));
+}
+
+static ft_pipeline *api_pipeline_create(const ft_pipeline_desc *desc) {
+  if (!have_graphics() || !desc) return NULL;
+  if (desc->instance_attr_count > MAX_CUSTOM_VERTEX_ATTRS) return NULL;
+
+  uint32_t locations[MAX_CUSTOM_VERTEX_ATTRS];
+  uint32_t offsets[MAX_CUSTOM_VERTEX_ATTRS];
+  int formats[MAX_CUSTOM_VERTEX_ATTRS];
+  for (uint32_t i = 0; i < desc->instance_attr_count; ++i) {
+    locations[i] = desc->instance_attrs[i].location;
+    offsets[i] = desc->instance_attrs[i].offset;
+    formats[i] = (int)desc->instance_attrs[i].format;
+  }
+
+  custom_pipeline_t *pipe = renderer_create_custom_pipeline(
+      g_engine, desc->vertex_spirv, desc->vertex_spirv_size, desc->fragment_spirv, desc->fragment_spirv_size, locations, offsets, formats,
+      desc->instance_attr_count, desc->instance_stride, desc->max_instances_per_frame, desc->texture_count, desc->alpha_blend,
+      desc->straight_alpha, desc->vertex_stride, desc->depth_test);
+  return (ft_pipeline *)pipe;
+}
+
+static void api_pipeline_destroy(ft_pipeline *pipeline) {
+  if (!have_graphics() || !pipeline) return;
+  renderer_destroy_custom_pipeline(g_engine, AS_PIPELINE(pipeline));
+}
+
+static ft_mesh *api_mesh_create(const void *vertices, uint32_t vertex_count, uint32_t vertex_stride, const uint32_t *indices,
+                                uint32_t index_count) {
+  // ft_vertex and the renderer's vertex_t are the same layout; the check keeps
+  // a module that got its struct wrong from silently drawing garbage.
+  if (!have_graphics() || !vertices) return NULL;
+  if (sizeof(ft_vertex) != sizeof(vertex_t) || vertex_stride == 0 || vertex_stride % 4 != 0) return NULL;
+  return (ft_mesh *)renderer_create_mesh_raw(g_engine, vertices, vertex_count, vertex_stride, indices, index_count);
+}
+
+static void api_mesh_destroy(ft_mesh *mesh) {
+  if (have_graphics() && mesh) renderer_destroy_mesh(g_engine, AS_MESH(mesh));
+}
+
+// --- drawing -----------------------------------------------------------------
+
+static void copy_color(const ft_color *in, vec4 out) {
+  out[0] = in->r;
+  out[1] = in->g;
+  out[2] = in->b;
+  out[3] = in->a;
+}
+
+static void api_draw_sprites(ft_atlas *atlas, float z, const ft_sprite_draw *draws, uint32_t count) {
+  if (!have_graphics() || !atlas || !draws || count == 0) return;
+  atlas_renderer_t *ar = AS_ATLAS(atlas);
+
+  // The renderer batches by atlas, so the whole array goes in as one command.
+  atlas_instance_t stack_instances[128];
+  atlas_instance_t *instances = count <= 128 ? stack_instances : malloc(sizeof(atlas_instance_t) * count);
+  if (!instances) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    const ft_sprite_draw *d = &draws[i];
+    atlas_instance_t *inst = &instances[i];
+    renderer_calculate_atlas_uvs(ar, d->sprite_index, inst);
+    inst->pos[0] = d->pos.x;
+    inst->pos[1] = d->pos.y;
+    inst->size[0] = d->size.x;
+    inst->size[1] = d->size.y;
+    inst->rotation = d->rotation;
+    inst->sprite_index = (int)d->sprite_index;
+    inst->tiling[0] = d->tiling.x != 0.f ? d->tiling.x : 1.f;
+    inst->tiling[1] = d->tiling.y != 0.f ? d->tiling.y : 1.f;
+    copy_color(&d->color, inst->color);
+  }
+  renderer_submit_atlas_batch(g_engine, ar, z, instances, count, false);
+  if (instances != stack_instances) free(instances);
+}
+
+static void api_draw_texture(float z, ft_texture *texture, ft_rect dst, ft_color tint) {
+  if (!have_graphics() || !texture) return;
+  texture_t *tex = AS_TEXTURE(texture);
+  if (!tex->active) return;
+
+  // Built once per texture and kept: the sampling setup does not change even
+  // though the pixels do.
+  if (!tex->alias_atlas) {
+    tex->alias_atlas = renderer_create_texture_atlas(g_engine, tex);
+    if (!tex->alias_atlas) return;
+  }
+
+  atlas_instance_t inst = {0};
+  renderer_calculate_atlas_uvs(tex->alias_atlas, 0, &inst);
+  inst.pos[0] = dst.x + dst.w * 0.5f;
+  inst.pos[1] = dst.y + dst.h * 0.5f;
+  inst.size[0] = dst.w;
+  inst.size[1] = dst.h;
+  inst.rotation = 0.f;
+  inst.sprite_index = 0;
+  inst.tiling[0] = 1.f;
+  inst.tiling[1] = 1.f;
+  copy_color(&tint, inst.color);
+  renderer_submit_atlas_batch(g_engine, tex->alias_atlas, z, &inst, 1, false);
+}
+
+static void api_draw_line3(ft_vec3 a, ft_vec3 b, ft_color color, float thickness) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_line3(g_engine, (vec3){a.x, a.y, a.z}, (vec3){b.x, b.y, b.z}, col, thickness);
+}
+
+static void api_draw_triangle3(ft_vec3 a, ft_vec3 b, ft_vec3 c, ft_color color) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_triangle3(g_engine, (vec3){a.x, a.y, a.z}, (vec3){b.x, b.y, b.z}, (vec3){c.x, c.y, c.z}, col);
+}
+
+static void api_set_texture3(ft_texture *texture) {
+  if (!have_graphics()) return;
+  renderer_set_texture3(g_engine, texture ? AS_TEXTURE(texture) : NULL);
+}
+
+static void api_draw_triangle3_textured(ft_vec3 a, ft_vec3 b, ft_vec3 c, ft_vec2 uv_a, ft_vec2 uv_b, ft_vec2 uv_c,
+                                        uint32_t layer, ft_color tint) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&tint, col);
+  renderer_submit_triangle3_textured(g_engine, (vec3){a.x, a.y, a.z}, (vec3){b.x, b.y, b.z}, (vec3){c.x, c.y, c.z},
+                                     (vec2){uv_a.x, uv_a.y}, (vec2){uv_b.x, uv_b.y}, (vec2){uv_c.x, uv_c.y}, layer,
+                                     col);
+}
+
+static void api_draw_box3(ft_vec3 center, ft_vec3 size, ft_color color, bool wire) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_box3(g_engine, (vec3){center.x, center.y, center.z}, (vec3){size.x, size.y, size.z}, col, wire);
+}
+
+static void api_draw_line(float z, ft_vec2 a, ft_vec2 b, ft_color color, float thickness) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_line(g_engine, z, (vec2){a.x, a.y}, (vec2){b.x, b.y}, col, thickness);
+}
+
+static void api_draw_rect(float z, ft_vec2 pos, ft_vec2 size, ft_color color) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_rect_filled(g_engine, z, (vec2){pos.x, pos.y}, (vec2){size.x, size.y}, col);
+}
+
+static void api_draw_rect_rounded(float z, ft_vec2 pos, ft_vec2 size, float radius, ft_color color, uint32_t segments) {
+  if (!have_graphics()) return;
+  vec4 c;
+  copy_color(&color, c);
+  renderer_submit_rect_rounded(g_engine, z, (vec2){pos.x, pos.y}, (vec2){size.x, size.y}, radius, c, segments);
+}
+
+static void api_draw_circle(float z, ft_vec2 center, float radius, ft_color color, uint32_t segments) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_circle_filled(g_engine, z, (vec2){center.x, center.y}, radius, col, segments ? segments : 16);
+}
+
+static void api_draw_triangle(float z, ft_vec2 a, ft_vec2 b, ft_vec2 c, ft_color color) {
+  if (!have_graphics()) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_triangle_filled(g_engine, z, (vec2){a.x, a.y}, (vec2){b.x, b.y}, (vec2){c.x, c.y}, col);
+}
+
+// ft_vec2 is two floats, laid out as cglm's vec2; the renderer copies them.
+static void api_draw_polyline_smooth(float z, const ft_vec2 *points, uint32_t count, ft_color color, float thickness, bool closed) {
+  if (!have_graphics() || !points) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_polyline(g_engine, z, (const vec2 *)points, count, col, thickness, closed);
+}
+
+static void api_draw_polygon_smooth(float z, const ft_vec2 *points, uint32_t count, ft_color color) {
+  if (!have_graphics() || !points) return;
+  vec4 col;
+  copy_color(&color, col);
+  renderer_submit_polygon(g_engine, z, (const vec2 *)points, count, col);
+}
+
+static void api_draw_text(float z, ft_vec2 pos, float size, ft_color color, const char *text) {
+  // World-space text goes through ImGui's viewport draw list: the renderer has
+  // no glyph pipeline of its own yet, and this keeps module labels legible at
+  // any zoom without one.
+  if (!have_graphics() || !text || !*text) return;
+  (void)z;
+  float sx, sy;
+  world_to_screen(g_engine, pos.x, pos.y, &sx, &sy);
+  sx += g_engine->user_interface.viewport_window_pos.x;
+  sy += g_engine->user_interface.viewport_window_pos.y;
+
+  ImDrawList *list = igGetForegroundDrawList_ViewportPtr(igGetMainViewport());
+  if (!list) return;
+  const ImU32 packed = igGetColorU32_Vec4((ImVec4){color.r, color.g, color.b, color.a});
+  ImFont *font = g_engine->user_interface.font;
+  const float font_size = size > 0.f ? size : igGetFontSize();
+  ImDrawList_AddText_FontPtr(list, font, font_size, (ImVec2){sx, sy}, packed, text, NULL, 0.f, NULL);
+}
+
+static void api_draw_instances(ft_pipeline *pipeline, float z, ft_texture *const *textures, uint32_t texture_count, const void *instances,
+                               uint32_t count) {
+  if (!have_graphics() || !pipeline) return;
+  renderer_submit_instances(g_engine, AS_PIPELINE(pipeline), z, (texture_t *const *)textures, texture_count, instances, count);
+}
+
+static void api_draw_mesh_range(ft_pipeline *pipeline, float z, ft_mesh *mesh,
+                                uint32_t first_index, uint32_t index_count, ft_texture *const *textures,
+                                uint32_t texture_count, const void *uniforms, size_t uniform_size) {
+  if (!have_graphics() || !mesh || !pipeline) return;
+  renderer_submit_mesh_range(g_engine, AS_PIPELINE(pipeline), z, AS_MESH(mesh), first_index, index_count,
+                             (texture_t *const *)textures, texture_count, uniforms, uniform_size, NULL);
+}
+
+static void api_draw_mesh_range_clipped(ft_pipeline *pipeline, float z, ft_mesh *mesh, uint32_t first_index,
+                                        uint32_t index_count, ft_texture *const *textures, uint32_t texture_count,
+                                        const void *uniforms, size_t uniform_size, const float clip[4]) {
+  if (!have_graphics() || !mesh || !pipeline) return;
+  renderer_submit_mesh_range(g_engine, AS_PIPELINE(pipeline), z, AS_MESH(mesh), first_index, index_count,
+                             (texture_t *const *)textures, texture_count, uniforms, uniform_size, clip);
+}
+
+static void api_draw_mesh(ft_pipeline *pipeline, float z, ft_mesh *mesh, ft_texture *const *textures, uint32_t texture_count,
+                          const void *uniforms, size_t uniform_size) {
+  // Queued like every other draw, so a game's level sorts against its own
+  // entities by z instead of always landing underneath them.
+  if (!have_graphics() || !mesh || !pipeline) return;
+  renderer_submit_mesh(g_engine, AS_PIPELINE(pipeline), z, AS_MESH(mesh), (texture_t *const *)textures, texture_count, uniforms,
+                       uniform_size);
+}
+
+// --- camera ------------------------------------------------------------------
+
+static ft_camera s_cached_camera;
+static float s_last_cam_pos[2];
+static float s_last_cam_zoom = -999.f;
+static uint32_t s_last_cam_mode = UINT32_MAX;
+static float s_last_viewport[2];
+static float s_last_world_size[2];
+static bool s_has_cached_camera = false;
+
+static void api_camera_get(ft_camera *out) {
+  if (!out || !g_engine) return;
+
+  const bool is_3d = game_is_3d(&g_engine->game_host);
+  if (!is_3d && s_has_cached_camera &&
+      g_engine->renderer.camera.pos[0] == s_last_cam_pos[0] &&
+      g_engine->renderer.camera.pos[1] == s_last_cam_pos[1] &&
+      g_engine->renderer.camera.zoom == s_last_cam_zoom &&
+      g_engine->renderer.camera.mode == s_last_cam_mode &&
+      g_engine->viewport[0] == s_last_viewport[0] &&
+      g_engine->viewport[1] == s_last_viewport[1] &&
+      g_engine->world_width == s_last_world_size[0] &&
+      g_engine->world_height == s_last_world_size[1]) {
+    *out = s_cached_camera;
+    return;
+  }
+
+  memset(out, 0, sizeof(*out));
+  out->struct_size = sizeof(*out);
+  out->position = (ft_vec2){g_engine->renderer.camera.pos[0] * g_engine->world_width, g_engine->renderer.camera.pos[1] * g_engine->world_height};
+  out->zoom = g_engine->renderer.camera.zoom;
+  out->mode = g_engine->renderer.camera.mode;
+  out->aspect = g_engine->viewport[1] > 0.f ? g_engine->viewport[0] / g_engine->viewport[1] : 1.f;
+  out->viewport = (ft_vec2){g_engine->viewport[0], g_engine->viewport[1]};
+
+  // The visible rectangle, so a game culls against what the engine actually
+  // shows instead of guessing at screen coordinates.
+  float left, top, right, bottom;
+  screen_to_world(g_engine, 0.f, 0.f, &left, &top);
+  screen_to_world(g_engine, g_engine->viewport[0], g_engine->viewport[1], &right, &bottom);
+  const float min_x = fminf(left, right);
+  const float max_x = fmaxf(left, right);
+  const float min_y = fminf(top, bottom);
+  const float max_y = fmaxf(top, bottom);
+  out->visible = (ft_rect){min_x, min_y, max_x - min_x, max_y - min_y};
+
+  // A 3D game gets the camera it is actually being rendered with, down to the
+  // exact view-projection, so a module drawing with its own device lines up
+  // with the engine's own primitives instead of guessing at a matrix.
+  if (game_is_3d(&g_engine->game_host)) {
+    const camera3_t *c = &g_engine->renderer.camera3;
+    const bool orthographic = c->mode == CAMERA3_TOP_DOWN;
+    vec3 eye, forward, target;
+    renderer_camera3_eye(g_engine, eye);
+    renderer_camera3_forward(g_engine, forward);
+    renderer_camera3_target(g_engine, target);
+    out->eye = (ft_vec3){eye[0], eye[1], eye[2]};
+    out->forward = (ft_vec3){forward[0], forward[1], forward[2]};
+    out->target = (ft_vec3){target[0], target[1], target[2]};
+    // Looking straight down leaves world up parallel to the view, so the plan
+    // view rolls its own up onto -Z. See renderer_camera3_view_proj.
+    out->up = orthographic ? (ft_vec3){0.f, 0.f, -1.f} : (ft_vec3){0.f, 1.f, 0.f};
+    out->orthographic = orthographic;
+    // The plan view has no lens: its extent and its clipping come from the
+    // level, and a game that needs either reads them off the view-projection.
+    out->fov_y = orthographic ? 0.f : c->fov_y;
+    out->near_z = orthographic ? 0.f : c->near_z;
+    out->far_z = orthographic ? c->top_down_depth * 2.f : c->far_z;
+    if (c->mode == CAMERA3_ORBIT && c->directed_camera_valid) {
+      out->up = c->directed_camera.up;
+      out->orthographic = c->directed_camera.orthographic;
+      out->fov_y = c->directed_camera.fov_y;
+      out->near_z = c->directed_camera.near_z;
+      out->far_z = c->directed_camera.far_z;
+      out->use_view_proj = true;
+    }
+
+    mat4 vp;
+    renderer_camera3_view_proj(g_engine, vp);
+    memcpy(out->view_proj, vp, sizeof(out->view_proj));
+  } else {
+    s_cached_camera = *out;
+    s_last_cam_pos[0] = g_engine->renderer.camera.pos[0];
+    s_last_cam_pos[1] = g_engine->renderer.camera.pos[1];
+    s_last_cam_zoom = g_engine->renderer.camera.zoom;
+    s_last_cam_mode = g_engine->renderer.camera.mode;
+    s_last_viewport[0] = g_engine->viewport[0];
+    s_last_viewport[1] = g_engine->viewport[1];
+    s_last_world_size[0] = g_engine->world_width;
+    s_last_world_size[1] = g_engine->world_height;
+    s_has_cached_camera = true;
+  }
+}
+
+static void api_camera_set(const ft_camera *camera) {
+  if (!camera || !g_engine) return;
+  if (g_engine->world_width > 0.f) g_engine->renderer.camera.pos[0] = camera->position.x / g_engine->world_width;
+  if (g_engine->world_height > 0.f) g_engine->renderer.camera.pos[1] = camera->position.y / g_engine->world_height;
+  if (camera->zoom > 0.f) {
+    g_engine->renderer.camera.zoom = camera->zoom;
+    g_engine->renderer.camera.zoom_wanted = camera->zoom;
+  }
+}
+
+static ft_vec2 api_screen_to_world(ft_vec2 screen) {
+  ft_vec2 out = {0.f, 0.f};
+  if (!g_engine) return out;
+  screen_to_world(g_engine, screen.x, screen.y, &out.x, &out.y);
+  return out;
+}
+
+static ft_vec2 api_world_to_screen(ft_vec2 world) {
+  ft_vec2 out = {0.f, 0.f};
+  if (!g_engine) return out;
+  world_to_screen(g_engine, world.x, world.y, &out.x, &out.y);
+  return out;
+}
+
+// --- UI ----------------------------------------------------------------------
+
+static void *api_imgui_context(void) {
+  if (g_is_headless) return NULL;
+  return igGetCurrentContext();
+}
+
+static void api_imgui_allocators(void **alloc_fn, void **free_fn, void **user_data) {
+  if (g_is_headless) {
+    if (alloc_fn) *alloc_fn = NULL;
+    if (free_fn) *free_fn = NULL;
+    if (user_data) *user_data = NULL;
+    return;
+  }
+  igGetAllocatorFunctions((ImGuiMemAllocFunc *)alloc_fn, (ImGuiMemFreeFunc *)free_fn, user_data);
+}
+
+// --- engine feedback ---------------------------------------------------------
+
+// A game's start screen picks a level and asks the editor to open it, which is
+// the same path the user's own file dialog takes: recorded here and carried out
+// at the top of the next frame, because this is called from inside the game's
+// own UI callback and opening a level can replace the game that is running.
+static bool api_request_level(const char *path) {
+  if (!g_engine || !path || !*path) return false;
+  if (g_engine->game_host.calling_index >= 0)
+    ui_splash_open(&g_engine->user_interface, UI_PENDING_LOAD_LEVEL, path);
+  else
+    ui_request_load_level(&g_engine->user_interface, path);
+  return true;
+}
+
+// The game module a game asks about by id: the caller (the browsed game while its start screen draws, or
+// the active one), a backend of it or the game it is a backend of. -1 for anything else.
+static int api_same_game_index(const char *game_id) {
+  game_host_t *host = &g_engine->game_host;
+  const int caller = host->calling_index >= 0 ? host->calling_index : host->active;
+  const int index = game_host_find_id(host, game_id);
+  return game_host_same_game(host, caller, index) ? index : -1;
+}
+
+static bool api_request_level_with(const char *game_id, const char *path) {
+  if (!g_engine || !game_id || !path || !*path) return false;
+  const int index = api_same_game_index(game_id);
+  if (index < 0) return false;
+  if (g_engine->game_host.calling_index >= 0)
+    ui_splash_open_with(&g_engine->user_interface, UI_PENDING_LOAD_LEVEL, path, index);
+  else
+    ui_request_load_level_with(&g_engine->user_interface, path, index);
+  return true;
+}
+
+static bool api_switch_backend(const char *game_id) {
+  if (!g_engine || !game_id) return false;
+  const int index = api_same_game_index(game_id);
+  return index >= 0 && ui_request_switch_backend(&g_engine->user_interface, index);
+}
+
+static uint64_t api_imgui_texture_id(ft_texture *texture) {
+  if (!have_graphics() || !texture) return 0;
+  texture_t *tex = AS_TEXTURE(texture);
+  if (!tex->image_view || !tex->sampler) return 0;
+  return (uint64_t)ImGui_ImplVulkan_AddTexture(tex->sampler, tex->image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+static void api_imgui_texture_release(uint64_t texture_id) {
+  if (!have_graphics() || !texture_id) return;
+  gfx_retire_imgui_texture(g_engine, texture_id);
+}
+
+static void api_mark_dirty(void) {
+  if (g_engine) ui_mark_unsaved(&g_engine->user_interface);
+}
+
+static void api_invalidate_simulation(int32_t tick) {
+  if (!g_engine) return;
+  model_recalc_physics(&g_engine->user_interface.timeline, tick < 0 ? 0 : tick);
+}
+
+void engine_api_camera_get(ft_camera *out) { api_camera_get(out); }
+
+void engine_api_fill_state(ft_engine_state *out) {
+  memset(out, 0, sizeof(*out));
+  out->struct_size = sizeof(*out);
+  if (!g_engine) return;
+  const timeline_state_t *ts = &g_engine->user_interface.timeline;
+  out->current_tick = ts->current_tick;
+  out->playing = ts->is_playing;
+  out->recording = ts->recording;
+  out->headless = g_is_headless;
+  out->selected_player = ts->selected_player_track_index;
+  out->lod_bias = g_engine->renderer.lod_bias;
+  api_camera_get(&out->camera);
+}
+
+static void api_get_state(ft_engine_state *out) {
+  if (out) engine_api_fill_state(out);
+}
+
+static bool api_get_player_input(int32_t player, int32_t tick, void *out_record) {
+  if (!g_engine || !out_record) return false;
+  timeline_state_t *ts = &g_engine->user_interface.timeline;
+  if (player < 0 || player >= ts->player_track_count) return false;
+
+  // While recording, the tick under the playhead is still being authored: the
+  // committed snippets do not have it yet, but the live input does. Handing back
+  // a stale value here makes cursor-directed controls lag the mouse. (`tick` is
+  // the track's own, its group's: compared with the global playhead, a group
+  // that starts later never reached it.)
+  if (ts->recording && tick >= model_group_playhead_tick(ts, model_track_group_index(ts, player))) {
+    memcpy(out_record, ts->player_tracks[player].current_input.bytes, game_input_size(&g_engine->game_host));
+    return true;
+  }
+  // The record is the game's own layout; the engine just hands back the bytes
+  // it stored, trimmed to the size the game declared.
+  // Inside a demo snippet that is what the demo's player held, not the snippet's (absent) inputs.
+  const input_record_t record = recordings_display_input(ts, player, tick);
+  memcpy(out_record, record.bytes, game_input_size(&g_engine->game_host));
+  return true;
+}
+
+// --- snippets ---
+
+static input_snippet_t *snippet_of(int32_t snippet_id, int *track) {
+  if (!g_engine) return NULL;
+  return model_find_snippet_by_id(&g_engine->user_interface.timeline, snippet_id, track);
+}
+
+static bool api_snippet_info(int32_t snippet_id, ft_snippet_info *out) {
+  int track = -1;
+  const input_snippet_t *snippet = snippet_of(snippet_id, &track);
+  if (!snippet || !out) return false;
+  *out = (ft_snippet_info){.id = snippet->id, .player = track, .start_tick = snippet->start_tick,
+                           .end_tick = snippet->end_tick, .playback = snippet_is_playback(snippet)};
+  return true;
+}
+
+static bool api_snippet_input(int32_t snippet_id, int32_t tick, void *out_record) {
+  int track = -1;
+  const input_snippet_t *snippet = snippet_of(snippet_id, &track);
+  if (!snippet || !out_record || tick < snippet->start_tick || tick >= snippet->end_tick) return false;
+  const size_t size = game_input_size(&g_engine->game_host);
+  // A demo's snippet plays what the demo's player held.
+  if (snippet_is_playback(snippet)) {
+    const input_record_t record = recordings_display_input(&g_engine->user_interface.timeline, track, tick);
+    memcpy(out_record, record.bytes, size);
+    return true;
+  }
+  const input_record_t *window = input_effects_snippet_window(snippet);
+  if (!window) return false;
+  memcpy(out_record, window[tick - snippet->start_tick].bytes, size);
+  return true;
+}
+
+static void api_settings_changed(void) {
+  if (g_engine) config_save(&g_engine->user_interface);
+}
+
+static bool api_snippet_set_inputs(int32_t snippet_id, int32_t start_tick, const void *records, uint32_t count,
+                                   const char *description) {
+  int track = -1;
+  input_snippet_t *snippet = snippet_of(snippet_id, &track);
+  timeline_state_t *ts = g_engine ? &g_engine->user_interface.timeline : NULL;
+  if (!snippet || snippet_is_playback(snippet) || !records || count == 0 || count > INT32_MAX || start_tick < 0 ||
+      ts->recording)
+    return false;
+  const size_t size = game_input_size(&g_engine->game_host);
+  input_record_t *inputs = calloc(count, sizeof(*inputs));
+  if (!inputs) return false;
+  for (uint32_t i = 0; i < count; ++i) {
+    engine_input_default(&g_engine->game_host, &inputs[i]);
+    memcpy(inputs[i].bytes, (const uint8_t *)records + (size_t)i * size, size);
+  }
+  timeline_data_snapshot_t *before = commands_capture_timeline_data(ts);
+  const int first = snippet->start_tick < start_tick ? snippet->start_tick : start_tick;
+  free(snippet->inputs);
+  snippet->inputs = inputs;
+  snippet->start_tick = start_tick;
+  snippet->input_count = snippet->source_count = (int)count;
+  snippet->source_offset = 0;
+  snippet->end_tick = start_tick + (int)count;
+  input_effects_snippet_discard_cache(snippet);
+  model_recalc_group_physics(ts, model_track_group_index(ts, track), first);
+  if (before) {
+    undo_command_t *change = commands_create_timeline_data_change(&g_engine->user_interface, before,
+                                                                  description && description[0] ? description : "Set Inputs");
+    if (change) undo_manager_register_command(&g_engine->user_interface.undo_manager, change);
+  }
+  ui_mark_unsaved(&g_engine->user_interface);
+  return true;
+}
+
+// The game's dialog. Its answer goes through here so that a game destroyed while the dialog was up
+// is not called back.
+static struct {
+  ft_file_dialog_done done;
+  void *user;
+  const ft_game *instance;
+  uint32_t instance_serial;
+} g_game_dialog;
+
+static void game_dialog_done(void *user, const char *path) {
+  (void)user;
+  const ft_file_dialog_done done = g_game_dialog.done;
+  g_game_dialog.done = NULL;
+  const game_host_t *host = &g_engine->game_host;
+  if (done && host->instance == g_game_dialog.instance && host->instance_serial == g_game_dialog.instance_serial)
+    done(g_game_dialog.user, path);
+}
+
+static bool open_game_dialog(bool save, const char *filter_name, const char *filter_ext, const char *default_name,
+                             ft_file_dialog_done done, void *user) {
+  if (!done || !g_engine) return false;
+  if (g_is_headless) {
+    log_warn(LOG_SOURCE, "file dialogs are unavailable in headless mode");
+    return false;
+  }
+  const file_dialog_t dialog = {.save = save, .filter_name = filter_name, .filter_ext = filter_ext, .default_name = default_name};
+  if (!file_dialog_open(&dialog, game_dialog_done, &g_game_dialog)) return false;
+  g_game_dialog.done = done;
+  g_game_dialog.user = user;
+  g_game_dialog.instance = g_engine->game_host.instance;
+  g_game_dialog.instance_serial = g_engine->game_host.instance_serial;
+  return true;
+}
+
+static bool api_save_file_dialog(const char *filter_name, const char *filter_ext, const char *default_name, ft_file_dialog_done done,
+                                 void *user) {
+  return open_game_dialog(true, filter_name, filter_ext, default_name, done, user);
+}
+
+static bool api_open_file_dialog(const char *filter_name, const char *filter_ext, ft_file_dialog_done done, void *user) {
+  return open_game_dialog(false, filter_name, filter_ext, NULL, done, user);
+}
+
+static uint32_t api_visit_directory(const char *path, ft_directory_visitor visitor, void *user) {
+  if (!path || !visitor) return 0;
+  fs_dir_t *directory = fs_opendir(path);
+  if (!directory) return 0;
+  uint32_t count = 0;
+  fs_dirent_t *item;
+  while ((item = fs_readdir(directory)) != NULL) {
+    const ft_directory_entry entry = {.name = item->name, .is_directory = item->is_directory};
+    ++count;
+    if (!visitor(user, &entry)) break;
+  }
+  fs_closedir(directory);
+  return count;
+}
+
+static bool api_get_player_setup(int32_t player, ft_player_setup *out) {
+  if (!g_engine || !out) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (player < 0 || player >= timeline->player_track_count) return false;
+  const player_track_t *track = &timeline->player_tracks[player];
+  const player_profile_t *profile = &track->player_profile;
+  *out = (ft_player_setup){.struct_size = sizeof(*out),
+                           .track_name = track->name,
+                           .data = profile->size ? profile->data : NULL,
+                           .data_size = profile->size,
+                           .linked_player = track->is_linked && game_has_cap(&g_engine->game_host, FT_CAP_LINKED_INPUTS)
+                                                ? model_group_local_track_index(timeline, model_linked_source_track(timeline, player))
+                                                : -1};
+  return true;
+}
+
+// The game's own bytes about one player. The engine stores them, saves them and
+// hands them back; what they mean stays on the game's side of the boundary.
+static bool api_set_player_profile(int32_t player, const void *data, uint32_t size) {
+  if (!g_engine) return false;
+  if (size > FT_PLAYER_PROFILE_MAX) return false;
+  if (size > 0 && !data) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (player < 0 || player >= timeline->player_track_count) return false;
+
+  player_profile_t *profile = &timeline->player_tracks[player].player_profile;
+  if (profile->size == size && (size == 0 || memcmp(profile->data, data, size) == 0)) return true;
+  if (size > 0) memcpy(profile->data, data, size);
+  memset(profile->data + size, 0, sizeof(profile->data) - size);
+  profile->size = size;
+  api_mark_dirty();
+  return true;
+}
+
+// The engine's own starting-state editor, drawn wherever the game put it. The
+// game supplies the properties; the widgets and the storage are the engine's.
+static bool api_starting_state_editor(int32_t player) {
+  if (!g_engine) return false;
+  return starting_state_draw(&g_engine->user_interface, player);
+}
+
+static uint32_t api_timeline_world_count(void) {
+  return g_engine ? (uint32_t)g_engine->user_interface.timeline.group_count : 0;
+}
+
+static bool api_timeline_world_info(uint32_t world_index, ft_timeline_world_info *out) {
+  if (!g_engine || !out) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (world_index >= (uint32_t)timeline->group_count) return false;
+  *out = (ft_timeline_world_info){.struct_size = sizeof(*out),
+                                  .world_index = (int32_t)world_index,
+                                  .start_offset = timeline->groups[world_index]->start_offset,
+                                  .player_count = (uint32_t)model_group_track_count(timeline, (int)world_index),
+                                  .name = timeline->groups[world_index]->name,
+                                  .physics_revision = timeline->groups[world_index]->physics_revision};
+  return true;
+}
+
+static bool api_timeline_world_pair(uint32_t world_index, int32_t global_tick, const ft_world **out_previous,
+                                    const ft_world **out_current) {
+  if (out_previous) *out_previous = NULL;
+  if (out_current) *out_current = NULL;
+  if (!g_engine) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (world_index >= (uint32_t)timeline->group_count) return false;
+  const bool previous_effects = engine_api_set_presentation_effects(false);
+  model_group_world_pair(timeline, (int)world_index, global_tick, out_previous, out_current);
+  engine_api_set_presentation_effects(previous_effects);
+  return out_current && *out_current;
+}
+
+static int32_t api_timeline_player_track(uint32_t world_index, uint32_t local_player) {
+  if (!g_engine || world_index >= (uint32_t)g_engine->user_interface.timeline.group_count) return -1;
+  return model_group_track_index(&g_engine->user_interface.timeline, (int)world_index, (int)local_player);
+}
+
+static uint32_t api_timeline_event_count(void) {
+  return g_engine ? (uint32_t)g_engine->user_interface.timeline.event_count : 0;
+}
+
+static bool api_timeline_event_get(uint32_t index, ft_timeline_event *out) {
+  if (!g_engine || !out) return false;
+  const timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (index >= (uint32_t)timeline->event_count) return false;
+  timeline_event_to_abi(&timeline->events[index], out);
+  return true;
+}
+
+static bool api_timeline_event_add(const ft_timeline_event *event) {
+  if (!g_engine || !event) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  timeline_event_t stored;
+  if (!timeline_event_from_abi(&stored, event, timeline->active_group_index) || stored.group_index < 0 ||
+      stored.group_index >= timeline->group_count)
+    return false;
+  const int before = timeline->event_count;
+  timeline_events_add(timeline, stored);
+  if (timeline->event_count == before) return false;
+  api_mark_dirty();
+  return true;
+}
+
+static bool api_timeline_event_update(uint32_t index, const ft_timeline_event *event) {
+  if (!g_engine || !event) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  if (index >= (uint32_t)timeline->event_count) return false;
+  timeline_event_t stored;
+  if (!timeline_event_from_abi(&stored, event, timeline->active_group_index) || stored.group_index < 0 ||
+      stored.group_index >= timeline->group_count)
+    return false;
+  timeline->events[index] = stored;
+  timeline_events_sort(timeline);
+  api_mark_dirty();
+  return true;
+}
+
+static bool api_timeline_event_remove(uint32_t index) {
+  if (!g_engine || index >= (uint32_t)g_engine->user_interface.timeline.event_count) return false;
+  timeline_events_remove(&g_engine->user_interface.timeline, (int)index);
+  api_mark_dirty();
+  return true;
+}
+
+static int32_t api_timeline_active_world(void) {
+  return g_engine ? g_engine->user_interface.timeline.active_group_index : -1;
+}
+
+static bool api_timeline_range(int32_t *out_start_tick, int32_t *out_end_tick) {
+  if (!g_engine || !out_start_tick || !out_end_tick) return false;
+  timeline_state_t *timeline = &g_engine->user_interface.timeline;
+  *out_start_tick = model_get_min_global_tick(timeline);
+  *out_end_tick = model_get_max_timeline_tick(timeline);
+  return true;
+}
+
+static bool api_presentation_effects_enabled(void) { return engine_api_presentation_effects_enabled(); }
+
+static const char *api_get_level_name(void) {
+  return (g_engine && g_engine->user_interface.loaded_level_name[0])
+             ? g_engine->user_interface.loaded_level_name
+             : "";
+}
+
+// --- assembly ----------------------------------------------------------------
+
+const ft_engine_api *engine_api_init(gfx_handler_t *handler) {
+  static ft_engine_api api;
+  g_engine = handler;
+
+  api = (ft_engine_api){
+      .struct_size = sizeof(ft_engine_api),
+      .log = api_log,
+      .resolve_data_path = api_resolve_data_path,
+      .read_file = api_read_file,
+      .free_file_data = api_free_file_data,
+      .resolve_cache_path = api_resolve_cache_path,
+      .texture_create = api_texture_create,
+      .texture_destroy = api_texture_destroy,
+      .texture_update_layer = api_texture_update_layer,
+      .atlas_create = api_atlas_create,
+      .atlas_destroy = api_atlas_destroy,
+      .pipeline_create = api_pipeline_create,
+      .pipeline_destroy = api_pipeline_destroy,
+      .mesh_create = api_mesh_create,
+      .mesh_destroy = api_mesh_destroy,
+      .draw_sprites = api_draw_sprites,
+      .draw_line = api_draw_line,
+      .draw_rect = api_draw_rect,
+      .draw_rect_rounded = api_draw_rect_rounded,
+      .draw_circle = api_draw_circle,
+      .draw_triangle = api_draw_triangle,
+      .draw_text = api_draw_text,
+      .draw_polyline_smooth = api_draw_polyline_smooth,
+      .draw_polygon_smooth = api_draw_polygon_smooth,
+      .draw_instances = api_draw_instances,
+      .draw_mesh = api_draw_mesh,
+      .draw_mesh_range = api_draw_mesh_range,
+      .draw_mesh_range_clipped = api_draw_mesh_range_clipped,
+      .request_level_with = api_request_level_with,
+      .switch_backend = api_switch_backend,
+      .camera_get = api_camera_get,
+      .camera_set = api_camera_set,
+      .screen_to_world = api_screen_to_world,
+      .world_to_screen = api_world_to_screen,
+      .imgui_context = api_imgui_context,
+      .imgui_allocators = api_imgui_allocators,
+      .request_level = api_request_level,
+      .imgui_texture_id = api_imgui_texture_id,
+      .imgui_texture_release = api_imgui_texture_release,
+      .mark_dirty = api_mark_dirty,
+      .invalidate_simulation = api_invalidate_simulation,
+      .get_state = api_get_state,
+      .get_player_input = api_get_player_input,
+      .save_file_dialog = api_save_file_dialog,
+      .open_file_dialog = api_open_file_dialog,
+      .visit_directory = api_visit_directory,
+      .get_player_setup = api_get_player_setup,
+      .set_player_profile = api_set_player_profile,
+      .starting_state_editor = api_starting_state_editor,
+      .timeline_world_count = api_timeline_world_count,
+      .timeline_world_info = api_timeline_world_info,
+      .timeline_world_pair = api_timeline_world_pair,
+      .timeline_player_track = api_timeline_player_track,
+      .render_instances_preview = api_render_instances_preview,
+      .gpu_device = api_gpu_device,
+      .texture_gpu_image = api_texture_gpu_image,
+      .draw_texture = api_draw_texture,
+      .draw_line3 = api_draw_line3,
+      .draw_triangle3 = api_draw_triangle3,
+      .set_texture3 = api_set_texture3,
+      .draw_triangle3_textured = api_draw_triangle3_textured,
+      .draw_box3 = api_draw_box3,
+      .timeline_event_count = api_timeline_event_count,
+      .timeline_event_get = api_timeline_event_get,
+      .timeline_event_add = api_timeline_event_add,
+      .timeline_event_update = api_timeline_event_update,
+      .timeline_event_remove = api_timeline_event_remove,
+      .timeline_active_world = api_timeline_active_world,
+      .timeline_range = api_timeline_range,
+      .presentation_effects_enabled = api_presentation_effects_enabled,
+      .get_level_name = api_get_level_name,
+      .audio_sample_load = audio_sample_load,
+      .audio_sample_decode = audio_sample_decode,
+      .audio_sample_create = audio_sample_create,
+      .audio_sample_destroy = audio_sample_destroy,
+      .audio_enabled = audio_enabled,
+      .audio_heard = audio_heard,
+      .snippet_info = api_snippet_info,
+      .snippet_input = api_snippet_input,
+      .snippet_set_inputs = api_snippet_set_inputs,
+      .open_path = fs_open_in_file_manager,
+      .settings_changed = api_settings_changed,
+  };
+  return &api;
+}
+
+bool engine_api_set_presentation_effects(bool enabled) {
+  const bool previous = g_presentation_effects;
+  g_presentation_effects = enabled;
+  return previous;
+}
+
+bool engine_api_presentation_effects_enabled(void) { return g_presentation_effects; }
+
+void engine_api_set_world_extent(gfx_handler_t *handler, float width, float height) {
+  handler->world_width = width > 0.f ? width : 1.f;
+  handler->world_height = height > 0.f ? height : 1.f;
+}

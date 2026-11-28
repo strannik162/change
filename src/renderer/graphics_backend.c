@@ -1,0 +1,2401 @@
+#include "graphics_backend.h"
+#include <user_interface/render/render_window.h>
+#include "renderer.h"
+#include <engine/engine_api.h>
+#include <logger/logger.h>
+#include <math.h>
+#include <stdbool.h>
+#include <system/config.h>
+#include <system/fs.h>
+#include <system/input.h>
+#include <system/raw_mouse.h>
+#include <user_interface/snippet_editor.h>
+#include <user_interface/timeline/timeline_interaction.h>
+#include <user_interface/timeline/timeline_model.h>
+#include <user_interface/user_interface.h>
+
+extern bool g_is_headless;
+extern bool g_is_render_worker;
+extern bool g_hide_render_window;
+
+#include <GLFW/glfw3.h>
+// prototypes for the cached monitor wrappers defined below; NO_REDIRECT keeps the
+// real GLFW entry points visible here, only imgui_impl_glfw.cpp gets the redirects
+#define IMGUI_GLFW_CACHE_NO_REDIRECT
+#include "imgui_glfw_cache.h"
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vulkan/vulkan_core.h>
+
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(_ARR) ((int)(sizeof(_ARR) / sizeof(*(_ARR))))
+#endif
+
+static const char *LOG_SOURCE = "GfxBackend";
+
+// forward declarations of static functions
+static void glfw_error_callback(int error, const char *description);
+static int init_window(gfx_handler_t *handler);
+static void save_window_geometry(GLFWwindow *window);
+static int init_vulkan(gfx_handler_t *handler);
+static int init_imgui(gfx_handler_t *handler);
+static void cleanup_vulkan(gfx_handler_t *handler);
+static void log_vulkan_loader_diagnostics(void);
+static void cleanup_vulkan_window(gfx_handler_t *handler);
+// frame_render and frame_present are now folded into gfx_begin/end_frame
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_report(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT object_type, uint64_t object,
+                                                   size_t location, int32_t message_code, const char *layer_prefix, const char *message,
+                                                   void *user_data);
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_utils_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT type,
+                                                           const VkDebugUtilsMessengerCallbackDataEXT *callback_data, void *user_data);
+#endif
+
+// offscreen helpers
+static int init_offscreen_resources(gfx_handler_t *handler, uint32_t width, uint32_t height);
+static VkFramebuffer window_framebuffer(gfx_handler_t *handler, uint32_t index);
+static void destroy_window_framebuffers(gfx_handler_t *handler);
+static void destroy_offscreen_resources(gfx_handler_t *handler);
+static int recreate_offscreen_if_needed(gfx_handler_t *handler, uint32_t width, uint32_t height);
+static void destroy_export_resources(gfx_handler_t *handler);
+
+// vulkan initialization helpers
+static VkResult create_instance(gfx_handler_t *handler, const char **extensions, uint32_t extensions_count);
+static int select_physical_device(gfx_handler_t *handler);
+static void create_logical_device(gfx_handler_t *handler);
+static void create_descriptor_pool(gfx_handler_t *handler);
+static void setup_window(gfx_handler_t *handler, struct ImGui_ImplVulkanH_Window *wd, VkSurfaceKHR surface, int width, int height);
+
+// glfw error callback
+static void glfw_error_callback(int error, const char *description) { log_error("GLFW", "%d: %s", error, description); }
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_report(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT object_type, uint64_t object,
+                                                   size_t location, int32_t message_code, const char *layer_prefix, const char *message,
+                                                   void *user_data) {
+  (void)flags;
+  (void)object_type;
+  (void)object;
+  (void)location;
+  (void)user_data;
+
+  log_error(LOG_SOURCE, "[vulkan][%s] code %d: %s", layer_prefix ? layer_prefix : "unknown", message_code, message);
+  fflush(stderr);
+  return VK_FALSE; // do not abort
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_utils_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT type,
+                                                           const VkDebugUtilsMessengerCallbackDataEXT *callback_data, void *user_data) {
+  (void)type;
+  (void)user_data;
+
+  const char *severity_str = "";
+  switch (severity) {
+  case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT:
+    severity_str = "VERBOSE";
+    break;
+  case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT:
+    severity_str = "INFO";
+    break;
+  case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT:
+    severity_str = "WARN";
+    break;
+  case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
+    severity_str = "ERROR";
+    break;
+  default:
+    severity_str = "UNKNOWN";
+    break;
+  }
+
+  log_error(LOG_SOURCE, "[vulkan][%s] %s", severity_str, callback_data && callback_data->pMessage ? callback_data->pMessage : "(null)");
+  fflush(stderr);
+  return VK_FALSE;
+}
+#endif
+
+static struct {
+  GLFWwindow *window;
+  double x, y;
+  bool pending;
+} g_imgui_mouse;
+
+static void flush_imgui_mouse_pos(void) {
+  if (!g_imgui_mouse.pending) return;
+  g_imgui_mouse.pending = false;
+  ImGui_ImplGlfw_CursorPosCallback((void *)g_imgui_mouse.window, g_imgui_mouse.x, g_imgui_mouse.y);
+}
+
+// Mouse motion into the aim being recorded: scaled by the sensitivity, kept within reach.
+static void add_recording_aim(gfx_handler_t *handler, double diff_x, double diff_y) {
+  if (!handler->user_interface.timeline.recording || engine_input_cursor_field() < 0) return;
+  // Over a take the aim is the take's: moving the mouse there would show for a frame and snap back.
+  if (interaction_cursor_held_by_take(&handler->user_interface.timeline)) return;
+
+  float sens = handler->user_interface.mouse_sens * 0.01f;
+  handler->user_interface.recording_mouse_pos[0] += diff_x * sens;
+  handler->user_interface.recording_mouse_pos[1] += diff_y * sens;
+
+  // Clamp the recorded aim to the configured reach. Plain float maths now that
+  // the engine no longer borrows a game's vector type for this.
+  const float max_distance = handler->user_interface.mouse_max_distance;
+  const float aim_x = handler->user_interface.recording_mouse_pos[0];
+  const float aim_y = handler->user_interface.recording_mouse_pos[1];
+  const float length = sqrtf(aim_x * aim_x + aim_y * aim_y);
+  if (length > max_distance && length > 0.0001f) {
+    handler->user_interface.recording_mouse_pos[0] = aim_x / length * max_distance;
+    handler->user_interface.recording_mouse_pos[1] = aim_y / length * max_distance;
+  }
+  // TODO: make this go in the right direction actually
+  if ((int)handler->user_interface.recording_mouse_pos[0] == 0 && (int)handler->user_interface.recording_mouse_pos[1] == 0) {
+    handler->user_interface.recording_mouse_pos[0] = 1;
+  }
+}
+
+static void cursor_position_callback(GLFWwindow *window, double xpos, double ypos) {
+  window_state_on_cursor(window, xpos, ypos);
+  gfx_handler_t *handler = glfwGetWindowUserPointer(window);
+  if (!handler) return;
+
+  g_imgui_mouse.window = window;
+  g_imgui_mouse.x = xpos;
+  g_imgui_mouse.y = ypos;
+  g_imgui_mouse.pending = true;
+
+  double diff_x, diff_y;
+  input_accumulate_mouse_pos(xpos, ypos, &diff_x, &diff_y);
+  // (the raw motion read on its own thread is the aim's then, see gfx_begin_frame())
+  if (!raw_mouse_running()) add_recording_aim(handler, diff_x, diff_y);
+}
+
+static void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
+  input_accumulate_scroll(xoffset, yoffset);
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_ScrollCallback((void *)window, xoffset, yoffset);
+}
+
+static void key_callback(GLFWwindow *window, int key, int scancode, int action, int mods) {
+  // Down/up state is polled; the OS repeat timing, and presses too short for a poll to see, come from
+  // events.
+  if (action == GLFW_REPEAT) input_accumulate_key_repeat(key);
+  if (action == GLFW_PRESS) input_accumulate_key_press(key);
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_KeyCallback((void *)window, key, scancode, action, mods);
+}
+
+static void mouse_button_callback(GLFWwindow *window, int button, int action, int mods) {
+  if (action == GLFW_PRESS) input_accumulate_button_press(button);
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_MouseButtonCallback((void *)window, button, action, mods);
+}
+
+static void char_callback(GLFWwindow *window, unsigned int c) {
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_CharCallback((void *)window, c);
+}
+
+static void cursor_enter_callback(GLFWwindow *window, int entered) {
+  window_state_on_enter(window, entered);
+  // Leaving the window has to arrive after the last position inside it, or imgui keeps a cursor that
+  // is no longer there.
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_CursorEnterCallback((void *)window, entered);
+}
+
+static void window_focus_callback(GLFWwindow *window, int focused) {
+  window_state_on_focus(window, focused);
+  flush_imgui_mouse_pos();
+  ImGui_ImplGlfw_WindowFocusCallback((void *)window, focused);
+}
+
+// Followed only for system/window_state.c, which answers from them what GLFW would ask X11 for.
+static void window_size_callback(GLFWwindow *window, int width, int height) { window_state_on_size(window, width, height); }
+
+static void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
+  window_state_on_framebuffer_size(window, width, height);
+}
+
+static void window_iconify_callback(GLFWwindow *window, int iconified) { window_state_on_iconify(window, iconified); }
+
+// Taken back before the imgui backend is shut down, since every one of these hands the event to a
+// backend that would no longer be there. Kept in step with the set installed in init_imgui().
+static void clear_glfw_callbacks(GLFWwindow *window) {
+  glfwSetCursorPosCallback(window, NULL);
+  glfwSetCursorEnterCallback(window, NULL);
+  glfwSetMouseButtonCallback(window, NULL);
+  glfwSetScrollCallback(window, NULL);
+  glfwSetKeyCallback(window, NULL);
+  glfwSetCharCallback(window, NULL);
+  glfwSetWindowFocusCallback(window, NULL);
+  glfwSetWindowSizeCallback(window, NULL);
+  glfwSetFramebufferSizeCallback(window, NULL);
+  glfwSetWindowIconifyCallback(window, NULL);
+}
+
+static bool imgui_queue_needs_trickling(void) {
+  ImGuiContext *ctx = igGetCurrentContext();
+  if (!ctx) return true;
+
+  const ImGuiInputEvent *events = ctx->InputEventsQueue.Data;
+  const int event_count = ctx->InputEventsQueue.Size;
+
+  ImGuiKey keys_seen[32];
+  int keys_seen_count = 0;
+  unsigned int buttons_seen = 0;
+  bool has_key = false, has_text = false;
+
+  for (int i = 0; i < event_count; ++i) {
+    const ImGuiInputEvent *e = &events[i];
+    switch (e->Type) {
+    case ImGuiInputEventType_MousePos:
+      // A click belongs to the position the cursor was at when it happened, not to the one it
+      // reached by the end of the frame, so a click with movement queued behind it has to keep its
+      // own frame. Long frames are where this is worth the most and where the gap is widest.
+      if (buttons_seen != 0) return true;
+      break;
+
+    case ImGuiInputEventType_MouseButton: {
+      // Imgui drops events that only repeat the state already queued for that button, so a button
+      // showing up twice is a press and a release, which flattening would collapse into no click.
+      const unsigned int bit = 1u << e->MouseButton.Button;
+      if (buttons_seen & bit) return true;
+      buttons_seen |= bit;
+      break;
+    }
+
+    case ImGuiInputEventType_Key:
+      // Same reasoning as the mouse buttons: a key that appears twice was tapped inside one frame.
+      has_key = true;
+      for (int k = 0; k < keys_seen_count; ++k)
+        if (keys_seen[k] == e->Key.Key) return true;
+      if (keys_seen_count == ARRAYSIZE(keys_seen)) return true;
+      keys_seen[keys_seen_count++] = e->Key.Key;
+      break;
+
+    case ImGuiInputEventType_Text:
+      has_text = true;
+      break;
+
+    default:
+      break;
+    }
+  }
+
+  return has_key && has_text && ctx->WantTextInputNextFrame == 1;
+}
+
+// Brings up the game layer: builds the service table and finds the installed
+// game modules. It activates none of them. The editor comes up on its start
+// screen with nothing open, and a game only starts existing once the user
+// picks something to open with it -- until then there is no instance, no
+// atlases or pipelines, no game keybinds and no game-specific plugins.
+static void init_game_layer(gfx_handler_t *handler) {
+  const ft_engine_api *api = engine_api_init(handler);
+  game_host_init(&handler->game_host, api);
+  if (game_host_discover(&handler->game_host, "games") == 0) {
+    char exe_dir[1024];
+    if (fs_get_executable_dir(exe_dir, sizeof(exe_dir))) {
+      char games_dir[1024];
+      snprintf(games_dir, sizeof(games_dir), "%s/games", exe_dir);
+      game_host_discover(&handler->game_host, games_dir);
+    }
+  }
+}
+
+// The game to bring up for a level that never passed the start screen -- one
+// named by --level on the command line, or opened by a script. A --game
+// argument wins over the config, which in turn wins over "whatever loaded
+// first" so a fresh install still comes up with something usable.
+//
+// FRAMETEE_DEFAULT_GAME_ID is a build-time setting, not engine knowledge: a
+// distribution names the game it ships as its default, and without it the
+// engine simply takes the first module in id order.
+#ifndef FRAMETEE_DEFAULT_GAME_ID
+#define FRAMETEE_DEFAULT_GAME_ID ""
+#endif
+static int startup_game_index(const gfx_handler_t *handler) {
+  extern const char *g_forced_game_id;
+  const char *const wanted[3] = {g_forced_game_id, handler->user_interface.preferred_game_id, FRAMETEE_DEFAULT_GAME_ID};
+  for (int w = 0; w < 3; ++w) {
+    if (!wanted[w] || !*wanted[w]) continue;
+    const int index = game_host_find_id(&handler->game_host, wanted[w]);
+    if (index >= 0) return index;
+  }
+  for (int i = 0; i < handler->game_host.count; ++i)
+    if (handler->game_host.slots[i].usable) return i;
+  return -1;
+}
+
+int init_gfx_handler(gfx_handler_t *handler) {
+  memset(handler, 0, sizeof(gfx_handler_t));
+  // Unit playfield until a level is loaded, so the projection stays finite even
+  // when nothing has been opened yet.
+  handler->world_width = 1.f;
+  handler->world_height = 1.f;
+
+  if (g_is_headless) {
+    igCreateContext(NULL);
+    igGetIO_Nil()->IniFilename = NULL;
+    handler->user_interface.gfx_handler = handler;
+    ui_init_config(&handler->user_interface);
+    init_game_layer(handler);
+    ui_init(&handler->user_interface, handler);
+    return 0;
+  }
+
+  handler->g_allocator = NULL;
+  handler->g_instance = VK_NULL_HANDLE;
+  handler->g_physical_device = VK_NULL_HANDLE;
+  handler->g_device = VK_NULL_HANDLE;
+  handler->g_queue_family = (uint32_t)-1;
+  handler->g_queue = VK_NULL_HANDLE;
+  handler->g_debug_report = VK_NULL_HANDLE;
+  handler->g_debug_messenger = VK_NULL_HANDLE;
+  handler->g_pipeline_cache = VK_NULL_HANDLE;
+  handler->g_descriptor_pool = VK_NULL_HANDLE;
+  handler->g_min_image_count = 2;
+  handler->g_swap_chain_rebuild = false;
+  handler->offscreen_initialized = false;
+  handler->offscreen_image = VK_NULL_HANDLE;
+  handler->offscreen_image_view = VK_NULL_HANDLE;
+  handler->offscreen_sampler = VK_NULL_HANDLE;
+  handler->offscreen_framebuffer = VK_NULL_HANDLE;
+  handler->offscreen_render_pass = VK_NULL_HANDLE;
+  handler->offscreen_depth_image = VK_NULL_HANDLE;
+  handler->offscreen_depth_memory = VK_NULL_HANDLE;
+  handler->offscreen_depth_view = VK_NULL_HANDLE;
+  handler->offscreen_texture = NULL;
+
+  if (init_window(handler) != 0) {
+    return 1;
+  }
+
+  glfwSetWindowUserPointer(handler->window, handler);
+  input_init(handler->window);
+
+  // Initialize ImGui context early for config keybind parsing
+  igCreateContext(NULL);
+
+  handler->user_interface.gfx_handler = handler;
+  ui_init_config(&handler->user_interface);
+
+  if (init_vulkan(handler) != 0) {
+    input_shutdown();
+    glfwDestroyWindow(handler->window);
+    glfwTerminate();
+    return 1;
+  }
+  if (renderer_init(handler) != 0) {
+    input_shutdown();
+    cleanup_vulkan(handler);
+    glfwDestroyWindow(handler->window);
+    glfwTerminate();
+    return 1;
+  }
+
+  // Apply LOD Bias from config (renderer_init resets it)
+  handler->renderer.lod_bias = handler->user_interface.lod_bias;
+
+  if (init_imgui(handler) != 0) {
+    input_shutdown();
+    destroy_export_resources(handler);
+    renderer_cleanup(handler);
+    cleanup_vulkan(handler);
+    glfwDestroyWindow(handler->window);
+    glfwTerminate();
+    return 1;
+  }
+
+  if (!handler->quad_mesh) {
+    vertex_t quad_vertices[] = {
+        {{-1.f, -1.f}, {1.0f, 1.0f, 1.0f}, {-1.f, 1.0f}}, // Top Left
+        {{1.0f, -1.f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}, // Top Right
+        {{1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, -1.f}}, // Bottom Right
+        {{-1.f, 1.0f}, {1.0f, 1.0f, 1.0f}, {-1.f, -1.f}}  // Bottom Left
+    };
+    uint32_t quad_indices[] = {
+        0, 1, 2, // First triangle
+        2, 3, 0  // Second triangle
+    };
+    handler->quad_mesh = renderer_create_mesh(handler, quad_vertices, 4, quad_indices, 6);
+  }
+
+  int fb_width, fb_height;
+  glfwGetFramebufferSize(handler->window, &fb_width, &fb_height);
+  handler->viewport[0] = (float)fb_width;
+  handler->viewport[1] = (float)fb_height;
+
+  const char *forced = getenv("FRAMETEE_VIEWPORT_SIZE");
+  if (forced != NULL) {
+    int w = 0, h = 0;
+    if (sscanf(forced, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+      handler->viewport[0] = (float)w;
+      handler->viewport[1] = (float)h;
+    }
+  }
+
+  // initialize offscreen target to match the viewport size
+  uint32_t init_w = handler->viewport[0] > 0.0f ? (uint32_t)handler->viewport[0] : (uint32_t)fb_width;
+  uint32_t init_h = handler->viewport[1] > 0.0f ? (uint32_t)handler->viewport[1] : (uint32_t)fb_height;
+  if (init_offscreen_resources(handler, init_w, init_h) != 0) {
+    log_warn(LOG_SOURCE, "Failed to create offscreen resources. The ImGui game view will be disabled.");
+  }
+
+  init_game_layer(handler);
+  ui_init(&handler->user_interface, handler);
+
+  return 0;
+}
+
+// With vsync, FIFO. Without, a mode that never waits for the display: immediate where the surface
+// has it, else mailbox (no tearing, the newest frame shown), and only then FIFO, which every surface
+// has. Going straight from immediate to FIFO made "vsync off" vsync after all, with its frame or two
+// of input delay, wherever there is no immediate (often under Wayland).
+static VkPresentModeKHR choose_present_mode(gfx_handler_t *handler, VkSurfaceKHR surface) {
+  if (handler->user_interface.vsync) return VK_PRESENT_MODE_FIFO_KHR;
+  const VkPresentModeKHR modes[] = {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR};
+  return ImGui_ImplVulkanH_SelectPresentMode(handler->g_physical_device, surface, modes, ARRAYSIZE(modes));
+}
+
+// Whether the window's images take the viewport copied in (present_viewport_only); ImGui draws into them either way.
+static bool g_swapchain_takes_transfers = false;
+
+static VkImageUsageFlags swapchain_usage(gfx_handler_t *handler) {
+  VkSurfaceCapabilitiesKHR caps = {0};
+  g_swapchain_takes_transfers =
+      handler->present_viewport_only &&
+      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(handler->g_physical_device, handler->g_main_window_data.Surface, &caps) == VK_SUCCESS &&
+      (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+  return VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (g_swapchain_takes_transfers ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0);
+}
+
+// How many frames may be in flight: the setting, as far as the swapchain has images for them. One
+// means each frame waits for the one before, which is what a game drawing with a renderer of its own
+// gets, since it may count on that.
+static uint32_t frames_in_flight(const gfx_handler_t *handler) {
+  int n = handler->user_interface.frames_in_flight;
+  if (handler->renderer.external_texture_count > 0) n = 1;
+  if (n > (int)handler->g_main_window_data.ImageCount) n = (int)handler->g_main_window_data.ImageCount;
+  if (n > MAX_FRAMES_IN_FLIGHT) n = MAX_FRAMES_IN_FLIGHT;
+  return n < 1 ? 1 : (uint32_t)n;
+}
+
+// This frame's keys, buttons and wheel, and the raw motion read off the main thread (see raw_mouse.h).
+static void read_input(gfx_handler_t *handler) {
+  input_new_frame();
+  if (raw_mouse_running()) {
+    double dx, dy;
+    raw_mouse_take(&dx, &dy);
+    // (it is the mouse's motion whichever window has it)
+    if (window_state_get_attrib(handler->window, GLFW_FOCUSED)) add_recording_aim(handler, dx, dy);
+  }
+}
+
+int gfx_begin_frame(gfx_handler_t *handler) {
+  if (glfwWindowShouldClose(handler->window)) {
+    // A background render outlives the editor; the user is asked first.
+    if (render_allow_quit(&handler->user_interface)) return FRAME_EXIT;
+    glfwSetWindowShouldClose(handler->window, GLFW_FALSE);
+  }
+
+  glfwPollEvents();
+
+  if (window_state_get_attrib(handler->window, GLFW_ICONIFIED) != 0) {
+    read_input(handler);
+    ImGui_ImplGlfw_Sleep(10);
+    return FRAME_SKIP;
+  }
+
+  int fb_width, fb_height;
+  window_state_get_framebuffer_size(handler->window, &fb_width, &fb_height);
+  if (fb_width > 0 && fb_height > 0 &&
+      (handler->g_swap_chain_rebuild || handler->g_main_window_data.Width != fb_width || handler->g_main_window_data.Height != fb_height)) {
+    vkDeviceWaitIdle(handler->g_device);
+    renderer_frames_completed(handler, UINT64_MAX);
+    // (they hold the images of the swapchain about to be replaced, and its fences)
+    destroy_window_framebuffers(handler);
+    memset(handler->slot_fences, 0, sizeof(handler->slot_fences));
+
+    // Update Present Mode based on settings
+    handler->g_main_window_data.PresentMode = choose_present_mode(handler, handler->g_main_window_data.Surface);
+
+    ImGui_ImplVulkan_SetMinImageCount(handler->g_min_image_count);
+    ImGui_ImplVulkanH_CreateOrResizeWindow(handler->g_instance, handler->g_physical_device, handler->g_device, &handler->g_main_window_data,
+                                           handler->g_queue_family, handler->g_allocator, fb_width, fb_height, handler->g_min_image_count, swapchain_usage(handler));
+    handler->g_main_window_data.FrameIndex = 0;
+    handler->g_swap_chain_rebuild = false;
+  }
+
+  // Acquire the image before the ImGui frame begins. A frame skipped after igNewFrame would submit
+  // no windows, and ImGui then moves focus off the window that had it, which closes any open modal:
+  // switching to fullscreen made dialogs vanish.
+  ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+  VkSemaphore image_acquired_semaphore = wd->FrameSemaphores.Data[wd->SemaphoreIndex].ImageAcquiredSemaphore;
+  // The frame in flight this one is. Its buffers are those the frame frames_in_flight() before used,
+  // so that one has to be done; and with it everything submitted earlier, including the last wait on
+  // the semaphore about to be acquired with, which comes round every ImageCount frames, no fewer.
+  handler->frame_slot = (uint32_t)(handler->frame_serial % frames_in_flight(handler));
+  VkResult err;
+  if (handler->slot_fences[handler->frame_slot] != VK_NULL_HANDLE) {
+    err = vkWaitForFences(handler->g_device, 1, &handler->slot_fences[handler->frame_slot], VK_TRUE, UINT64_MAX);
+    check_vk_result(err);
+    renderer_frames_completed(handler, handler->slot_serials[handler->frame_slot]);
+  }
+
+  err = vkAcquireNextImageKHR(handler->g_device, wd->Swapchain, UINT64_MAX, image_acquired_semaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+  if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR) {
+    handler->g_swap_chain_rebuild = true;
+    read_input(handler);
+    // Skip this frame if the swapchain is invalid
+    return FRAME_SKIP;
+  }
+  check_vk_result(err);
+  // The acquired image's last frame has to be done before its command buffer is used again.
+  ImGui_ImplVulkanH_Frame *fd = &wd->Frames.Data[wd->FrameIndex];
+  err = vkWaitForFences(handler->g_device, 1, &fd->Fence, VK_TRUE, UINT64_MAX);
+  check_vk_result(err);
+
+  // The input of the frame is read only now, after every wait for the GPU and the swapchain (with
+  // vsync up to a refresh): read before them, it would be that much older by the time the frame
+  // uses it.
+  glfwPollEvents();
+  read_input(handler);
+
+  // Layout first: the viewport excludes the actual menu/tab bars and panels,
+  // whose sizes depend on docking and UI scale, not a fixed pixel allowance.
+  ImGui_ImplVulkan_NewFrame();
+  ImGui_ImplGlfw_NewFrame();
+  flush_imgui_mouse_pos();
+  igGetIO_Nil()->ConfigInputTrickleEventQueue = imgui_queue_needs_trickling();
+  igNewFrame();
+  ui_begin_frame(&handler->user_interface);
+
+  // Recreate offscreen target to match the viewport size if changed
+  uint32_t target_w = handler->viewport[0] > 0.0f ? (uint32_t)handler->viewport[0] : (uint32_t)fb_width;
+  uint32_t target_h = handler->viewport[1] > 0.0f ? (uint32_t)handler->viewport[1] : (uint32_t)fb_height;
+  if (target_w > 0 && target_h > 0 &&
+      (handler->offscreen_width != target_w || handler->offscreen_height != target_h)) {
+    vkDeviceWaitIdle(handler->g_device);
+    renderer_frames_completed(handler, UINT64_MAX);
+    recreate_offscreen_if_needed(handler, target_w, target_h);
+  }
+
+  // Begin Command Buffer
+  // (its fence is reset only by the submit that signals it again, in gfx_end_frame(): a frame that is
+  // skipped from here on would leave it unsignaled, and the next wait for it would never return)
+  err = vkResetCommandPool(handler->g_device, fd->CommandPool, 0);
+  check_vk_result(err);
+  VkCommandBufferBeginInfo info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+  err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
+  check_vk_result(err);
+
+  handler->current_frame_command_buffer = fd->CommandBuffer;
+
+  // A game rendering with its own renderer has already submitted this frame's
+  // work to the shared queue, so its images become sampleable here, before the
+  // pass that reads them opens. Layout transitions cannot be recorded inside a
+  // render pass, which is why this sits ahead of it.
+  renderer_sync_external_textures(handler, fd->CommandBuffer, true);
+
+  // The renderer now uses the same dimensions that ImGui will display.
+  renderer_begin_frame(handler, handler->current_frame_command_buffer);
+
+  // Begin the game's render pass: into the offscreen target, or straight into the window's image
+  // when the frame is nothing but the viewport and that has not to be read back.
+  handler->frame_into_window = false;
+  if (handler->offscreen_initialized && handler->offscreen_render_pass != VK_NULL_HANDLE && handler->offscreen_framebuffer != VK_NULL_HANDLE) {
+    const VkFramebuffer window_fb = handler->present_viewport_only && !handler->keep_viewport_offscreen
+                                        ? window_framebuffer(handler, wd->FrameIndex)
+                                        : VK_NULL_HANDLE;
+    handler->frame_into_window = window_fb != VK_NULL_HANDLE;
+    // A 2D game never tests the depth, so once it has its layout it is left as it is.
+    const bool keep_depth = handler->offscreen_depth_written && !game_is_3d(&handler->game_host);
+    // Depth clears to zero because the 3D path runs on a reversed range, where
+    // zero is the far plane. See renderer_camera3_view_proj.
+    VkClearValue clears[2] = {{.color = {.float32 = {handler->user_interface.bg_color[0], handler->user_interface.bg_color[1],
+                                                     handler->user_interface.bg_color[2], 1.0f}}},
+                              {.depthStencil = {.depth = 0.0f, .stencil = 0}}};
+    VkRenderPassBeginInfo rp_info = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                     .renderPass = handler->game_passes[handler->frame_into_window][keep_depth],
+                                     .framebuffer = handler->frame_into_window ? window_fb : handler->offscreen_framebuffer,
+                                     .renderArea = {{0, 0}, {handler->offscreen_width, handler->offscreen_height}},
+                                     .clearValueCount = 2,
+                                     .pClearValues = clears};
+    vkCmdBeginRenderPass(fd->CommandBuffer, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
+    handler->offscreen_depth_written = true;
+  }
+
+  return FRAME_OK;
+}
+
+// The viewport as the whole frame: the offscreen target's drawn corner copied
+// into the window's image, which ImGui otherwise covers with it as one quad.
+static void blit_viewport(gfx_handler_t *handler, VkCommandBuffer cmd, VkImage window_image) {
+  const ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  const VkImageSubresourceLayers layers = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  // Out of the layout the offscreen pass leaves for ImGui's sampler, and the
+  // window's image from whatever it was presented in.
+  VkImageMemoryBarrier to_copy[2] = {
+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+       .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+       .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .image = handler->offscreen_image,
+       .subresourceRange = range},
+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+       .srcAccessMask = 0,
+       .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .image = window_image,
+       .subresourceRange = range}};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, to_copy);
+
+  // (only the top-left viewport-sized corner of the target is drawn)
+  const int32_t width = handler->viewport[0] > 0.f && (uint32_t)handler->viewport[0] < handler->offscreen_width
+                            ? (int32_t)handler->viewport[0]
+                            : (int32_t)handler->offscreen_width;
+  const int32_t height = handler->viewport[1] > 0.f && (uint32_t)handler->viewport[1] < handler->offscreen_height
+                             ? (int32_t)handler->viewport[1]
+                             : (int32_t)handler->offscreen_height;
+  const VkImageBlit region = {.srcSubresource = layers,
+                              .srcOffsets = {{0, 0, 0}, {width, height, 1}},
+                              .dstSubresource = layers,
+                              .dstOffsets = {{0, 0, 0}, {wd->Width, wd->Height, 1}}};
+  vkCmdBlitImage(cmd, handler->offscreen_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, window_image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+
+  // Back for the next frame's pass, which must not draw over the target before
+  // this has read it, and the window's image on to the display.
+  VkImageMemoryBarrier after[2] = {to_copy[0], to_copy[1]};
+  after[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  after[0].dstAccessMask = 0;
+  after[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  after[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  after[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  after[1].dstAccessMask = 0;
+  after[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  after[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
+                       2, after);
+}
+
+bool gfx_end_frame(gfx_handler_t *handler) {
+  bool hovered = false;
+
+  if (handler->g_swap_chain_rebuild || window_state_get_attrib(handler->window, GLFW_ICONIFIED) != 0) {
+    // The image acquired for this frame is not presented, and only a new swapchain gives it back.
+    // (minimizing gets here: the window can be minimized by the events read after the acquire)
+    handler->g_swap_chain_rebuild = true;
+    // End the ImGui frame to avoid state issues, but don't render.
+    igEndFrame();
+    // We also need to end the render pass we started.
+    if (handler->current_frame_command_buffer != VK_NULL_HANDLE) {
+      // End any offscreen pass if open
+      if (handler->offscreen_initialized) {
+        vkCmdEndRenderPass(handler->current_frame_command_buffer);
+      }
+      vkEndCommandBuffer(handler->current_frame_command_buffer);
+      handler->current_frame_command_buffer = VK_NULL_HANDLE;
+    }
+    return hovered;
+  }
+
+  // Finish game rendering into offscreen target
+  if (handler->offscreen_initialized) {
+    renderer_end_frame(handler, handler->current_frame_command_buffer);
+    vkCmdEndRenderPass(handler->current_frame_command_buffer);
+  } else {
+    renderer_end_frame(handler, handler->current_frame_command_buffer);
+  }
+
+  // Hand the externally rendered images back in the layout their owner draws
+  // into, so the next frame starts from the same state this one assumed.
+  renderer_sync_external_textures(handler, handler->current_frame_command_buffer, false);
+
+  ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+  ImGui_ImplVulkanH_Frame *fd = &wd->Frames.Data[wd->FrameIndex];
+  const bool copy_viewport = !handler->frame_into_window && handler->present_viewport_only && g_swapchain_takes_transfers &&
+                             handler->offscreen_initialized;
+  if (handler->frame_into_window || copy_viewport) {
+    // ImGui keeps its clock and input, but draws nothing.
+    igEndFrame();
+    // (drawn straight into the window's image, the frame is already there)
+    if (copy_viewport) blit_viewport(handler, handler->current_frame_command_buffer, fd->Backbuffer);
+  } else {
+    // Begin swapchain render pass for ImGui
+    VkRenderPassBeginInfo rp_info = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                     .renderPass = wd->RenderPass,
+                                     .framebuffer = fd->Framebuffer,
+                                     .renderArea = {{0, 0}, {(uint32_t)wd->Width, (uint32_t)wd->Height}},
+                                     .clearValueCount = 1,
+                                     .pClearValues = &wd->ClearValue};
+    vkCmdBeginRenderPass(handler->current_frame_command_buffer, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    hovered = ui_render_late(&handler->user_interface);
+
+    igRender();
+    ImDrawData *draw_data = igGetDrawData();
+    ImGui_ImplVulkan_RenderDrawData(draw_data, handler->current_frame_command_buffer, VK_NULL_HANDLE);
+
+    // End swapchain render pass
+    vkCmdEndRenderPass(handler->current_frame_command_buffer);
+  }
+
+  // Retire resources only after enough complete submissions have passed for
+  // every swapchain image that could reference them.
+  renderer_lock();
+  for (uint32_t i = 0; i < handler->retire_count;) {
+    if (handler->frame_serial - handler->retire_textures[i].frame_serial >= 3) {
+      if (handler->retire_textures[i].sampler) vkDestroySampler(handler->g_device, handler->retire_textures[i].sampler, handler->g_allocator);
+      if (handler->retire_textures[i].image_view) vkDestroyImageView(handler->g_device, handler->retire_textures[i].image_view, handler->g_allocator);
+      if (handler->retire_textures[i].image) vkDestroyImage(handler->g_device, handler->retire_textures[i].image, handler->g_allocator);
+      if (handler->retire_textures[i].memory) vkFreeMemory(handler->g_device, handler->retire_textures[i].memory, handler->g_allocator);
+
+      handler->retire_textures[i] = handler->retire_textures[--handler->retire_count];
+      continue;
+    }
+    i++;
+  }
+  for (uint32_t i = 0; i < handler->retire_imgui_count;) {
+    if (handler->frame_serial - handler->retire_imgui_textures[i].frame_serial >= 3) {
+      ImGui_ImplVulkan_RemoveTexture(handler->retire_imgui_textures[i].descriptor_set);
+      handler->retire_imgui_textures[i] = handler->retire_imgui_textures[--handler->retire_imgui_count];
+      continue;
+    }
+    i++;
+  }
+  renderer_unlock();
+
+  // End the command buffer and submit like before.
+  VkResult err = vkEndCommandBuffer(handler->current_frame_command_buffer);
+  check_vk_result(err);
+  VkSemaphore image_acquired_semaphore = wd->FrameSemaphores.Data[wd->SemaphoreIndex].ImageAcquiredSemaphore;
+  VkSemaphore render_complete_semaphore = wd->FrameSemaphores.Data[wd->SemaphoreIndex].RenderCompleteSemaphore;
+
+  // (the window's image is first written by the copy, or else by ImGui's pass)
+  VkPipelineStageFlags wait_stage = copy_viewport ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                              .waitSemaphoreCount = 1,
+                              .pWaitSemaphores = &image_acquired_semaphore,
+                              .pWaitDstStageMask = &wait_stage,
+                              .commandBufferCount = 1,
+                              .pCommandBuffers = &handler->current_frame_command_buffer,
+                              .signalSemaphoreCount = 1,
+                              .pSignalSemaphores = &render_complete_semaphore};
+
+  err = vkResetFences(handler->g_device, 1, &fd->Fence);
+  check_vk_result(err);
+  err = vkQueueSubmit(handler->g_queue, 1, &submit_info, fd->Fence);
+  check_vk_result(err);
+  handler->slot_fences[handler->frame_slot] = fd->Fence;
+  handler->slot_serials[handler->frame_slot] = handler->frame_serial;
+
+  handler->current_frame_command_buffer = VK_NULL_HANDLE;
+  ImGuiIO *io = igGetIO_Nil();
+  if (io->ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+    igUpdatePlatformWindows();
+    igRenderPlatformWindowsDefault(NULL, NULL);
+  }
+  // Present
+  VkPresentInfoKHR present_info = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                   .waitSemaphoreCount = 1,
+                                   .pWaitSemaphores = &render_complete_semaphore,
+                                   .swapchainCount = 1,
+                                   .pSwapchains = &wd->Swapchain,
+                                   .pImageIndices = &wd->FrameIndex};
+  err = vkQueuePresentKHR(handler->g_queue, &present_info);
+  if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR) {
+    handler->g_swap_chain_rebuild = true;
+  } else {
+    check_vk_result(err);
+  }
+  wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->ImageCount;
+  handler->frame_serial++;
+  return hovered;
+}
+
+void gfx_retire_imgui_texture(gfx_handler_t *handler, uint64_t texture_id) {
+  if (!handler || !texture_id || g_is_headless) return;
+  renderer_lock();
+  if (handler->retire_imgui_count >= 256) {
+    renderer_unlock();
+    vkDeviceWaitIdle(handler->g_device);
+    renderer_lock();
+    for (uint32_t i = 0; i < handler->retire_imgui_count; ++i)
+      ImGui_ImplVulkan_RemoveTexture(handler->retire_imgui_textures[i].descriptor_set);
+    handler->retire_imgui_count = 0;
+  }
+  const uint32_t index = handler->retire_imgui_count++;
+  handler->retire_imgui_textures[index].descriptor_set = (VkDescriptorSet)texture_id;
+  handler->retire_imgui_textures[index].frame_serial = handler->frame_serial;
+  renderer_unlock();
+}
+
+void gfx_cleanup(gfx_handler_t *handler) {
+  if (!g_is_headless) {
+    VkResult err = vkDeviceWaitIdle(handler->g_device);
+    check_vk_result(err);
+  }
+
+  ui_cleanup(&handler->user_interface);
+
+  gh_level_destroy(&handler->game_host, handler->level);
+  handler->level = NULL;
+  game_host_shutdown(&handler->game_host);
+
+  if (!g_is_headless) {
+    for (uint32_t i = 0; i < handler->retire_count; ++i) {
+      if (handler->retire_textures[i].sampler)
+        vkDestroySampler(handler->g_device, handler->retire_textures[i].sampler, handler->g_allocator);
+      if (handler->retire_textures[i].image_view)
+        vkDestroyImageView(handler->g_device, handler->retire_textures[i].image_view, handler->g_allocator);
+      if (handler->retire_textures[i].image)
+        vkDestroyImage(handler->g_device, handler->retire_textures[i].image, handler->g_allocator);
+      if (handler->retire_textures[i].memory)
+        vkFreeMemory(handler->g_device, handler->retire_textures[i].memory, handler->g_allocator);
+    }
+    handler->retire_count = 0;
+    for (uint32_t i = 0; i < handler->retire_imgui_count; ++i)
+      ImGui_ImplVulkan_RemoveTexture(handler->retire_imgui_textures[i].descriptor_set);
+    handler->retire_imgui_count = 0;
+    renderer_cleanup(handler);
+    destroy_offscreen_resources(handler);
+    for (int into_window = 0; into_window < 2; ++into_window)
+      for (int keep_depth = 0; keep_depth < 2; ++keep_depth)
+        if (handler->game_passes[into_window][keep_depth] != VK_NULL_HANDLE) {
+          vkDestroyRenderPass(handler->g_device, handler->game_passes[into_window][keep_depth], handler->g_allocator);
+          handler->game_passes[into_window][keep_depth] = VK_NULL_HANDLE;
+        }
+    handler->offscreen_render_pass = VK_NULL_HANDLE;
+    if (handler->offscreen_sampler != VK_NULL_HANDLE) {
+      vkDestroySampler(handler->g_device, handler->offscreen_sampler, handler->g_allocator);
+      handler->offscreen_sampler = VK_NULL_HANDLE;
+    }
+    save_window_geometry(handler->window);
+    clear_glfw_callbacks(handler->window);
+    input_shutdown();
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+  }
+
+  igDestroyContext(NULL);
+
+  if (!g_is_headless) {
+    cleanup_vulkan_window(handler);
+    cleanup_vulkan(handler);
+    if (handler->window) glfwDestroyWindow(handler->window);
+    handler->window = NULL;
+    glfwTerminate();
+  }
+}
+
+// Publishes a freshly loaded level to the parts of the engine that need to know
+// how big it is, then lets the timeline rebuild its worlds on top of it.
+static void on_level_loaded(gfx_handler_t *handler) {
+  handler->renderer.camera.pos[0] = 0.5f;
+  handler->renderer.camera.pos[1] = 0.5f;
+
+  ft_level_info info;
+  if (gh_level_info(&handler->game_host, handler->level, &info) && info.bounds.w > 0.f && info.bounds.h > 0.f) {
+    engine_api_set_world_extent(handler, info.bounds.w, info.bounds.h);
+    // A 3D game's bounds describe its ground plane, so every 3D camera mode is
+    // sized from that plane: how far the orbit backs off, how wide the plan
+    // view is and how deep its slab reaches, how fast the freecam flies.
+    // Without this they all keep the shape they had for the previous level and
+    // the new one is somewhere off to one side.
+    if (game_is_3d(&handler->game_host)) {
+      const float span = fmaxf(info.bounds.w, info.bounds.h);
+      // The bounds are a ground plane, so the height to frame at is the one
+      // part of this the level does not supply: a fifth of the span puts the
+      // pivot above the surface without leaving the level.
+      vec3 center = {info.bounds.x + info.bounds.w * 0.5f, span * 0.2f, info.bounds.y + info.bounds.h * 0.5f};
+      renderer_camera3_frame_level(handler, center, span);
+      // (a near plane of the game's own, when it has one)
+      const float near_z = game_camera_near_z(&handler->game_host);
+      if (near_z > 0.f) handler->renderer.camera3.near_z = near_z;
+    }
+    snprintf(handler->user_interface.loaded_level_name, sizeof(handler->user_interface.loaded_level_name), "%s", info.name ? info.name : "level");
+  } else {
+    engine_api_set_world_extent(handler, 1.f, 1.f);
+  }
+
+  model_reset_groups_for_level(&handler->user_interface.timeline);
+}
+
+// Loading a bare level starts an untitled project. Only load_project() may
+// associate the active session with an existing .tasp path; otherwise Ctrl+S
+// must open Save As instead of reusing a file from the previous project.
+static void begin_untitled_project(ui_handler_t *ui) {
+  snippet_editor_reset();
+  undo_manager_cleanup(&ui->undo_manager);
+  undo_manager_init(&ui->undo_manager);
+  ui->current_project_path[0] = '\0';
+  ui->has_unsaved_changes = false;
+  ui->last_auto_save_time = 0.0;
+}
+
+// Everything the outgoing game owns has to go while its module is still there
+// to destroy it: worlds and levels are opaque module-owned objects, and the
+// incoming game would otherwise be handed foreign pointers on its first render
+// or simulation callback.
+static void release_active_game_state(gfx_handler_t *handler) {
+  ui_handler_t *ui = &handler->user_interface;
+  snippet_editor_reset();
+  undo_manager_cleanup(&ui->undo_manager);
+  undo_manager_init(&ui->undo_manager);
+  timeline_cleanup(&ui->timeline);
+  gh_level_destroy(&handler->game_host, handler->level);
+  handler->level = NULL;
+}
+
+// The other half: everything the editor keeps per game, rebuilt around the one
+// that has just become active. Its rendering resources are created here rather
+// than on activation, so a game is only made to build atlases and pipelines
+// once the editor has actually committed to running it.
+static bool adopt_active_game(gfx_handler_t *handler) {
+  ui_handler_t *ui = &handler->user_interface;
+  if (!gh_resources_create(&handler->game_host)) {
+    log_error(LOG_SOURCE, "The selected game could not create its rendering resources.");
+    game_host_deactivate(&handler->game_host);
+    timeline_init(ui);
+    return false;
+  }
+
+  timeline_init(ui);
+  camera_init(&handler->renderer.camera);
+  keybinds_bind_game(&ui->keybinds, &handler->game_host);
+  config_load(ui);
+  engine_api_set_world_extent(handler, 1.f, 1.f);
+
+  snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", "unnamed_level");
+  ui->loaded_level_path[0] = '\0';
+  ui->current_project_path[0] = '\0';
+  ui->has_unsaved_changes = false;
+  // Only a game the editor actually ran is worth coming back up under, which is
+  // why this is recorded here and not where the start screen offers the choice.
+  // (the game, not one of its backends: the start screen opens those)
+  snprintf(ui->preferred_game_id, sizeof(ui->preferred_game_id), "%s", game_host_settings_id(&handler->game_host));
+  config_save(ui);
+  plugin_manager_on_game_changed(&ui->plugin_manager);
+  return true;
+}
+
+bool gfx_activate_game(gfx_handler_t *handler, int game_index) {
+  if (!handler || game_index < 0 || game_index >= handler->game_host.count) return false;
+  game_host_browse_clear(&handler->game_host);
+  if (game_index == handler->game_host.active && game_host_ready(&handler->game_host)) return true;
+
+  release_active_game_state(handler);
+  if (!game_host_activate_index(&handler->game_host, game_index)) {
+    timeline_init(&handler->user_interface);
+    return false;
+  }
+  return adopt_active_game(handler);
+}
+
+// File/CLI/script loads use the running game, or the configured default when
+// nothing is running. Browsing another game has no influence on these callers.
+static bool ensure_active_game(gfx_handler_t *handler) {
+  if (!handler) return false;
+  if (game_host_ready(&handler->game_host)) return true;
+  const int index = startup_game_index(handler);
+  if (index < 0) {
+    log_error(LOG_SOURCE, "No game module is available to open this level.");
+    return false;
+  }
+  return gfx_activate_game(handler, index);
+}
+
+void on_level_load_path(gfx_handler_t *handler, const char *level_path) {
+  if (!level_path || !*level_path || !ensure_active_game(handler)) return;
+  ft_level *level = gh_level_load_path(&handler->game_host, level_path);
+  if (!level) {
+    log_error(LOG_SOURCE, "The active game could not load '%s'", level_path);
+    return;
+  }
+  ui_handler_t *ui = &handler->user_interface;
+  begin_untitled_project(ui);
+  timeline_cleanup(&ui->timeline);
+  gh_level_destroy(&handler->game_host, handler->level);
+  handler->level = level;
+  timeline_init(ui);
+  snprintf(ui->loaded_level_path, sizeof(ui->loaded_level_path), "%s", level_path);
+  log_info(LOG_SOURCE, "Loaded level '%s'", level_path);
+  on_level_loaded(handler);
+  ui_post_level_load(ui);
+}
+
+void on_level_load_memory(struct gfx_handler_t *handler, const unsigned char *level_buffer, size_t size,
+                          const char *name) {
+  if (!ensure_active_game(handler)) return;
+  ui_handler_t *ui = &handler->user_interface;
+  // The game names in-memory levels after whatever the editor currently calls
+  // its level, so the new name has to be in place before loading: otherwise the
+  // level is named after the map that was open before.
+  char previous_name[sizeof(ui->loaded_level_name)];
+  snprintf(previous_name, sizeof(previous_name), "%s", ui->loaded_level_name);
+  snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", name && *name ? name : "unnamed_level");
+  ft_level *level = gh_level_load_memory(&handler->game_host, level_buffer, size);
+  if (!level) {
+    snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", previous_name);
+    log_error(LOG_SOURCE, "The active game could not load the level from memory");
+    return;
+  }
+  begin_untitled_project(ui);
+  timeline_cleanup(&ui->timeline);
+  gh_level_destroy(&handler->game_host, handler->level);
+  handler->level = level;
+  timeline_init(ui);
+  ui->loaded_level_path[0] = '\0';
+  on_level_loaded(handler);
+  ui_post_level_load(ui);
+}
+
+bool gfx_replace_level(gfx_handler_t *handler, const unsigned char *level_buffer, size_t size, const char *name) {
+  if (!handler || !level_buffer || !size || !game_host_ready(&handler->game_host)) return false;
+  ui_handler_t *ui = &handler->user_interface;
+  // The game names in-memory levels after whatever the editor currently calls its level.
+  // Without a name the level must not inherit the one it replaces.
+  char previous_name[sizeof(ui->loaded_level_name)];
+  snprintf(previous_name, sizeof(previous_name), "%s", ui->loaded_level_name);
+  snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", name && *name ? name : "unnamed_level");
+  ft_level *level = gh_level_load_memory(&handler->game_host, level_buffer, size);
+  if (!level) {
+    snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", previous_name);
+    log_error(LOG_SOURCE, "The active game could not load the level from memory");
+    return false;
+  }
+  const float camera_x = handler->renderer.camera.pos[0], camera_y = handler->renderer.camera.pos[1];
+  gh_level_destroy(&handler->game_host, handler->level);
+  handler->level = level;
+  ui->loaded_level_path[0] = '\0';
+  on_level_loaded(handler);
+  if (name && *name) snprintf(ui->loaded_level_name, sizeof(ui->loaded_level_name), "%s", name);
+  // Every group keeps its tracks and snippets; only the worlds they run in are rebuilt.
+  for (int group = 0; group < ui->timeline.group_count; ++group)
+    model_rebuild_group_start(&ui->timeline, group);
+  handler->renderer.camera.pos[0] = camera_x;
+  handler->renderer.camera.pos[1] = camera_y;
+  return true;
+}
+
+// The main window's size, position and maximized state, kept across runs in
+// window.ini beside the config. Only the interactive editor reads or writes it:
+// a render worker, a hidden capture and --size all want the size they ask for.
+typedef struct {
+  bool valid;
+  int x, y, width, height;
+  bool has_pos;
+  bool maximized;
+} window_geometry_t;
+
+static window_geometry_t g_saved_geometry;
+
+static bool window_geometry_enabled(void) {
+  return !g_is_headless && !g_is_render_worker && !g_hide_render_window && getenv("FRAMETEE_WINDOW_SIZE") == NULL;
+}
+
+static bool window_geometry_path(char *out, size_t size) {
+  char dir[1024];
+  if (!fs_get_config_dir(dir, sizeof(dir))) return false;
+  const int needed = snprintf(out, size, "%s/window.ini", dir);
+  return needed >= 0 && (size_t)needed < size;
+}
+
+static void load_window_geometry(void) {
+  char path[1100];
+  if (!window_geometry_path(path, sizeof(path))) return;
+  FILE *fp = fs_open(path, "r");
+  if (!fp) return;
+  window_geometry_t g = {0};
+  char line[128];
+  int value;
+  while (fgets(line, sizeof(line), fp)) {
+    if (sscanf(line, "x=%d", &value) == 1) g.x = value, g.has_pos = true;
+    else if (sscanf(line, "y=%d", &value) == 1) g.y = value;
+    else if (sscanf(line, "width=%d", &value) == 1) g.width = value;
+    else if (sscanf(line, "height=%d", &value) == 1) g.height = value;
+    else if (sscanf(line, "maximized=%d", &value) == 1) g.maximized = value != 0;
+  }
+  fclose(fp);
+  g.valid = g.width >= 200 && g.height >= 150;
+  if (g.valid) g_saved_geometry = g;
+}
+
+// A position is only used while some monitor still shows the top of the
+// window, so a display unplugged since the last run cannot hide it.
+static bool window_position_visible(int x, int y) {
+  int count = 0;
+  GLFWmonitor **monitors = glfwGetMonitors(&count);
+  for (int i = 0; i < count; ++i) {
+    int mx, my, mw, mh;
+    glfwGetMonitorWorkarea(monitors[i], &mx, &my, &mw, &mh);
+    if (x + 100 > mx && x < mx + mw - 100 && y >= my - 10 && y < my + mh - 50) return true;
+  }
+  return false;
+}
+
+static bool window_position_supported(void) {
+#ifdef GLFW_PLATFORM_WAYLAND
+  // Wayland does not let a client place its own window.
+  return glfwGetPlatform() != GLFW_PLATFORM_WAYLAND;
+#else
+  return true;
+#endif
+}
+
+static void apply_window_geometry(GLFWwindow *window) {
+  const window_geometry_t *g = &g_saved_geometry;
+  // Set after creation rather than passed to glfwCreateWindow: with
+  // GLFW_SCALE_TO_MONITOR the size asked for there is scaled again, and the
+  // window would grow on every run on a scaled display.
+  glfwSetWindowSize(window, g->width, g->height);
+  if (g->has_pos && window_position_supported() && window_position_visible(g->x, g->y))
+    glfwSetWindowPos(window, g->x, g->y);
+  if (g->maximized) glfwMaximizeWindow(window);
+}
+
+static void save_window_geometry(GLFWwindow *window) {
+  if (!window || !window_geometry_enabled()) return;
+  window_geometry_t g = g_saved_geometry;
+  g.maximized = glfwGetWindowAttrib(window, GLFW_MAXIMIZED) != 0;
+  // A maximized or minimized window's size is not the one to come back to, so
+  // the last normal size is kept for when it is restored.
+  if (!g.maximized && !glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+    glfwGetWindowSize(window, &g.width, &g.height);
+    g.has_pos = window_position_supported();
+    if (g.has_pos) glfwGetWindowPos(window, &g.x, &g.y);
+  }
+  if (g.width < 200 || g.height < 150) return;
+
+  char dir[1024], path[1100];
+  if (!fs_get_config_dir(dir, sizeof(dir)) || !window_geometry_path(path, sizeof(path))) return;
+  fs_mkdir(dir);
+  FILE *fp = fs_open(path, "w");
+  if (!fp) return;
+  if (g.has_pos) fprintf(fp, "x=%d\ny=%d\n", g.x, g.y);
+  fprintf(fp, "width=%d\nheight=%d\nmaximized=%d\n", g.width, g.height, g.maximized ? 1 : 0);
+  fclose(fp);
+}
+
+#ifdef _WIN32
+// Only the GLFW with cmake/glfw's change to its Windows event loop defines this (without the change,
+// a mouse polling at 4-8 kHz stalls the editor). Read below, so a build with any other GLFW does
+// not link.
+extern const int frametee_glfw_win32_mouse_motion_patch;
+#endif
+
+// initialization and cleanup
+static int init_window(gfx_handler_t *handler) {
+  glfwSetErrorCallback(glfw_error_callback);
+  if (!glfwInit()) return 1;
+#ifdef _WIN32
+  if (!frametee_glfw_win32_mouse_motion_patch) log_warn("GLFW", "Built without its Windows event loop change.");
+#endif
+
+  glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+  glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+  if (window_geometry_enabled()) load_window_geometry();
+  // Kept hidden until the saved geometry is applied, so it does not jump.
+  if (g_is_render_worker || g_hide_render_window || g_saved_geometry.valid) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+
+  // A capture is only comparable against another one at the same size, and the
+  // window manager does not have to honour the size asked for here -- so
+  // --size pins it and the viewport, and with it the offscreen target that
+  // --screenshot reads.
+  int window_width = 1920, window_height = 1080;
+  const char *size = getenv("FRAMETEE_WINDOW_SIZE");
+  if (size != NULL) {
+    int w = 0, h = 0;
+    if (sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+      window_width = w;
+      window_height = h;
+    }
+  }
+  handler->window = glfwCreateWindow(window_width, window_height, "frametee", NULL, NULL);
+  if (!handler->window) {
+    glfwTerminate();
+    return 1;
+  }
+  if (g_saved_geometry.valid) {
+    apply_window_geometry(handler->window);
+    glfwShowWindow(handler->window);
+  }
+  if (!glfwVulkanSupported()) {
+    log_error("GLFW", "Vulkan is not supported on this system.");
+    log_vulkan_loader_diagnostics();
+    glfwDestroyWindow(handler->window);
+    glfwTerminate();
+    return 1;
+  }
+  return 0;
+}
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+// windows.h carries an ARRAYSIZE of its own; keep the signed one this file's
+// call sites are written against.
+#undef ARRAYSIZE
+#define ARRAYSIZE(_ARR) ((int)(sizeof(_ARR) / sizeof(*(_ARR))))
+#endif
+
+// glfwGetRequiredInstanceExtensions() returns NULL without raising a GLFW error
+// of its own, so this is the only place that failure can be explained. What it
+// looks for -- VK_KHR_surface plus the platform's surface extension -- is
+// contributed by the graphics driver (the ICD), not by the loader: a loader
+// with no driver behind it still loads and still enumerates successfully, which
+// is why glfwVulkanSupported() in init_window() passed, and reports only a
+// handful of debug and meta extensions with no window-system ones among them.
+// Print the list the loader actually gave and, on Windows, which vulkan-1.dll
+// produced it -- a copy sitting beside the executable shadows the one the
+// graphics driver installed in System32.
+static void log_vulkan_loader_diagnostics(void) {
+#ifdef _WIN32
+  HMODULE loader = GetModuleHandleA("vulkan-1.dll");
+  char loader_path[MAX_PATH];
+  if (loader != NULL && GetModuleFileNameA(loader, loader_path, (DWORD)sizeof(loader_path)) > 0) {
+    log_error("Vulkan", "Loader in use: %s", loader_path);
+  } else {
+    log_error("Vulkan", "Loader in use: the path of vulkan-1.dll could not be resolved.");
+  }
+#endif
+
+  uint32_t count = 0;
+  VkResult err = vkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+  if (err != VK_SUCCESS) {
+    log_error("Vulkan", "The loader could not count its instance extensions (VkResult %d).", (int)err);
+    return;
+  }
+
+  VkExtensionProperties *properties = calloc(count > 0 ? count : 1, sizeof(*properties));
+  if (properties == NULL) return;
+  if (count > 0) {
+    err = vkEnumerateInstanceExtensionProperties(NULL, &count, properties);
+    if (err != VK_SUCCESS) {
+      log_error("Vulkan", "The loader could not list its instance extensions (VkResult %d).", (int)err);
+      free(properties);
+      return;
+    }
+  }
+
+  // the same set GLFW itself accepts as a platform surface extension
+  static const char *const platform_surface_extensions[] = {
+      "VK_KHR_win32_surface",
+      "VK_KHR_xlib_surface",
+      "VK_KHR_xcb_surface",
+      "VK_KHR_wayland_surface",
+      "VK_EXT_metal_surface",
+      "VK_MVK_macos_surface",
+  };
+
+  bool has_surface = false;
+  bool has_platform_surface = false;
+  char list[2048];
+  size_t used = 0;
+  list[0] = '\0';
+  for (uint32_t i = 0; i < count; ++i) {
+    const char *name = properties[i].extensionName;
+    if (strcmp(name, "VK_KHR_surface") == 0) has_surface = true;
+    for (int j = 0; j < ARRAYSIZE(platform_surface_extensions); ++j) {
+      if (strcmp(name, platform_surface_extensions[j]) == 0) has_platform_surface = true;
+    }
+    if (used < sizeof(list)) {
+      int written = snprintf(list + used, sizeof(list) - used, "%s%s", used > 0 ? ", " : "", name);
+      if (written < 0 || (size_t)written >= sizeof(list) - used) {
+        used = sizeof(list);
+      } else {
+        used += (size_t)written;
+      }
+    }
+  }
+  free(properties);
+
+  log_error("Vulkan", "The loader reports %u instance extension%s (VK_KHR_surface: %s, platform surface extension: %s).", count,
+            count == 1 ? "" : "s", has_surface ? "present" : "missing", has_platform_surface ? "present" : "missing");
+  log_error("Vulkan", "Instance extensions: %s", count > 0 ? list : "none");
+  if (!has_surface || !has_platform_surface) {
+    log_error("Vulkan", "No Vulkan driver found: the surface extensions come from the graphics driver, so a loader that reports none has "
+                        "no usable driver behind it. Install or repair the GPU driver's Vulkan runtime, and if a vulkan-1.dll sits next to "
+                        "the executable try removing it so the system loader is used. Run with VK_LOADER_DEBUG=all to see which driver "
+                        "manifests the loader found.");
+  }
+}
+
+static int init_vulkan(gfx_handler_t *handler) {
+  uint32_t extensions_count = 0;
+  const char **glfw_extensions = glfwGetRequiredInstanceExtensions(&extensions_count);
+  if (glfw_extensions == NULL) {
+    log_error("Vulkan", "glfwGetRequiredInstanceExtensions failed: the loader exposes no window-system extensions.");
+    log_vulkan_loader_diagnostics();
+    return -1;
+  }
+
+  if (create_instance(handler, glfw_extensions, extensions_count) != VK_SUCCESS) {
+    return -1;
+  }
+
+  if (select_physical_device(handler) != 0) {
+    return -1;
+  }
+  create_logical_device(handler);
+  create_descriptor_pool(handler);
+
+  VkSurfaceKHR surface;
+  VkResult err = glfwCreateWindowSurface(handler->g_instance, handler->window, handler->g_allocator, &surface);
+  if (err != VK_SUCCESS) {
+    log_error("Vulkan", "glfwCreateWindowSurface failed (VkResult %d).", (int)err);
+    log_error("Vulkan", "On X11 this usually means DRI3 is disabled. See the instructions above.");
+    return -1;
+  }
+
+  int w, h;
+  glfwGetFramebufferSize(handler->window, &w, &h);
+  memset(&handler->g_main_window_data, 0, sizeof(handler->g_main_window_data));
+  ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+
+  // Background color
+  wd->ClearValue.color.float32[0] = 0.f;
+  wd->ClearValue.color.float32[1] = 0.f;
+  wd->ClearValue.color.float32[2] = 0.f;
+  wd->ClearValue.color.float32[3] = 1.0f;
+  wd->ClearEnable = true;
+
+  setup_window(handler, wd, surface, w, h);
+  return 0;
+}
+
+/*
+void ayu_dark(void) {
+  ImGuiStyle *style = igGetStyle();
+
+  // Base Colors
+  ImVec4 bg_main = hex_vec4("0A0E14", 1.0f);
+  ImVec4 bg_panel = hex_vec4("0F131A", 1.0f);
+  ImVec4 bg_line = hex_vec4("151A1F", 1.0f);
+
+  ImVec4 fg_text = hex_vec4("E6E1CF", 1.0f);
+  ImVec4 fg_inactive = hex_vec4("565B66", 1.0f);
+  ImVec4 shadow = hex_vec4("000000", 0.5f);
+
+  // Accent & Syntax
+  ImVec4 accent_yellow = hex_vec4("D61430", 1.0f);
+  ImVec4 accent_orange = hex_vec4("FF8F40", 1.0f);
+  ImVec4 accent_green = hex_vec4("AAD94C", 1.0f);
+  ImVec4 accent_blue = hex_vec4("39BAE6", 1.0f);
+
+  // Style Metrics
+  style->WindowPadding = (ImVec2){8, 8};
+  style->FramePadding = (ImVec2){6, 4};
+  style->ItemSpacing = (ImVec2){8, 4};
+  style->ScrollbarSize = 14;
+  style->GrabMinSize = 20;
+
+  style->WindowRounding = 10;
+  style->FrameRounding = 10;
+  style->TabRounding = 10;
+  style->ScrollbarRounding = 6;
+
+  ImVec4 *colors = style->Colors;
+
+  // Text
+  colors[ImGuiCol_Text] = fg_text;
+  colors[ImGuiCol_TextDisabled] = fg_inactive;
+
+  // Backgrounds
+  colors[ImGuiCol_WindowBg] = bg_main;
+  colors[ImGuiCol_ChildBg] = bg_panel;
+  colors[ImGuiCol_PopupBg] = bg_panel;
+  colors[ImGuiCol_Border] = bg_line;
+  colors[ImGuiCol_BorderShadow] = shadow;
+
+  // Frames & widgets
+  colors[ImGuiCol_FrameBg] = bg_line;
+  colors[ImGuiCol_FrameBgHovered] = hex_vec4("475266", 0.25f);
+  colors[ImGuiCol_FrameBgActive] = accent_yellow;
+
+  // Titles
+  colors[ImGuiCol_TitleBg] = bg_panel;
+  colors[ImGuiCol_TitleBgActive] = bg_panel;
+  colors[ImGuiCol_TitleBgCollapsed] = bg_main;
+
+  // Scrollbar
+  colors[ImGuiCol_ScrollbarBg] = hex_vec4("0F131A", 0.8f);
+  colors[ImGuiCol_ScrollbarGrab] = fg_inactive;
+  colors[ImGuiCol_ScrollbarGrabHovered] = accent_yellow;
+  colors[ImGuiCol_ScrollbarGrabActive] = accent_orange;
+
+  // Buttons
+  colors[ImGuiCol_Button] = hex_vec4("D4652F", 1.0f);
+  colors[ImGuiCol_ButtonHovered] = hex_vec4("E67D4A", 1.0f);
+  colors[ImGuiCol_ButtonActive] = hex_vec4("C25A29", 1.0f);
+
+  // Tabs
+  colors[ImGuiCol_Tab] = bg_line;
+  colors[ImGuiCol_TabHovered] = accent_blue;
+  colors[ImGuiCol_TabSelected] = bg_panel;
+  colors[ImGuiCol_TabDimmed] = bg_line;
+  colors[ImGuiCol_TabDimmedSelected] = bg_panel;
+
+  // Selections
+  colors[ImGuiCol_Header] = hex_vec4("409FFF", 0.15f);
+  colors[ImGuiCol_HeaderHovered] = hex_vec4("409FFF", 0.25f);
+  colors[ImGuiCol_HeaderActive] = hex_vec4("FF6F40", 1.0f);
+
+  colors[ImGuiCol_TextSelectedBg] = hex_vec4("409FFF", 0.35f);
+
+  // Special
+  colors[ImGuiCol_CheckMark] = accent_green;
+  colors[ImGuiCol_SliderGrab] = accent_yellow;
+  colors[ImGuiCol_SliderGrabActive] = accent_orange;
+
+  colors[ImGuiCol_PlotLines] = accent_blue;
+  colors[ImGuiCol_PlotHistogram] = accent_green;
+
+  // Navigation highlight
+  colors[ImGuiCol_NavCursor] = accent_yellow;
+  colors[ImGuiCol_NavWindowingHighlight] = accent_yellow;
+  colors[ImGuiCol_ModalWindowDimBg] = shadow;
+}
+*/
+
+// How much larger than the automatic size the user wants the interface, 1 for as worked out.
+static float g_ui_size = 1.f;
+
+float gfx_get_auto_ui_scale(void) {
+  extern bool g_is_headless;
+  if (g_is_headless) return 1.0f;
+
+  static float dpi = -1.f;
+  if (dpi != -1.f)
+    return dpi;
+#define UI_DIV 5.0
+  GLFWmonitor *mon = glfwGetPrimaryMonitor();
+  // There is no primary monitor when GLFW enumerates none: a headless X
+  // server, a stripped build without RandR. Scaling is guesswork then, so take
+  // 1.0 rather than dereferencing NULL inside GLFW.
+  if (!mon) {
+    dpi = 1.f;
+    return dpi;
+  }
+  int width_mm, height_mm;
+  glfwGetMonitorPhysicalSize(mon, &width_mm, &height_mm);
+  float dia_inch = sqrtf(width_mm * width_mm + height_mm * height_mm) * UI_DIV;
+  int p0, p1;
+  int width_px, height_px;
+  glfwGetMonitorWorkarea(mon, &p0, &p1, &width_px, &height_px);
+  float dia_px = sqrtf(width_px * width_px + height_px * height_px);
+  dpi = dia_px / dia_inch;
+  // A monitor that reports no physical size (some projectors and virtual displays) gives no
+  // answer at all; the user's size is what sets it then.
+  if (!isfinite(dpi) || dpi <= 0.f) dpi = 1.f;
+  return dpi;
+}
+
+float gfx_get_ui_scale(void) {
+  extern bool g_is_headless;
+  if (g_is_headless) return 1.0f;
+  return gfx_get_auto_ui_scale() * g_ui_size;
+}
+
+float gfx_get_ui_size(void) { return g_ui_size; }
+
+void gfx_set_ui_size(float size) {
+  if (!isfinite(size)) return;
+  g_ui_size = size < GFX_UI_SIZE_MIN ? GFX_UI_SIZE_MIN : size > GFX_UI_SIZE_MAX ? GFX_UI_SIZE_MAX : size;
+}
+
+static int init_imgui(gfx_handler_t *handler) {
+  ImGuiIO *io = igGetIO_Nil();
+  io->ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  // The layout lives with the config rather than wherever the editor was
+  // started from. ImGui keeps the pointer, so the path must outlive the context.
+  // A render worker or a hidden capture keeps no layout, so it neither picks up
+  // the user's nor writes over it.
+  static char ini_path[1100];
+  char config_dir[1024];
+  if (g_is_render_worker || g_hide_render_window) {
+    io->IniFilename = NULL;
+  } else if (fs_get_config_dir(config_dir, sizeof(config_dir))) {
+    fs_mkdir(config_dir);
+    snprintf(ini_path, sizeof(ini_path), "%s/imgui.ini", config_dir);
+    io->IniFilename = ini_path;
+  }
+  // io->ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+  io->ConfigDpiScaleFonts = true;
+  io->ConfigDpiScaleViewports = true;
+  io->ConfigWindowsMoveFromTitleBarOnly = true;
+  // Set per frame in gfx_begin_frame(); see imgui_queue_needs_trickling().
+  io->ConfigInputTrickleEventQueue = true;
+
+  // The backend installs no callbacks of its own: every GLFW event goes to the callbacks above,
+  // which pass it on to the backend once they have put the mouse position in front of it. That keeps
+  // one path from the window to imgui, and the whole set has to be installed here, since anything
+  // left out is an event imgui stops receiving.
+  ImGui_ImplGlfw_InitForVulkan((void *)handler->window, false);
+  window_state_init(handler->window);
+  glfwSetWindowSizeCallback(handler->window, window_size_callback);
+  glfwSetFramebufferSizeCallback(handler->window, framebuffer_size_callback);
+  glfwSetWindowIconifyCallback(handler->window, window_iconify_callback);
+  glfwSetCursorPosCallback(handler->window, cursor_position_callback);
+  glfwSetCursorEnterCallback(handler->window, cursor_enter_callback);
+  glfwSetMouseButtonCallback(handler->window, mouse_button_callback);
+  glfwSetScrollCallback(handler->window, scroll_callback);
+  glfwSetKeyCallback(handler->window, key_callback);
+  glfwSetCharCallback(handler->window, char_callback);
+  glfwSetWindowFocusCallback(handler->window, window_focus_callback);
+  ImGui_ImplVulkan_InitInfo init_info = {.Instance = handler->g_instance,
+                                         .PhysicalDevice = handler->g_physical_device,
+                                         .Device = handler->g_device,
+                                         .QueueFamily = handler->g_queue_family,
+                                         .Queue = handler->g_queue,
+                                         .PipelineCache = handler->g_pipeline_cache,
+                                         .DescriptorPool = handler->g_descriptor_pool,
+                                         .PipelineInfoMain = {
+                                             .RenderPass = handler->g_main_window_data.RenderPass,
+                                             .Subpass = 0,
+                                             .MSAASamples = VK_SAMPLE_COUNT_1_BIT},
+                                         .MinImageCount = handler->g_min_image_count,
+                                         .ImageCount = handler->g_main_window_data.ImageCount,
+                                         .Allocator = handler->g_allocator,
+                                         .CheckVkResultFn = check_vk_result};
+  ImGui_ImplVulkan_Init(&init_info);
+  return 0;
+}
+
+static void cleanup_vulkan(gfx_handler_t *handler) {
+  if (handler->g_descriptor_pool != VK_NULL_HANDLE) {
+    vkDestroyDescriptorPool(handler->g_device, handler->g_descriptor_pool, handler->g_allocator);
+    handler->g_descriptor_pool = VK_NULL_HANDLE;
+  }
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+  PFN_vkDestroyDebugReportCallbackEXT f_vkDestroyDebugReportCallbackEXT =
+      (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(handler->g_instance, "vkDestroyDebugReportCallbackEXT");
+  if (f_vkDestroyDebugReportCallbackEXT && handler->g_debug_report != VK_NULL_HANDLE) {
+    f_vkDestroyDebugReportCallbackEXT(handler->g_instance, handler->g_debug_report, handler->g_allocator);
+    handler->g_debug_report = VK_NULL_HANDLE;
+  }
+  PFN_vkDestroyDebugUtilsMessengerEXT f_vkDestroyDebugUtilsMessengerEXT =
+      (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(handler->g_instance, "vkDestroyDebugUtilsMessengerEXT");
+  if (f_vkDestroyDebugUtilsMessengerEXT && handler->g_debug_messenger != VK_NULL_HANDLE) {
+    f_vkDestroyDebugUtilsMessengerEXT(handler->g_instance, handler->g_debug_messenger, handler->g_allocator);
+    handler->g_debug_messenger = VK_NULL_HANDLE;
+  }
+#endif
+  if (handler->g_device != VK_NULL_HANDLE) {
+    vkDestroyDevice(handler->g_device, handler->g_allocator);
+    handler->g_device = VK_NULL_HANDLE;
+  }
+  if (handler->g_instance != VK_NULL_HANDLE) {
+    vkDestroyInstance(handler->g_instance, handler->g_allocator);
+    handler->g_instance = VK_NULL_HANDLE;
+  }
+}
+
+static void cleanup_vulkan_window(gfx_handler_t *handler) {
+  ImGui_ImplVulkanH_DestroyWindow(handler->g_instance, handler->g_device, &handler->g_main_window_data, handler->g_allocator);
+}
+
+// offscreen resource helpers
+// One of the passes the game draws into (see game_passes). They differ only in
+// what happens to the images at either end, which leaves them compatible.
+static bool create_game_pass(gfx_handler_t *handler, VkFormat format, bool into_window, bool keep_depth, VkRenderPass *out) {
+  VkAttachmentDescription attachments[2] = {
+      {
+          .format = format,
+          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          // ready for ImGui to sample, or to be shown
+          .finalLayout = into_window ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      },
+      {
+          .format = handler->offscreen_depth_format,
+          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = keep_depth ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR,
+          .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          // Kept, the depth stays in its layout: coming from UNDEFINED, the driver would set it up again
+          // every frame. Intel's, at least, can only fast-clear depth to 1, not to the 0 a 3D game needs.
+          .initialLayout = keep_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+          .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      }};
+  VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference depth_ref = {.attachment = 1, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription subpass = {
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &color_ref,
+      .pDepthStencilAttachment = &depth_ref,
+  };
+  // The offscreen colour and the depth are the same images every frame, and with
+  // frames in flight the previous frame may still be drawing into them: its writes
+  // come first. (Its reads, ImGui sampling the viewport, end before colour output,
+  // which the stage mask takes in with every stage before it.)
+  VkSubpassDependency dependency = {
+      .srcSubpass = VK_SUBPASS_EXTERNAL,
+      .dstSubpass = 0,
+      .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .dependencyFlags = 0,
+  };
+  VkRenderPassCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+      .attachmentCount = 2,
+      .pAttachments = attachments,
+      .subpassCount = 1,
+      .pSubpasses = &subpass,
+      .dependencyCount = 1,
+      .pDependencies = &dependency,
+  };
+  VkResult err = vkCreateRenderPass(handler->g_device, &info, handler->g_allocator, out);
+  if (err != VK_SUCCESS) {
+    log_error(LOG_SOURCE, "Failed to create a game render pass (%d)", err);
+    *out = VK_NULL_HANDLE;
+    return false;
+  }
+  return true;
+}
+
+// Only once nothing in flight uses them: after a wait for the device.
+static void destroy_window_framebuffers(gfx_handler_t *handler) {
+  for (uint32_t i = 0; i < handler->window_framebuffer_count; ++i)
+    vkDestroyFramebuffer(handler->g_device, handler->window_framebuffers[i], handler->g_allocator);
+  handler->window_framebuffer_count = 0;
+}
+
+// The window's image `index` as the target of the game's passes, where the
+// viewport fills the window exactly; otherwise none, and the frame goes through
+// the offscreen target. Made for the swapchain and depth there are now, and
+// dropped whenever either is made anew.
+static VkFramebuffer window_framebuffer(gfx_handler_t *handler, uint32_t index) {
+  ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+  if (handler->offscreen_width != (uint32_t)wd->Width || handler->offscreen_height != (uint32_t)wd->Height ||
+      (uint32_t)wd->ImageCount > ARRAYSIZE(handler->window_framebuffers) || index >= (uint32_t)wd->ImageCount)
+    return VK_NULL_HANDLE;
+  if (handler->window_framebuffer_count == 0) {
+    for (uint32_t i = 0; i < (uint32_t)wd->ImageCount; ++i) {
+      VkImageView attachments[2] = {wd->Frames.Data[i].BackbufferView, handler->offscreen_depth_view};
+      VkFramebufferCreateInfo info = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                      .renderPass = handler->game_passes[1][0],
+                                      .attachmentCount = 2,
+                                      .pAttachments = attachments,
+                                      .width = (uint32_t)wd->Width,
+                                      .height = (uint32_t)wd->Height,
+                                      .layers = 1};
+      if (vkCreateFramebuffer(handler->g_device, &info, handler->g_allocator, &handler->window_framebuffers[i]) != VK_SUCCESS) {
+        destroy_window_framebuffers(handler);
+        return VK_NULL_HANDLE;
+      }
+      handler->window_framebuffer_count = i + 1;
+    }
+  }
+  return handler->window_framebuffers[index];
+}
+
+static int init_offscreen_resources(gfx_handler_t *handler, uint32_t width, uint32_t height) {
+  if (width == 0 || height == 0) {
+    return 1;
+  }
+
+  // destroy previous if any
+  destroy_offscreen_resources(handler);
+
+  handler->offscreen_width = width;
+  handler->offscreen_height = height;
+
+  // Match swapchain format to keep pipelines compatible
+  VkFormat format = handler->g_main_window_data.SurfaceFormat.format;
+
+  // create image (color attachment + sampled)
+  // TRANSFER_SRC so the viewport can be read back to a file. That is what
+  // --screenshot uses: the offscreen image is the viewport and nothing else,
+  // so a capture of it carries no editor chrome.
+  create_image(handler, width, height, 1, 1, format, VK_IMAGE_TILING_OPTIMAL,
+               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &handler->offscreen_image, &handler->offscreen_memory);
+
+  // create image view
+  handler->offscreen_image_view = create_image_view(handler, handler->offscreen_image, format, VK_IMAGE_VIEW_TYPE_2D, 1, 1);
+
+  // create sampler
+  if (handler->offscreen_sampler == VK_NULL_HANDLE) {
+    handler->offscreen_sampler = create_texture_sampler(handler, 1, VK_FILTER_LINEAR);
+  }
+
+  // The passes the game draws into, made once: their formats never change.
+  if (handler->offscreen_render_pass == VK_NULL_HANDLE) {
+    handler->offscreen_depth_format = VK_FORMAT_D32_SFLOAT;
+    for (int into_window = 0; into_window < 2; ++into_window)
+      for (int keep_depth = 0; keep_depth < 2; ++keep_depth)
+        if (!create_game_pass(handler, format, into_window, keep_depth, &handler->game_passes[into_window][keep_depth])) return 1;
+    handler->offscreen_render_pass = handler->game_passes[0][0];
+  }
+
+  // Depth image for that attachment, matching the colour target's extent.
+  create_image(handler, handler->offscreen_width, handler->offscreen_height, 1, 1, handler->offscreen_depth_format,
+               VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+               &handler->offscreen_depth_image, &handler->offscreen_depth_memory);
+  handler->offscreen_depth_view =
+      create_image_view_aspect(handler, handler->offscreen_depth_image, handler->offscreen_depth_format, VK_IMAGE_VIEW_TYPE_2D, 1, 1,
+                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+  handler->offscreen_depth_written = false;
+
+  // Create framebuffer
+  VkImageView attachments[2];
+  attachments[0] = handler->offscreen_image_view;
+  attachments[1] = handler->offscreen_depth_view;
+
+  VkFramebufferCreateInfo fb_info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = handler->offscreen_render_pass,
+      .attachmentCount = 2,
+      .pAttachments = attachments,
+      .width = width,
+      .height = height,
+      .layers = 1,
+  };
+
+  VkResult err = vkCreateFramebuffer(handler->g_device, &fb_info, handler->g_allocator, &handler->offscreen_framebuffer);
+  if (err != VK_SUCCESS) {
+    log_error(LOG_SOURCE, "Failed to create offscreen framebuffer (%d)", err);
+    return 1;
+  }
+
+  // Add ImGui texture handle from sampler + image view
+  // ImGui_ImplVulkan_AddTexture returns an ImTextureID (void*).
+
+  ImTextureID id =
+      (ImTextureID)ImGui_ImplVulkan_AddTexture(handler->offscreen_sampler, handler->offscreen_image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  handler->offscreen_texture = ImTextureRef_ImTextureRef_TextureID(id);
+  handler->offscreen_initialized = true;
+  // log_info(LOG_SOURCE,"Offscreen resources created: %ux%u", width, height);
+  return 0;
+}
+
+static void destroy_offscreen_resources(gfx_handler_t *handler) {
+  if (!handler->offscreen_initialized) return;
+  destroy_window_framebuffers(handler);
+
+  // Note: ImGui_ImplVulkan does not provide an explicit remove for a texture id, but the descriptor set
+  // allocated by AddTexture will be freed when the descriptor pool is destroyed / ImGui shuts down.
+  // To avoid leaking descriptors across re-creation, we simply destroy the Vulkan objects here.
+  if (handler->offscreen_framebuffer != VK_NULL_HANDLE) {
+    vkDestroyFramebuffer(handler->g_device, handler->offscreen_framebuffer, handler->g_allocator);
+    handler->offscreen_framebuffer = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_depth_view != VK_NULL_HANDLE) {
+    vkDestroyImageView(handler->g_device, handler->offscreen_depth_view, handler->g_allocator);
+    handler->offscreen_depth_view = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_depth_image != VK_NULL_HANDLE) {
+    vkDestroyImage(handler->g_device, handler->offscreen_depth_image, handler->g_allocator);
+    handler->offscreen_depth_image = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_depth_memory != VK_NULL_HANDLE) {
+    vkFreeMemory(handler->g_device, handler->offscreen_depth_memory, handler->g_allocator);
+    handler->offscreen_depth_memory = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_image_view != VK_NULL_HANDLE) {
+    vkDestroyImageView(handler->g_device, handler->offscreen_image_view, handler->g_allocator);
+    handler->offscreen_image_view = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_image != VK_NULL_HANDLE) {
+    vkDestroyImage(handler->g_device, handler->offscreen_image, handler->g_allocator);
+    handler->offscreen_image = VK_NULL_HANDLE;
+  }
+  if (handler->offscreen_memory != VK_NULL_HANDLE) {
+    vkFreeMemory(handler->g_device, handler->offscreen_memory, handler->g_allocator);
+    handler->offscreen_memory = VK_NULL_HANDLE;
+  }
+
+  destroy_imgui_texture_ref(&handler->offscreen_texture);
+  handler->offscreen_initialized = false;
+  handler->offscreen_width = 0;
+  handler->offscreen_height = 0;
+  // log_info(LOG_SOURCE, "Offscreen resources destroyed");
+}
+
+static int recreate_offscreen_if_needed(gfx_handler_t *handler, uint32_t width, uint32_t height) {
+  if (!handler->offscreen_initialized) return init_offscreen_resources(handler, width, height);
+
+  if (handler->offscreen_width != width || handler->offscreen_height != height) {
+    // recreate
+    destroy_offscreen_resources(handler);
+    return init_offscreen_resources(handler, width, height);
+  }
+  return 0;
+}
+
+static uint32_t export_memory_type(gfx_handler_t *h, uint32_t bits, VkMemoryPropertyFlags flags) {
+  VkPhysicalDeviceMemoryProperties properties;
+  vkGetPhysicalDeviceMemoryProperties(h->g_physical_device, &properties);
+  for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+    if ((bits & (1u << i)) && (properties.memoryTypes[i].propertyFlags & flags) == flags) return i;
+  return UINT32_MAX;
+}
+
+static void destroy_export_resources(gfx_handler_t *h) {
+  if (!h || h->g_device == VK_NULL_HANDLE) return;
+  if (h->export_framebuffer) vkDestroyFramebuffer(h->g_device, h->export_framebuffer, h->g_allocator);
+  if (h->export_view) vkDestroyImageView(h->g_device, h->export_view, h->g_allocator);
+  if (h->export_depth_view) vkDestroyImageView(h->g_device, h->export_depth_view, h->g_allocator);
+  if (h->export_image) vkDestroyImage(h->g_device, h->export_image, h->g_allocator);
+  if (h->export_depth_image) vkDestroyImage(h->g_device, h->export_depth_image, h->g_allocator);
+  if (h->export_memory) vkFreeMemory(h->g_device, h->export_memory, h->g_allocator);
+  if (h->export_depth_memory) vkFreeMemory(h->g_device, h->export_depth_memory, h->g_allocator);
+  if (h->export_readback) vkDestroyBuffer(h->g_device, h->export_readback, h->g_allocator);
+  if (h->export_readback_mapped) vkUnmapMemory(h->g_device, h->export_readback_memory);
+  if (h->export_readback_memory) vkFreeMemory(h->g_device, h->export_readback_memory, h->g_allocator);
+  if (h->export_command_pool) vkDestroyCommandPool(h->g_device, h->export_command_pool, h->g_allocator);
+  h->export_framebuffer = VK_NULL_HANDLE;
+  h->export_view = h->export_depth_view = VK_NULL_HANDLE;
+  h->export_image = h->export_depth_image = VK_NULL_HANDLE;
+  h->export_memory = h->export_depth_memory = VK_NULL_HANDLE;
+  h->export_readback = VK_NULL_HANDLE;
+  h->export_readback_memory = VK_NULL_HANDLE;
+  h->export_readback_mapped = NULL;
+  h->export_command_pool = VK_NULL_HANDLE;
+  h->export_command_buffer = VK_NULL_HANDLE;
+  h->export_width = h->export_height = 0;
+}
+
+static bool init_export_resources(gfx_handler_t *h, uint32_t width, uint32_t height) {
+  if (h->export_width == width && h->export_height == height && h->export_framebuffer) return true;
+  vkQueueWaitIdle(h->g_queue);
+  destroy_export_resources(h);
+  VkPhysicalDeviceProperties device;
+  vkGetPhysicalDeviceProperties(h->g_physical_device, &device);
+  if (!width || !height || width > device.limits.maxImageDimension2D || height > device.limits.maxImageDimension2D ||
+      (uint64_t)width * height > SIZE_MAX / 4u) return false;
+
+  const VkFormat format = h->g_main_window_data.SurfaceFormat.format;
+  if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB &&
+      format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_B8G8R8A8_SRGB) return false;
+  create_image(h, width, height, 1, 1, format, VK_IMAGE_TILING_OPTIMAL,
+               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &h->export_image, &h->export_memory);
+  h->export_view = create_image_view(h, h->export_image, format, VK_IMAGE_VIEW_TYPE_2D, 1, 1);
+  create_image(h, width, height, 1, 1, h->offscreen_depth_format, VK_IMAGE_TILING_OPTIMAL,
+               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+               &h->export_depth_image, &h->export_depth_memory);
+  h->export_depth_view = create_image_view_aspect(h, h->export_depth_image, h->offscreen_depth_format,
+                                                   VK_IMAGE_VIEW_TYPE_2D, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
+  VkImageView attachments[2] = {h->export_view, h->export_depth_view};
+  VkFramebufferCreateInfo fb = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                 .renderPass = h->offscreen_render_pass, .attachmentCount = 2,
+                                 .pAttachments = attachments, .width = width, .height = height, .layers = 1};
+  if (vkCreateFramebuffer(h->g_device, &fb, h->g_allocator, &h->export_framebuffer) != VK_SUCCESS) goto failed;
+
+  VkBufferCreateInfo buffer = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                .size = (VkDeviceSize)width * height * 4u,
+                                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+  if (vkCreateBuffer(h->g_device, &buffer, h->g_allocator, &h->export_readback) != VK_SUCCESS) goto failed;
+  VkMemoryRequirements requirements;
+  vkGetBufferMemoryRequirements(h->g_device, h->export_readback, &requirements);
+  // The CPU reads every frame back: uncached (write-combined) memory makes
+  // that copy many times slower, so prefer a cached type.
+  uint32_t memory_type = export_memory_type(h, requirements.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  if (memory_type == UINT32_MAX)
+    memory_type = export_memory_type(h, requirements.memoryTypeBits,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (memory_type == UINT32_MAX) goto failed;
+  VkPhysicalDeviceMemoryProperties memory_properties;
+  vkGetPhysicalDeviceMemoryProperties(h->g_physical_device, &memory_properties);
+  h->export_readback_coherent =
+      memory_properties.memoryTypes[memory_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  VkMemoryAllocateInfo allocation = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                      .allocationSize = requirements.size, .memoryTypeIndex = memory_type};
+  if (vkAllocateMemory(h->g_device, &allocation, h->g_allocator, &h->export_readback_memory) != VK_SUCCESS ||
+      vkBindBufferMemory(h->g_device, h->export_readback, h->export_readback_memory, 0) != VK_SUCCESS ||
+      vkMapMemory(h->g_device, h->export_readback_memory, 0, VK_WHOLE_SIZE, 0, &h->export_readback_mapped) !=
+          VK_SUCCESS) goto failed;
+
+  VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                  .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                  .queueFamilyIndex = h->g_queue_family};
+  if (vkCreateCommandPool(h->g_device, &pool, h->g_allocator, &h->export_command_pool) != VK_SUCCESS) goto failed;
+  VkCommandBufferAllocateInfo command = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                          .commandPool = h->export_command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                          .commandBufferCount = 1};
+  if (vkAllocateCommandBuffers(h->g_device, &command, &h->export_command_buffer) != VK_SUCCESS) goto failed;
+  h->export_width = width;
+  h->export_height = height;
+  return true;
+failed:
+  destroy_export_resources(h);
+  return false;
+}
+
+bool gfx_render_export_frame(gfx_handler_t *h, uint32_t width, uint32_t height,
+                             void (*draw)(gfx_handler_t *, float), float alpha, uint8_t *pixels) {
+  if (!h || !draw || !pixels || !h->offscreen_render_pass || !init_export_resources(h, width, height)) return false;
+  // The preview submitted immediately before this call may still use shared
+  // dynamic buffers and descriptor pools. Complete it before resetting them.
+  if (vkQueueWaitIdle(h->g_queue) != VK_SUCCESS ||
+      vkResetCommandPool(h->g_device, h->export_command_pool, 0) != VK_SUCCESS) return false;
+  renderer_frames_completed(h, UINT64_MAX);
+  const VkCommandBuffer cmd = h->export_command_buffer;
+  VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+  if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
+  vec2 old_viewport = {h->viewport[0], h->viewport[1]};
+  h->viewport[0] = (float)width;
+  h->viewport[1] = (float)height;
+  h->current_frame_command_buffer = cmd;
+  renderer_sync_external_textures(h, cmd, true);
+  renderer_begin_frame(h, cmd);
+  VkClearValue clear[2] = {{.color = {.float32 = {h->user_interface.bg_color[0], h->user_interface.bg_color[1],
+                                                   h->user_interface.bg_color[2], 1.f}}},
+                            {.depthStencil = {.depth = 0.f, .stencil = 0}}};
+  VkRenderPassBeginInfo pass = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                .renderPass = h->offscreen_render_pass, .framebuffer = h->export_framebuffer,
+                                .renderArea = {{0, 0}, {width, height}}, .clearValueCount = 2, .pClearValues = clear};
+  vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+  draw(h, alpha);
+  renderer_flush_queue(h, cmd);
+  renderer_end_frame(h, cmd);
+  vkCmdEndRenderPass(cmd);
+  renderer_sync_external_textures(h, cmd, false);
+  VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                   .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = h->export_image,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       0, 0, NULL, 0, NULL, 1, &barrier);
+  VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            .imageExtent = {width, height, 1}};
+  vkCmdCopyImageToBuffer(cmd, h->export_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, h->export_readback, 1, &copy);
+  h->current_frame_command_buffer = VK_NULL_HANDLE;
+  h->viewport[0] = old_viewport[0];
+  h->viewport[1] = old_viewport[1];
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+  VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+  if (vkQueueSubmit(h->g_queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS || vkQueueWaitIdle(h->g_queue) != VK_SUCCESS)
+    return false;
+  if (!h->export_readback_coherent) {
+    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                 .memory = h->export_readback_memory, .size = VK_WHOLE_SIZE};
+    if (vkInvalidateMappedMemoryRanges(h->g_device, 1, &range) != VK_SUCCESS) return false;
+  }
+  memcpy(pixels, h->export_readback_mapped, (size_t)width * height * 4u);
+  h->frame_serial++;
+  return true;
+}
+
+bool gfx_export_is_bgra(const gfx_handler_t *h) {
+  const VkFormat format = h->g_main_window_data.SurfaceFormat.format;
+  return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+// vulkan setup helpers
+static bool is_extension_available(const VkExtensionProperties *properties, uint32_t properties_count, const char *extension) {
+  for (uint32_t i = 0; i < properties_count; i++) {
+    if (strcmp(properties[i].extensionName, extension) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static VkResult create_instance(gfx_handler_t *handler, const char **glfw_extensions, uint32_t glfw_extensions_count) {
+  VkResult err;
+
+  uint32_t properties_count;
+  vkEnumerateInstanceExtensionProperties(NULL, &properties_count, NULL);
+  VkExtensionProperties *properties = malloc(sizeof(VkExtensionProperties) * properties_count);
+  vkEnumerateInstanceExtensionProperties(NULL, &properties_count, properties);
+
+  const char **extensions = malloc(sizeof(const char *) * (glfw_extensions_count + 10)); // Generous buffer
+  uint32_t extensions_count = glfw_extensions_count;
+  memcpy(extensions, glfw_extensions, glfw_extensions_count * sizeof(const char *));
+
+  if (is_extension_available(properties, properties_count, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+    extensions[extensions_count++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+  }
+#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
+  if (is_extension_available(properties, properties_count, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+    extensions[extensions_count++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+  }
+#endif
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+  extensions[extensions_count++] = "VK_EXT_debug_report";
+  extensions[extensions_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+#endif
+
+  VkInstanceCreateInfo create_info = {
+      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+      .enabledExtensionCount = extensions_count,
+      .ppEnabledExtensionNames = extensions,
+      .pNext = NULL,
+  };
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+  const char *validation_layers[] = {"VK_LAYER_KHRONOS_validation"};
+  create_info.enabledLayerCount = 1;
+  create_info.ppEnabledLayerNames = validation_layers;
+  VkDebugUtilsMessengerCreateInfoEXT debug_utils_ci = {
+      .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+      .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+      .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                     VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+      .pfnUserCallback = debug_utils_callback,
+  };
+  create_info.pNext = &debug_utils_ci;
+#else
+  create_info.enabledLayerCount = 0;
+  create_info.ppEnabledLayerNames = NULL;
+#endif
+
+#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
+  if (is_extension_available(properties, properties_count, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+    create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+  }
+#endif
+
+  err = vkCreateInstance(&create_info, handler->g_allocator, &handler->g_instance);
+  check_vk_result(err);
+  free(properties);
+  free(extensions);
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+  PFN_vkCreateDebugReportCallbackEXT f_vkCreateDebugReportCallbackEXT =
+      (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(handler->g_instance, "vkCreateDebugReportCallbackEXT");
+  assert(f_vkCreateDebugReportCallbackEXT != NULL);
+  VkDebugReportCallbackCreateInfoEXT debug_report_ci = {
+      .sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,
+      .flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT,
+      .pfnCallback = debug_report,
+  };
+  err = f_vkCreateDebugReportCallbackEXT(handler->g_instance, &debug_report_ci, handler->g_allocator, &handler->g_debug_report);
+  check_vk_result(err);
+
+  PFN_vkCreateDebugUtilsMessengerEXT f_vkCreateDebugUtilsMessengerEXT =
+      (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(handler->g_instance, "vkCreateDebugUtilsMessengerEXT");
+  if (f_vkCreateDebugUtilsMessengerEXT) {
+    VkDebugUtilsMessengerCreateInfoEXT messenger_ci = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = debug_utils_callback,
+    };
+    err = f_vkCreateDebugUtilsMessengerEXT(handler->g_instance, &messenger_ci, handler->g_allocator, &handler->g_debug_messenger);
+    check_vk_result(err);
+  }
+#endif
+
+  return err;
+}
+
+static int select_physical_device(gfx_handler_t *handler) {
+  handler->g_physical_device = ImGui_ImplVulkanH_SelectPhysicalDevice(handler->g_instance);
+  if (handler->g_physical_device == VK_NULL_HANDLE) {
+    log_error("Vulkan", "No physical device found.");
+    return -1;
+  }
+  handler->g_queue_family = ImGui_ImplVulkanH_SelectQueueFamilyIndex(handler->g_physical_device);
+  if (handler->g_queue_family == (uint32_t)-1) {
+    log_error("Vulkan", "No graphics queue family found on the physical device.");
+    return -1;
+  }
+  return 0;
+}
+
+static void create_logical_device(gfx_handler_t *handler) {
+  const char *device_extensions[] = {"VK_KHR_swapchain"};
+  uint32_t device_extensions_count = 1;
+
+  const float queue_priority[] = {1.0f};
+  VkDeviceQueueCreateInfo queue_info[1] = {{
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = handler->g_queue_family,
+      .queueCount = 1,
+      .pQueuePriorities = queue_priority,
+  }};
+  // Anisotropic filtering, when the device has it. A ground plane seen at a
+  // grazing angle, which is most of what a driving game shows, collapses to a
+  // flat average without it, however much detail the texture has.
+  VkPhysicalDeviceFeatures supported = {0};
+  vkGetPhysicalDeviceFeatures(handler->g_physical_device, &supported);
+  VkPhysicalDeviceFeatures enabled = {0};
+  enabled.samplerAnisotropy = supported.samplerAnisotropy;
+  // Block-compressed textures (BC1-3, Direct3D's DXT1-5), for game modules
+  // that upload their games' pictures as the games ship them.
+  enabled.textureCompressionBC = supported.textureCompressionBC;
+
+  VkDeviceCreateInfo create_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = ARRAYSIZE(queue_info),
+      .pQueueCreateInfos = queue_info,
+      .enabledExtensionCount = device_extensions_count,
+      .ppEnabledExtensionNames = device_extensions,
+      .pEnabledFeatures = &enabled,
+  };
+  VkResult err = vkCreateDevice(handler->g_physical_device, &create_info, handler->g_allocator, &handler->g_device);
+  check_vk_result(err);
+  vkGetDeviceQueue(handler->g_device, handler->g_queue_family, 0, &handler->g_queue);
+}
+
+static void create_descriptor_pool(gfx_handler_t *handler) {
+  // This pool is for Dear ImGui only
+  VkDescriptorPoolSize pool_sizes[] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                          .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                                          .maxSets = 1000 * ARRAYSIZE(pool_sizes),
+                                          .poolSizeCount = (uint32_t)ARRAYSIZE(pool_sizes),
+                                          .pPoolSizes = pool_sizes};
+  VkResult err = vkCreateDescriptorPool(handler->g_device, &pool_info, handler->g_allocator, &handler->g_descriptor_pool);
+  check_vk_result(err);
+}
+
+static void setup_window(gfx_handler_t *handler, ImGui_ImplVulkanH_Window *wd, VkSurfaceKHR surface, int width, int height) {
+  wd->Surface = surface;
+
+  VkBool32 res;
+  vkGetPhysicalDeviceSurfaceSupportKHR(handler->g_physical_device, handler->g_queue_family, wd->Surface, &res);
+  if (res != VK_TRUE) {
+    log_error("Vulkan", "No WSI support on the selected physical device.");
+    log_error("Vulkan", "On X11 this usually means DRI3 is disabled. Enable it by adding the following to /etc/X11/xorg.conf.d/20-intel.conf (adjust the Driver for your GPU):");
+    log_error("Vulkan", "  Section \"Device\"");
+    log_error("Vulkan", "    Identifier \"GPU0\"");
+    log_error("Vulkan", "    Driver \"modesetting\"");
+    log_error("Vulkan", "    Option \"DRI\" \"3\"");
+    log_error("Vulkan", "  EndSection");
+    log_error("Vulkan", "Then restart your X session. See also: https://wiki.archlinux.org/title/Hardware_video_acceleration");
+    exit(-1);
+  }
+
+  const VkFormat request_surface_image_format[] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8_UNORM,
+                                                   VK_FORMAT_R8G8B8_UNORM};
+  const VkColorSpaceKHR request_surface_color_space = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+  wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(handler->g_physical_device, wd->Surface, request_surface_image_format,
+                                                            (size_t)ARRAYSIZE(request_surface_image_format), request_surface_color_space);
+
+  wd->PresentMode = choose_present_mode(handler, wd->Surface);
+
+  assert(handler->g_min_image_count >= 2);
+  ImGui_ImplVulkanH_CreateOrResizeWindow(handler->g_instance, handler->g_physical_device, handler->g_device, wd, handler->g_queue_family,
+                                         handler->g_allocator, width, height, handler->g_min_image_count, swapchain_usage(handler));
+}
+
+// frame rendering and presentation
+/*
+static void frame_render(gfx_handler_t *handler, ImDrawData *draw_data) {
+  ImGui_ImplVulkanH_Window *wd = &handler->g_main_window_data;
+  VkSemaphore image_acquired_semaphore = wd->FrameSemaphores.Data[wd->SemaphoreIndex].ImageAcquiredSemaphore;
+  VkSemaphore render_complete_semaphore = wd->FrameSemaphores.Data[wd->SemaphoreIndex].RenderCompleteSemaphore;
+
+  VkResult err = vkAcquireNextImageKHR(handler->g_device, wd->Swapchain, UINT64_MAX, image_acquired_semaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+  if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR) {
+    handler->g_swap_chain_rebuild = true;
+    return;
+  }
+  check_vk_result(err);
+
+  ImGui_ImplVulkanH_Frame *fd = &wd->Frames.Data[wd->FrameIndex];
+  {
+    err = vkWaitForFences(handler->g_device, 1, &fd->Fence, VK_TRUE, UINT64_MAX);
+    check_vk_result(err);
+    err = vkResetFences(handler->g_device, 1, &fd->Fence);
+    check_vk_result(err);
+  }
+  {
+    err = vkResetCommandPool(handler->g_device, fd->CommandPool, 0);
+    check_vk_result(err);
+    VkCommandBufferBeginInfo info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
+    check_vk_result(err);
+  }
+  {
+    VkRenderPassBeginInfo info = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = wd->RenderPass,
+                                  .framebuffer = fd->Framebuffer,
+                                  .renderArea = {{0, 0}, {wd->Width, wd->Height}},
+                                  .clearValueCount = 1,
+                                  .pClearValues = &wd->ClearValue};
+    vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
+  }
+
+  // Immediate Mode Drawing Logic
+  renderer_begin_frame(handler, fd->CommandBuffer);
+
+
+  // Draw primitives on top
+  renderer_end_frame(handler, fd->CommandBuffer);
+  // End Immediate Mode Drawing
+
+  ImGui_ImplVulkan_RenderDrawData(draw_data, fd->CommandBuffer, VK_NULL_HANDLE);
+
+  vkCmdEndRenderPass(fd->CommandBuffer);
+  {
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                         .waitSemaphoreCount = 1,
+                         .pWaitSemaphores = &image_acquired_semaphore,
+                         .pWaitDstStageMask = &wait_stage,
+                         .commandBufferCount = 1,
+                         .pCommandBuffers = &fd->CommandBuffer,
+                         .signalSemaphoreCount = 1,
+                         .pSignalSemaphores = &render_complete_semaphore};
+    err = vkEndCommandBuffer(fd->CommandBuffer);
+    check_vk_result(err);
+    err = vkQueueSubmit(handler->g_queue, 1, &info, fd->Fence);
+    check_vk_result(err);
+  }
+}
+*/
+
+void gfx_toggle_fullscreen(gfx_handler_t *handler) {
+  GLFWmonitor *monitor = glfwGetWindowMonitor(handler->window);
+  if (monitor) {
+    // Switch to windowed mode
+    glfwSetWindowMonitor(handler->window, NULL, 100, 100, 1280, 720, 0);
+  } else {
+    // Switch to fullscreen mode
+    monitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+    glfwSetWindowMonitor(handler->window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+  }
+}
+
+// Mock GLFW monitor functions to avoid excessive X11 polling in ImGui_ImplGlfw_UpdateMonitors()
+typedef struct {
+  GLFWmonitor *monitor;
+  int x, y;
+  GLFWvidmode vid_mode;
+  int work_x, work_y, work_w, work_h;
+  float scale_x, scale_y;
+} cached_monitor_info_t;
+
+static GLFWmonitor **g_cached_monitors = NULL;
+static int g_cached_monitors_count = 0;
+static cached_monitor_info_t *g_cached_infos = NULL;
+static int g_cached_infos_count = 0;
+static int g_last_update_frame = -1000;
+
+static void update_cached_monitors(void) {
+  int count = 0;
+  GLFWmonitor **monitors = glfwGetMonitors(&count);
+  if (count <= 0) return;
+
+  g_cached_monitors = monitors;
+  g_cached_monitors_count = count;
+
+  cached_monitor_info_t *new_infos = realloc(g_cached_infos, count * sizeof(cached_monitor_info_t));
+  if (new_infos) {
+    g_cached_infos = new_infos;
+    g_cached_infos_count = count;
+  }
+
+  for (int i = 0; i < count; i++) {
+    g_cached_infos[i].monitor = monitors[i];
+    glfwGetMonitorPos(monitors[i], &g_cached_infos[i].x, &g_cached_infos[i].y);
+
+    const GLFWvidmode *vm = glfwGetVideoMode(monitors[i]);
+    if (vm) {
+      g_cached_infos[i].vid_mode = *vm;
+    } else {
+      memset(&g_cached_infos[i].vid_mode, 0, sizeof(GLFWvidmode));
+    }
+
+    glfwGetMonitorWorkarea(monitors[i], &g_cached_infos[i].work_x, &g_cached_infos[i].work_y, &g_cached_infos[i].work_w, &g_cached_infos[i].work_h);
+    glfwGetMonitorContentScale(monitors[i], &g_cached_infos[i].scale_x, &g_cached_infos[i].scale_y);
+  }
+}
+
+static void check_monitor_cache(void) {
+  int current_frame = igGetFrameCount();
+  if (!g_cached_monitors || (current_frame - g_last_update_frame) >= 65536 || (current_frame < g_last_update_frame)) {
+    update_cached_monitors();
+    g_last_update_frame = current_frame;
+  }
+}
+
+GLFWmonitor **mock_glfwGetMonitors(int *count) {
+  check_monitor_cache();
+  if (count) *count = g_cached_monitors_count;
+  return g_cached_monitors;
+}
+
+void mock_glfwGetMonitorPos(GLFWmonitor *monitor, int *xpos, int *ypos) {
+  check_monitor_cache();
+  for (int i = 0; i < g_cached_infos_count; i++) {
+    if (g_cached_infos[i].monitor == monitor) {
+      if (xpos) *xpos = g_cached_infos[i].x;
+      if (ypos) *ypos = g_cached_infos[i].y;
+      return;
+    }
+  }
+  glfwGetMonitorPos(monitor, xpos, ypos);
+}
+
+const GLFWvidmode *mock_glfwGetVideoMode(GLFWmonitor *monitor) {
+  check_monitor_cache();
+  for (int i = 0; i < g_cached_infos_count; i++) {
+    if (g_cached_infos[i].monitor == monitor) {
+      return &g_cached_infos[i].vid_mode;
+    }
+  }
+  return glfwGetVideoMode(monitor);
+}
+
+void mock_glfwGetMonitorWorkarea(GLFWmonitor *monitor, int *xpos, int *ypos, int *width, int *height) {
+  check_monitor_cache();
+  for (int i = 0; i < g_cached_infos_count; i++) {
+    if (g_cached_infos[i].monitor == monitor) {
+      if (xpos) *xpos = g_cached_infos[i].work_x;
+      if (ypos) *ypos = g_cached_infos[i].work_y;
+      if (width) *width = g_cached_infos[i].work_w;
+      if (height) *height = g_cached_infos[i].work_h;
+      return;
+    }
+  }
+  glfwGetMonitorWorkarea(monitor, xpos, ypos, width, height);
+}
+
+void mock_glfwGetMonitorContentScale(GLFWmonitor *monitor, float *xscale, float *yscale) {
+  check_monitor_cache();
+  for (int i = 0; i < g_cached_infos_count; i++) {
+    if (g_cached_infos[i].monitor == monitor) {
+      if (xscale) *xscale = g_cached_infos[i].scale_x;
+      if (yscale) *yscale = g_cached_infos[i].scale_y;
+      return;
+    }
+  }
+  glfwGetMonitorContentScale(monitor, xscale, yscale);
+}

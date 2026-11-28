@@ -1,0 +1,2861 @@
+#include "user_interface.h"
+#include "cglm/vec2.h"
+#include <include_cimgui.h>
+#include "camera/camera_rig.h"
+#include "input_effects_editor.h"
+#include "render/render_window.h"
+#include "player_profile.h"
+#include "recording_import.h"
+#include "snippet_editor.h"
+#include "starting_state.h"
+#include "timeline/timeline_commands.h"
+#include "timeline/timeline_interaction.h"
+#include "timeline/timeline_model.h"
+#include "timeline/timeline_recordings.h"
+#include "timeline_events.h"
+#include "undo_redo.h"
+#include "widgets/imcol.h"
+#include <GLFW/glfw3.h>
+#include <engine/engine_api.h>
+#include <engine/int_math.h>
+#include <frametee/icons.h>
+#include <limits.h>
+#include <logger/logger.h>
+#include <math.h>
+#include <plugins/api_impl.h>
+#include <renderer/graphics_backend.h>
+#include <renderer/renderer.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <system/config.h>
+#include <system/file_dialog.h>
+#include <system/fs.h>
+#include <system/input.h>
+#include <system/save.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static const char *LOG_SOURCE = "UI";
+
+// The text's size at an interface scale of 1.
+#define UI_FONT_SIZE 19.f
+static void ui_apply_interface_size(void);
+// Set by the Interface Size setting, applied at the start of the next frame: the style it rebuilds
+// would otherwise be restored by the menus still open around the setting as they close.
+static bool g_interface_size_changed = false;
+
+// The name a Save As dialog starts with, derived from the active level.
+static void project_default_file_name(ui_handler_t *ui, char *out, size_t out_size) {
+  const char *level_name = (ui->loaded_level_name[0] != '\0') ? ui->loaded_level_name : "unnamed_level";
+  snprintf(out, out_size, "%s.tasp", level_name);
+}
+
+void ui_render_game_ui_slot(ui_handler_t *ui, ft_ui_slot slot, int track_index) {
+  if (!ui || !game_host_ready(&ui->gfx_handler->game_host)) return;
+  timeline_state_t *timeline = &ui->timeline;
+  int group_index = model_track_group_index(timeline, track_index);
+  if (group_index < 0) group_index = timeline->active_group_index;
+
+  ft_ui_frame frame = {0};
+  frame.struct_size = sizeof(frame);
+  frame.slot = slot;
+  frame.tick = timeline->current_tick;
+  frame.player = model_group_local_track_index(timeline, track_index);
+  if (ui->gfx_handler->level && group_index >= 0 && group_index < timeline->group_count)
+    frame.world = model_group_world_at_tick(timeline, group_index, timeline->current_tick);
+  engine_api_fill_state(&frame.state);
+  gh_ui(&ui->gfx_handler->game_host, &frame);
+}
+
+// The game's items in a snippet's right-click menu.
+void ui_render_game_snippet_menu(ui_handler_t *ui, int snippet_id) {
+  if (!ui || !game_host_ready(&ui->gfx_handler->game_host)) return;
+  timeline_state_t *timeline = &ui->timeline;
+  int track = -1;
+  const input_snippet_t *snippet = model_find_snippet_by_id(timeline, snippet_id, &track);
+  if (!snippet || track < 0) return;
+  const int group_index = model_track_group_index(timeline, track);
+  ft_ui_frame frame = {0};
+  frame.struct_size = sizeof(frame);
+  frame.slot = FT_UI_SNIPPET_MENU;
+  frame.tick = timeline->current_tick;
+  frame.player = model_group_local_track_index(timeline, track);
+  if (ui->gfx_handler->level && group_index >= 0 && group_index < timeline->group_count)
+    frame.world = model_group_world_at_tick(timeline, group_index, timeline->current_tick);
+  engine_api_fill_state(&frame.state);
+  frame.snippet = (ft_snippet_info){.id = snippet->id, .player = track, .start_tick = snippet->start_tick,
+                                    .end_tick = snippet->end_tick, .playback = snippet_is_playback(snippet)};
+  gh_ui(&ui->gfx_handler->game_host, &frame);
+}
+
+// A dialog for a project file; `save` asks where to write one. It starts in <config dir>/projects,
+// or where the dialog likes when there is no config dir.
+static void open_project_dialog(ui_handler_t *ui, bool save, file_dialog_done_fn done) {
+  char dir[1024], name[256];
+  fs_get_config_subdir("projects", dir, sizeof(dir));
+  project_default_file_name(ui, name, sizeof(name));
+  const file_dialog_t dialog = {
+      .save = save, .filter_name = "TAS Project", .filter_ext = "tasp", .default_dir = dir[0] ? dir : NULL, .default_name = name};
+  file_dialog_open(&dialog, done, ui);
+}
+
+static void save_as_chosen(void *user, const char *path) {
+  if (path) save_project(user, path);
+}
+
+// The unsaved-changes prompt's Save: the project switch it holds goes ahead once the work is saved.
+static void save_as_chosen_then_switch(void *user, const char *path) {
+  ui_handler_t *ui = user;
+  if (path && save_project(ui, path)) ui->pending_confirmed = true;
+}
+
+void ui_save_project_as(ui_handler_t *ui) { open_project_dialog(ui, true, save_as_chosen); }
+
+// A game's level extension may be a list ("z64,n64,v64"): labels name the first.
+static void level_extension_label(const char *extensions, char *out, size_t out_size) {
+  size_t length = strcspn(extensions, ",");
+  if (length >= out_size) length = out_size - 1;
+  memcpy(out, extensions, length);
+  out[length] = '\0';
+}
+
+// The level filter the active game declares, or NULL when it takes no bare
+// levels. The File menu hides the item entirely in that case.
+static const ft_game_constraints *active_level_constraints(ui_handler_t *ui) {
+  const ft_game_module *module = ui->gfx_handler->game_host.module;
+  if (!module || !module->constraints.level_extension) return NULL;
+  return &module->constraints;
+}
+
+static void level_chosen(void *user, const char *path) {
+  if (path) ui_request_load_level(user, path);
+}
+
+static void level_open_dialog(ui_handler_t *ui, const ft_game_constraints *constraints) {
+  const file_dialog_t dialog = {.filter_name = constraints->level_filter_name, .filter_ext = constraints->level_extension};
+  file_dialog_open(&dialog, level_chosen, ui);
+}
+
+// The keybind the user has on an action, spelled the way the menu wants it, or
+// an empty string when nothing is bound. Menu shortcuts are labels only: the
+// binding itself is read in keybinds_process_inputs.
+static const char *menu_shortcut(ui_handler_t *ui, action_t action) {
+  keybind_entry_t *bind = keybinds_get_binding_for_action(&ui->keybinds, action, 0);
+  return bind ? keybind_get_combo_string(&bind->combo) : "";
+}
+
+static void render_menu_bar_status(ui_handler_t *ui) {
+  const bool has_level = ui->gfx_handler && ui->gfx_handler->level != NULL;
+  const bool has_level_name = has_level && ui->loaded_level_name[0] && strcmp(ui->loaded_level_name, "unnamed_level") != 0;
+
+  if (ui->has_unsaved_changes) {
+    igPushStyleColor_Vec4(ImGuiCol_Text, (ImVec4){1.0f, 0.70f, 0.20f, 1.0f});
+    igTextUnformatted("*", NULL);
+    igPopStyleColor(1);
+    if (igIsItemHovered(0)) {
+      if (ui->current_project_path[0])
+        igSetTooltip("This file has been modified since it was last saved. %s to save.", menu_shortcut(ui, ACTION_SAVE_PROJECT));
+      else
+        igSetTooltip("This project has not been saved yet. %s to choose a file.", menu_shortcut(ui, ACTION_SAVE_PROJECT));
+    }
+  }
+
+  if (has_level) {
+    igSeparator();
+    float before_x = igGetCursorPosX();
+    ui_render_game_ui_slot(ui, FT_UI_STATUS_BAR, ui->timeline.selected_player_track_index);
+    if (igGetCursorPosX() == before_x && has_level_name) {
+      igText("%s", ui->loaded_level_name);
+    }
+  }
+}
+
+// The active game's setting groups, once each, in the order it first mentions
+// them. Gathering by name rather than by adjacency is what lets a game list its
+// settings in whatever order suits its own source: a group is one submenu
+// however many times the descriptor array interrupts it.
+enum { MAX_GAME_SETTING_GROUPS = 24 };
+
+static const char *setting_group_name(const ft_setting_desc *desc) {
+  return (desc->group && *desc->group) ? desc->group : "General";
+}
+
+static int collect_setting_groups(game_host_t *host, const char *out[], int max) {
+  const unsigned count = gh_setting_count(host);
+  int found = 0;
+  for (unsigned i = 0; i < count && found < max; ++i) {
+    const ft_setting_desc *desc = gh_setting_desc(host, i);
+    // Render settings live in the Render tab, with a value for video too; hidden ones in the game's own UI.
+    if (!desc || render_setting_is_layer(desc) || (desc->flags & FT_SETTING_HIDDEN)) continue;
+    const char *group = setting_group_name(desc);
+    bool seen = false;
+    for (int g = 0; g < found; ++g)
+      if (strcmp(out[g], group) == 0) seen = true;
+    if (!seen) out[found++] = group;
+  }
+  return found;
+}
+
+// Draws a control for every setting in `group`, described by the game and
+// rendered here, so a module needs no UI toolkit to be configurable.
+static void render_game_setting_group(ui_handler_t *ui, const char *group) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const unsigned count = gh_setting_count(host);
+
+  for (unsigned i = 0; i < count; ++i) {
+    const ft_setting_desc *desc = gh_setting_desc(host, i);
+    ft_value value;
+    if (!desc || render_setting_is_layer(desc) || (desc->flags & FT_SETTING_HIDDEN) || !gh_setting_get(host, i, &value)) continue;
+    if (strcmp(setting_group_name(desc), group) != 0) continue;
+
+    const char *label = desc->display_name ? desc->display_name : desc->id;
+    bool changed = false;
+    switch (value.kind) {
+    case FT_VALUE_BOOL:
+      changed = igCheckbox(label, &value.as.b);
+      break;
+    case FT_VALUE_INT: {
+      int v = (int)value.as.i;
+      changed = igDragInt(label, &v, 1.f, (int)desc->min_value, (int)desc->max_value, "%d", 0);
+      value.as.i = v;
+      break;
+    }
+    case FT_VALUE_FLOAT: {
+      float v = (float)value.as.f;
+      changed = igDragFloat(label, &v, 0.02f, (float)desc->min_value, (float)desc->max_value, "%.2f", 0);
+      value.as.f = v;
+      break;
+    }
+    case FT_VALUE_STRING: {
+      char text[256];
+      snprintf(text, sizeof(text), "%s", value.as.s ? value.as.s : "");
+      changed = igInputText(label, text, sizeof(text), ImGuiInputTextFlags_EnterReturnsTrue, NULL, NULL);
+      value.as.s = text;
+      if (desc->description && igIsItemHovered(0)) igSetTooltip("%s", desc->description);
+      if (changed) {
+        gh_setting_set(host, i, &value);
+        config_save(ui);
+      }
+      continue;
+    }
+    default:
+      break;
+    }
+
+    if (desc->description && igIsItemHovered(0)) igSetTooltip("%s", desc->description);
+    if (changed) {
+      gh_setting_set(host, i, &value);
+      config_save(ui);
+    }
+  }
+}
+
+// Everything about the run that belongs to the game rather than the editor,
+// under the game's own name so the two are never confused for each other. Its
+// groups become the submenus, so no one of them is a wall of checkboxes.
+static void render_game_settings_menu(ui_handler_t *ui) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  if (!game_host_ready(host) || ui->gfx_handler->level == NULL) return;
+
+  const char *name = host->module ? host->module->info.display_name : NULL;
+  if (!name || !*name) name = "Game";
+
+  const char *groups[MAX_GAME_SETTING_GROUPS];
+  const int group_count = collect_setting_groups(host, groups, MAX_GAME_SETTING_GROUPS);
+  const bool draws_own_ui = host->module && host->module->ui;
+  if (group_count == 0 && !draws_own_ui) return;
+
+  igSeparator();
+  if (igBeginMenu(name, true)) {
+    for (int g = 0; g < group_count; ++g) {
+      if (igBeginMenu(groups[g], true)) {
+        render_game_setting_group(ui, groups[g]);
+        igEndMenu();
+      }
+    }
+    // Whatever the game draws for itself follows its own settings, and stands
+    // alone for a game that declares none.
+    ui_render_game_ui_slot(ui, FT_UI_SETTINGS, ui->timeline.selected_player_track_index);
+    igEndMenu();
+  }
+}
+
+// The top bar sorts items by what they do, not by what they happen to be:
+// File/Edit act on the project, View decides what is on screen, Plugins and
+// Settings own the two kinds of window that configure the editor. A "..."
+// opens a window; a checkmark toggles one.
+void render_menu_bar(ui_handler_t *ui) {
+  if (igBeginMainMenuBar()) {
+    if (igBeginMenu("File", true)) {
+      if (igMenuItem_Bool("New Project", NULL, false, true)) ui_request_new_project(ui);
+      igSeparator();
+      if (igMenuItem_Bool("Open Project...", menu_shortcut(ui, ACTION_OPEN_PROJECT), false, true)) ui_request_open_project(ui, NULL);
+
+      if (igBeginMenu("Open Recent", ui->num_recent_projects > 0)) {
+        for (int i = 0; i < ui->num_recent_projects; ++i) {
+          const char *path = ui->recent_projects[i];
+          const char *name = strrchr(path, '/');
+          if (!name) name = strrchr(path, '\\');
+          name = name ? name + 1 : path;
+          char label[1100];
+          snprintf(label, sizeof(label), "%s##recent_%d", name, i);
+          if (igMenuItem_Bool(label, NULL, false, true)) ui_request_open_project(ui, path);
+          if (igIsItemHovered(ImGuiHoveredFlags_None)) igSetTooltip("%s", path);
+        }
+        igEndMenu();
+      }
+
+      const ft_game_constraints *level = active_level_constraints(ui);
+      if (level) {
+        char extension[32], label[96];
+        level_extension_label(level->level_extension, extension, sizeof(extension));
+        snprintf(label, sizeof(label), "Load Local %s...", extension);
+        if (igMenuItem_Bool(label, NULL, false, true)) level_open_dialog(ui, level);
+      }
+
+      igSeparator();
+      if (igMenuItem_Bool("Save Project", menu_shortcut(ui, ACTION_SAVE_PROJECT), false, true)) ui_quick_save(ui);
+      if (igMenuItem_Bool("Save Project As...", menu_shortcut(ui, ACTION_SAVE_PROJECT_AS), false, true)) ui_save_project_as(ui);
+      igSeparator();
+      if (igMenuItem_Bool("Exit", NULL, false, true)) glfwSetWindowShouldClose(ui->gfx_handler->window, GLFW_TRUE);
+      igEndMenu();
+    }
+
+    if (igBeginMenu("Edit", true)) {
+      bool can_undo = undo_manager_can_undo(&ui->undo_manager);
+      if (igMenuItem_Bool("Undo", menu_shortcut(ui, ACTION_UNDO), false, can_undo)) {
+        undo_manager_undo(&ui->undo_manager, &ui->timeline);
+      }
+      bool can_redo = undo_manager_can_redo(&ui->undo_manager);
+      if (igMenuItem_Bool("Redo", menu_shortcut(ui, ACTION_REDO), false, can_redo)) {
+        undo_manager_redo(&ui->undo_manager, &ui->timeline);
+      }
+      igEndMenu();
+    }
+
+    // View is only about what is on screen. A window that edits settings is
+    // not a view of anything and lives under Settings instead.
+    if (igBeginMenu("View", true)) {
+      // Read before the item that flips it, so both halves of the disabled
+      // scope below agree on one value.
+      const bool panels_visible = ui->show_ui;
+      igMenuItem_BoolPtr("Interface", "Tab", &ui->show_ui, true);
+      igSeparator();
+      // The individual panels are still the user's to choose, but none of them
+      // can appear while the interface is down, so they say so.
+      if (!panels_visible) igBeginDisabled(true);
+      igMenuItem_BoolPtr("Timeline Events", NULL, &ui->show_timeline_events_window, true);
+      igMenuItem_BoolPtr("Snippet Editor", NULL, &ui->show_snippet_editor_window, true);
+      igMenuItem_BoolPtr("Effects", NULL, &ui->show_effects_window, true);
+      igMenuItem_BoolPtr("Undo History", NULL, &ui->undo_manager.show_history_window, true);
+      if (!panels_visible) igEndDisabled();
+      igSeparator();
+      // An overlay, not a graphics setting: it changes what is drawn over the
+      // level and nothing about how the level is drawn.
+      if (igMenuItem_BoolPtr("Show FPS", NULL, &ui->show_fps, true)) config_save(ui);
+      igSeparator();
+      if (igMenuItem_Bool("Reset Layout", NULL, false, true)) ui_reset_layout();
+      igEndMenu();
+    }
+
+    if (igBeginMenu("Plugins", true)) {
+      if (ui->plugin_manager.count == 0) {
+        igTextDisabled("No plugins found");
+      } else {
+        for (int i = 0; i < ui->plugin_manager.count; ++i) {
+          loaded_plugin_t *p = &ui->plugin_manager.plugins[i];
+          bool is_loaded = (p->status == PLUGIN_STATUS_LOADED);
+          char label[256];
+          snprintf(label, sizeof(label), "%s##menu_%d", p->info_name[0] ? p->info_name : p->key, i);
+          if (igMenuItem_Bool(label, NULL, is_loaded, true)) {
+            // A changed plugin is still enabled, but its previously approved
+            // digest deliberately prevents it from loading. The unchecked
+            // menu item means "make this active"; toggling the stored enabled
+            // bit here would disable it on the first click and require a
+            // second click to approve and load the new files.
+            if (p->status == PLUGIN_STATUS_CHANGED)
+              plugin_manager_approve_current_version(&ui->plugin_manager, i);
+            else
+              plugin_manager_toggle_plugin(&ui->plugin_manager, i);
+          }
+        }
+      }
+      igSeparator();
+      if (igMenuItem_Bool("Reload All", NULL, false, true)) {
+        plugin_manager_reload_all(&ui->plugin_manager, ui->plugin_manager.directory);
+      }
+      // The manager is a tool for the plugins listed above it, so it belongs
+      // here rather than among the workspace panels under View.
+      if (igMenuItem_Bool("Plugin Manager...", NULL, false, true)) ui->show_plugin_manager = true;
+      igEndMenu();
+    }
+
+    // Everything the editor remembers between sessions, edited where it is
+    // named. "Display" is the window and the GPU; what the world itself looks
+    // like belongs to the game, in its own menu at the bottom.
+    if (igBeginMenu("Settings", true)) {
+      if (igBeginMenu("Display", true)) {
+        if (igCheckbox("VSync", &ui->vsync)) {
+          ui->gfx_handler->g_swap_chain_rebuild = true;
+          config_save(ui);
+        }
+        if (igSliderInt("FPS Limit", &ui->fps_limit, 0, 1000, "%d", 0)) config_save(ui);
+        if (igIsItemHovered(ImGuiHoveredFlags_None)) igSetTooltip("0 = Unlimited");
+        if (igSliderInt("Frames in Flight", &ui->frames_in_flight, 1, MAX_FRAMES_IN_FLIGHT, "%d", ImGuiSliderFlags_AlwaysClamp))
+          config_save(ui);
+        if (igIsItemHovered(ImGuiHoveredFlags_None))
+          igSetTooltip("2: the GPU draws one frame while the next is prepared (faster)\n1: each frame waits for the one before (a frame less behind)");
+        if (igDragFloat("LOD Bias", &ui->lod_bias, 0.1f, -5.0f, 5.0f, "%.1f", 0)) {
+          ui->gfx_handler->renderer.lod_bias = ui->lod_bias;
+          config_save(ui);
+        }
+        // Taken when let go: the menu it sits in grows with the interface, which would pull the
+        // slider out from under the pointer while dragging.
+        static float interface_size;
+        static bool editing_interface_size = false;
+        if (!editing_interface_size) interface_size = gfx_get_ui_size() * 100.f;
+        igSliderFloat("Interface Size", &interface_size, GFX_UI_SIZE_MIN * 100.f, GFX_UI_SIZE_MAX * 100.f, "%.0f%%",
+                      ImGuiSliderFlags_AlwaysClamp);
+        editing_interface_size = igIsItemActive();
+        if (igIsItemDeactivatedAfterEdit()) {
+          gfx_set_ui_size(interface_size / 100.f);
+          g_interface_size_changed = true;
+          config_save(ui);
+        }
+        if (igColorEdit3("Background Color", ui->bg_color, ImGuiColorEditFlags_NoInputs)) config_save(ui);
+        igEndMenu();
+      }
+
+      if (igBeginMenu("Sound", true)) {
+        float percent = ui->audio_volume * 100.f;
+        if (igSliderFloat("Volume", &percent, 0.f, 100.f, "%.0f%%", 0)) {
+          ui->audio_volume = percent / 100.f;
+          config_save(ui);
+        }
+        igEndMenu();
+      }
+
+      // The one setting a menu cannot hold: a rebindable action list is a
+      // table, so it keeps the window it always had.
+      if (igMenuItem_Bool("Controls...", menu_shortcut(ui, ACTION_OPEN_CONTROLS), false, true))
+        ui->keybinds.show_settings_window = true;
+
+      if (igBeginMenu("Auto-Save", true)) {
+        if (igCheckbox("Enable Auto-Save", &ui->auto_save_enabled)) config_save(ui);
+        if (!ui->auto_save_enabled) igBeginDisabled(true);
+        if (igSliderInt("Interval", &ui->auto_save_interval_sec, 15, 600, "%d s", 0)) config_save(ui);
+        if (!ui->auto_save_enabled) igEndDisabled();
+        igEndMenu();
+      }
+
+      render_game_settings_menu(ui);
+      igEndMenu();
+    }
+
+    ui_render_game_ui_slot(ui, FT_UI_MAIN_MENU, ui->timeline.selected_player_track_index);
+
+    render_menu_bar_status(ui);
+    igEndMainMenuBar();
+  }
+}
+
+// The editor's own nodes, kept so a game's windows can be given a home. Indexed
+// by ft_dock_slot; FT_DOCK_FLOATING stays zero and means "leave it alone".
+static ImGuiID g_dock_nodes[FT_DOCK_CENTER + 1];
+// True when this session laid the dockspace out itself rather than restoring
+// the user's layout from imgui.ini, so every panel goes to its default node.
+static bool g_layout_built;
+static bool g_reset_layout_requested;
+// Bumped each time the default layout is built, so game panels are placed again.
+static int g_layout_generation;
+
+void ui_reset_layout(void) { g_reset_layout_requested = true; }
+
+// A game's own player panel shares the left dock with the editor's track list,
+// and the window added to a dock node last is the one holding the tab. The
+// editor's list is the one to come up on, so it takes the tab back whenever
+// that happens. Docking the panel is not the moment: the window itself is only
+// created when its game first draws it, which is after a level has loaded and
+// after this list has already drawn for that frame.
+static bool g_focus_players_tab = true;
+static int g_left_panel_window_count;
+
+// A game names its own windows, so the editor cannot dock them when it lays
+// itself out: the game is not loaded yet. Each one is placed the first time it
+// is seen instead, and is the user's to move from then on.
+static void place_game_panels(ui_handler_t *ui) {
+  enum { MAX_PLACED = 16 };
+  static char placed[MAX_PLACED][64];
+  static int placed_count = 0;
+  static char placed_game[FT_NAME_MAX] = {0};
+  static int placed_generation = 0;
+  if (placed_generation != g_layout_generation) {
+    placed_generation = g_layout_generation;
+    placed_count = 0;
+  }
+
+  game_host_t *host = &ui->gfx_handler->game_host;
+  if (!game_host_ready(host)) return;
+  // (the panels of a game are placed once for all its backends)
+  const char *game_id = game_host_settings_id(host);
+  if (!game_id) return;
+  if (strcmp(placed_game, game_id) != 0) {
+    snprintf(placed_game, sizeof(placed_game), "%s", game_id);
+    placed_count = 0;
+    // The windows of the game being left behind are not this game's, so its
+    // own count starts again and its first panel counts as newly arrived.
+    g_left_panel_window_count = 0;
+  }
+
+  uint32_t count = 0;
+  const ft_panel_desc *panels = gh_panels(host, &count);
+  for (uint32_t i = 0; i < count && placed_count < MAX_PLACED; ++i) {
+    const ft_panel_desc *panel = &panels[i];
+    if (!panel->window_title || panel->dock <= FT_DOCK_FLOATING || panel->dock > FT_DOCK_CENTER) continue;
+    const ImGuiID node = g_dock_nodes[panel->dock];
+    if (!node) continue;
+
+    bool already_placed = false;
+    for (int j = 0; j < placed_count; ++j)
+      if (strcmp(placed[j], panel->window_title) == 0) already_placed = true;
+    if (already_placed) continue;
+    // A layout restored from disk already knows where the user put this panel;
+    // only one it has never seen is given the default home.
+    if (!g_layout_built && igFindWindowSettingsByID(igImHashStr(panel->window_title, 0, 0))) continue;
+
+    snprintf(placed[placed_count++], sizeof(placed[0]), "%s", panel->window_title);
+    igDockBuilderDockWindow(panel->window_title, node);
+  }
+
+  // ImGui has no window for a panel until the game has drawn it once, so this
+  // counts the ones that have turned up. One more than last frame means a panel
+  // was just added to the left dock and took the tab with it.
+  int existing = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const ft_panel_desc *panel = &panels[i];
+    if (!panel->window_title || panel->dock != FT_DOCK_LEFT) continue;
+    if (igFindWindowByName(panel->window_title)) ++existing;
+  }
+  if (existing > g_left_panel_window_count) g_focus_players_tab = true;
+  g_left_panel_window_count = existing;
+}
+
+// Where each editor window lives in the default layout. Plugins go right.
+typedef struct {
+  const char *title;
+  ft_dock_slot slot;
+} default_dock_t;
+
+static const default_dock_t g_default_docks[] = {
+    {"Viewport", FT_DOCK_CENTER},      {"Controls", FT_DOCK_CENTER},       {"Undo History", FT_DOCK_CENTER},
+    {"Timeline", FT_DOCK_BOTTOM},      {"Camera", FT_DOCK_BOTTOM},         {"Render", FT_DOCK_BOTTOM},
+    {"Players", FT_DOCK_LEFT},         {"Snippet Editor", FT_DOCK_BOTTOM}, {"Effects", FT_DOCK_RIGHT},
+};
+
+static void build_default_layout(ui_handler_t *ui, ImGuiID dockspace_id, ImVec2 size) {
+  igDockBuilderRemoveNode(dockspace_id); // Clear existing layout
+  igDockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+  igDockBuilderSetNodeSize(dockspace_id, size);
+
+  // split root into bottom + top remainder
+  ImGuiID dock_id_top, dock_id_center;
+  const ImGuiID dock_id_bottom = igDockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.20f, NULL, &dock_id_top);
+
+  // split top remainder into left + remainder
+  const ImGuiID dock_id_right = igDockBuilderSplitNode(dock_id_top, ImGuiDir_Right, 0.25f, NULL, &dock_id_center);
+  const ImGuiID dock_id_left = igDockBuilderSplitNode(dock_id_center, ImGuiDir_Left, 0.40f, NULL, &dock_id_center);
+
+  g_dock_nodes[FT_DOCK_LEFT] = dock_id_left;
+  g_dock_nodes[FT_DOCK_RIGHT] = dock_id_right;
+  g_dock_nodes[FT_DOCK_BOTTOM] = dock_id_bottom;
+  g_dock_nodes[FT_DOCK_CENTER] = dock_id_center;
+
+  for (size_t i = 0; i < sizeof(g_default_docks) / sizeof(g_default_docks[0]); ++i)
+    igDockBuilderDockWindow(g_default_docks[i].title, g_dock_nodes[g_default_docks[i].slot]);
+  ui->select_timeline_tab = true;
+
+  for (int i = 0; i < ui->plugin_manager.count; ++i) {
+    loaded_plugin_t *p = &ui->plugin_manager.plugins[i];
+    if (p->info_name[0]) igDockBuilderDockWindow(p->info_name, dock_id_right);
+  }
+
+  igDockBuilderFinish(dockspace_id);
+}
+
+// The node a window is docked into, whether or not it has been drawn yet this
+// session. Zero when it floats or the node is gone.
+static ImGuiID window_dock_node(const char *title) {
+  ImGuiID dock_id = 0;
+  ImGuiWindow *window = igFindWindowByName(title);
+  if (window) {
+    dock_id = window->DockId;
+  } else {
+    ImGuiWindowSettings *settings = igFindWindowSettingsByID(igImHashStr(title, 0, 0));
+    if (settings) dock_id = settings->DockId;
+  }
+  return dock_id && igDockBuilderGetNode(dock_id) ? dock_id : 0;
+}
+
+// A restored layout has node IDs of its own, so each slot is found again
+// through the window that lives in it by default. Once the user moves that
+// window elsewhere, the slot follows it; a floating one falls back to center.
+static void resolve_dock_nodes(ImGuiID dockspace_id) {
+  ImGuiDockNode *central = igDockBuilderGetCentralNode(dockspace_id);
+  const ImGuiID fallback = central ? central->ID : dockspace_id;
+  for (int slot = FT_DOCK_LEFT; slot <= FT_DOCK_CENTER; ++slot) g_dock_nodes[slot] = 0;
+  for (size_t i = 0; i < sizeof(g_default_docks) / sizeof(g_default_docks[0]); ++i) {
+    const ft_dock_slot slot = g_default_docks[i].slot;
+    if (!g_dock_nodes[slot]) g_dock_nodes[slot] = window_dock_node(g_default_docks[i].title);
+  }
+  for (int slot = FT_DOCK_LEFT; slot <= FT_DOCK_CENTER; ++slot)
+    if (!g_dock_nodes[slot]) g_dock_nodes[slot] = fallback;
+}
+
+// Windows added since the layout was saved (a new editor panel, a newly
+// installed plugin) have no entry in it and would come up floating.
+static void restore_default_panels(ui_handler_t *ui, ImGuiID dockspace_id) {
+  resolve_dock_nodes(dockspace_id);
+  for (size_t i = 0; i < sizeof(g_default_docks) / sizeof(g_default_docks[0]); ++i) {
+    const char *title = g_default_docks[i].title;
+    if (!igFindWindowSettingsByID(igImHashStr(title, 0, 0))) igDockBuilderDockWindow(title, g_dock_nodes[g_default_docks[i].slot]);
+  }
+  for (int i = 0; i < ui->plugin_manager.count; ++i) {
+    loaded_plugin_t *p = &ui->plugin_manager.plugins[i];
+    if (p->info_name[0] && !igFindWindowSettingsByID(igImHashStr(p->info_name, 0, 0)))
+      igDockBuilderDockWindow(p->info_name, g_dock_nodes[FT_DOCK_RIGHT]);
+  }
+  ui->select_timeline_tab = true;
+}
+
+// The dockspace the panels live in. Its ID is taken outside any window of ours, as setup_docking
+// always has, so it is the same wherever it is asked for at that level.
+static ImGuiID main_dockspace(void) { return igGetID_Str("MainDockSpace"); }
+
+// docking setup
+void setup_docking(ui_handler_t *ui) {
+  ImGuiID main_dockspace_id = main_dockspace();
+
+  // Ensure the dockspace covers the entire viewport initially
+  ImGuiViewport *viewport = igGetMainViewport();
+  igSetNextWindowPos(viewport->WorkPos, ImGuiCond_Always, (ImVec2){0.0f, 0.0f});
+  igSetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
+  igSetNextWindowViewport(viewport->ID);
+
+  ImGuiWindowFlags host_window_flags = 0;
+  host_window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+  host_window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground;
+
+  igPushStyleVar_Float(ImGuiStyleVar_WindowRounding, 0.0f);
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){0.0f, 0.0f});
+  igBegin("DockSpace Host Window", NULL,
+          host_window_flags); // pass null for p_open to prevent closing the host window
+  igPopStyleVar(3);
+
+  // create the main dockspace
+  igDockSpace(main_dockspace_id, (ImVec2){0.0f, 0.0f},
+              ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_NoWindowMenuButton, NULL);
+  igEnd();
+
+  static bool first_time = true;
+  if (first_time || g_reset_layout_requested) {
+    ImGuiDockNode *root = igDockBuilderGetNode(main_dockspace_id);
+    // imgui.ini is loaded by the first NewFrame, so a saved layout is already
+    // in place here. Only an empty dockspace, or a reset, gets the default one.
+    if (first_time && root && ImGuiDockNode_IsSplitNode(root)) {
+      restore_default_panels(ui, main_dockspace_id);
+    } else {
+      build_default_layout(ui, main_dockspace_id, viewport->WorkSize);
+      g_layout_built = true;
+      ++g_layout_generation;
+    }
+    first_time = false;
+    g_reset_layout_requested = false;
+  }
+
+  if (!g_layout_built) resolve_dock_nodes(main_dockspace_id);
+  place_game_panels(ui);
+}
+
+// player manager panel
+static bool g_remove_confirm_needed = true;
+static int g_pending_remove_index = -1;
+// The confirmation is opened from the Players window, where it is drawn: a popup is known by its
+// name in the window that opens it, and one opened from a track's menu would never show.
+static bool g_open_remove_confirm = false;
+
+typedef struct {
+  bool active;
+  int index;
+  char before[MAX_TIMELINE_GROUP_NAME];
+} TimelineTextEditUndo;
+
+typedef struct {
+  bool active;
+  int index;
+  float before[4];
+} TimelineColorEditUndo;
+
+typedef struct {
+  bool active;
+  int index;
+  int before;
+} TimelineIntEditUndo;
+
+static TimelineTextEditUndo g_group_name_edit_undo;
+static TimelineTextEditUndo g_track_name_edit_undo;
+static TimelineColorEditUndo g_group_color_edit_undo;
+static TimelineIntEditUndo g_group_offset_edit_undo;
+
+static void register_timeline_data_change(ui_handler_t *ui, timeline_data_snapshot_t *before, const char *description) {
+  undo_command_t *command = commands_create_timeline_data_change(ui, before, description);
+  if (command) undo_manager_register_command(&ui->undo_manager, command);
+}
+
+static void project_import_chosen(void *user, const char *path) {
+  ui_handler_t *ui = user;
+  if (!path) return;
+  timeline_data_snapshot_t *before = commands_capture_timeline_data(&ui->timeline);
+  if (before && import_project_as_group(ui, path)) register_timeline_data_change(ui, before, "Import Project as Group");
+  else commands_free_timeline_data_snapshot(before);
+}
+
+void render_player_manager(ui_handler_t *ui) {
+  timeline_state_t *ts = &ui->timeline;
+  float dpi_scale = gfx_get_ui_scale();
+  if (g_focus_players_tab) {
+    igSetNextWindowFocus();
+    g_focus_players_tab = false;
+  }
+  if (igBegin("Players", NULL, 0)) {
+    if (ts->recording) igBeginDisabled(true);
+
+    // The active game decides what configurations are even possible. A game
+    // that cannot fork its state keeps one group; one with a fixed cast (a
+    // single-player run, say) hides adding and removing players entirely,
+    // rather than offering an action that would then be refused.
+    game_host_t *host = &ui->gfx_handler->game_host;
+    const bool allow_add_player = game_can_add_player(host, ts->player_track_count);
+    const bool fixed_cast = game_has_fixed_players(host);
+
+    if (igButton(ICON_FA_PLUS " Group", (ImVec2){0, 0})) {
+      char name[MAX_TIMELINE_GROUP_NAME];
+      snprintf(name, sizeof(name), "Group %d", ts->group_count + 1);
+      timeline_data_snapshot_t *before = commands_capture_timeline_data(ts);
+      if (before && model_add_group(ts, name)) {
+        model_set_active_group(ts, ts->group_count - 1);
+        model_sync_tracks_to_world(ts, ts->active_group_index);
+        register_timeline_data_change(ui, before, "Add Group");
+      } else commands_free_timeline_data_snapshot(before);
+    }
+    igSameLine(0, 5.0f * dpi_scale);
+    if (igButton(ICON_FA_FILE_IMPORT " Import", (ImVec2){0, 0})) open_project_dialog(ui, false, project_import_chosen);
+    // Recordings come in as a group of their own, beside imported projects. Starting a project from
+    // one is the start screen's.
+    if (recording_import_available(ui)) {
+      igSameLine(0, 5.0f * dpi_scale);
+      igBeginDisabled(!ui->gfx_handler->level);
+      if (igButton(ICON_FA_FILE_IMPORT " Demo", (ImVec2){0, 0})) recording_import_begin(ui, false);
+      igEndDisabled();
+      const char *kind = host->module->constraints.recording_filter_name;
+      if (igIsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) igSetTooltip("Import a %s as a new group", kind ? kind : "recording");
+    }
+    if (ts->group_count > 1) {
+      igSameLine(0, 5.0f * dpi_scale);
+      if (igButton(ICON_FA_ARROWS_LEFT_RIGHT_TO_LINE " Align starts", (ImVec2){0, 0})) {
+        undo_command_t *command = commands_create_align_group_starts(ui);
+        if (command) undo_manager_register_command(&ui->undo_manager, command);
+      }
+      if (igIsItemHovered(ImGuiHoveredFlags_None)) igSetTooltip("Align every group race start to Group 1");
+    }
+    if (ts->recording) igEndDisabled();
+
+    igSeparator();
+    if (!fixed_cast) {
+      static int num_to_add = 1;
+      igPushItemWidth(50 * dpi_scale);
+      const int headroom = game_max_players(host) > 0 ? game_max_players(host) - ts->player_track_count : 1000;
+      igDragInt("##NumToAdd", &num_to_add, 1, 1, headroom > 1 ? headroom : 1, "%d", ImGuiSliderFlags_None);
+      igPopItemWidth();
+      if (num_to_add < 1) num_to_add = 1;
+      if (headroom > 0 && num_to_add > headroom) num_to_add = headroom;
+
+      igSameLine(0, 5.0f * dpi_scale);
+
+      char aLabel[16];
+      snprintf(aLabel, 16, "Add Player%s", num_to_add > 1 ? "s" : "");
+      if (!allow_add_player) igBeginDisabled(true);
+      if (ui->gfx_handler->level && igButton(aLabel, (ImVec2){0, 0})) {
+        for (int i = 0; i < num_to_add && game_can_add_player(host, ts->player_track_count); ++i) {
+          undo_command_t *cmd = timeline_api_create_track(ui, NULL, NULL);
+          if (cmd) undo_manager_register_command(&ui->undo_manager, cmd);
+        }
+      }
+      if (!allow_add_player) {
+        igEndDisabled();
+        if (igIsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          igSetTooltip("%s allows at most %d players.", ui->plugin_context.active_game_id, game_max_players(host));
+      }
+      igSameLine(0, 10.f * dpi_scale);
+    }
+    igText("Players: %d%s  |  Active: %s", ts->player_track_count, fixed_cast ? " (fixed by the game)" : "",
+           ts->groups[ts->active_group_index]->name);
+
+    igSeparator();
+    int pending_group_remove = -1;
+    int pending_track_remove = -1;
+    int pending_clone_track = -1;
+    int pending_clone_group = -1;
+    ImGuiListClipper *group_clipper = NULL;
+    if (ts->group_count > 32) {
+      group_clipper = ImGuiListClipper_ImGuiListClipper();
+      ImGuiListClipper_Begin(group_clipper, ts->group_count, igGetFrameHeightWithSpacing());
+    }
+
+    while (!group_clipper || ImGuiListClipper_Step(group_clipper)) {
+      int start_grp = group_clipper ? group_clipper->DisplayStart : 0;
+      int end_grp = group_clipper ? group_clipper->DisplayEnd : ts->group_count;
+      for (int group_index = start_grp; group_index < end_grp; ++group_index) {
+        timeline_group_t *group = ts->groups[group_index];
+      igPushID_Int(10000 + group_index);
+
+      ImVec4 header_color = {group->color[0], group->color[1], group->color[2], group_index == ts->active_group_index ? 0.55f : 0.28f};
+      igPushStyleColor_Vec4(ImGuiCol_Header, header_color);
+      igPushStyleColor_Vec4(ImGuiCol_HeaderHovered, (ImVec4){group->color[0], group->color[1], group->color[2], 0.65f});
+      bool open = igCollapsingHeader_TreeNodeFlags(group->name, ts->group_count > 8 ? 0 : ImGuiTreeNodeFlags_DefaultOpen);
+      igPopStyleColor(2);
+      if (igIsItemClicked(ImGuiMouseButton_Left)) model_set_active_group(ts, group_index);
+      if (igBeginPopupContextItem("##group_context", ImGuiPopupFlags_MouseButtonRight)) {
+        bool can_delete = ts->group_count > 1 && !ts->recording;
+        if (!can_delete) igBeginDisabled(true);
+        if (igMenuItem_Bool(ICON_FA_TRASH " Delete group", NULL, false, can_delete)) pending_group_remove = group_index;
+        if (!can_delete) igEndDisabled();
+        igEndPopup();
+      }
+
+      if (open) {
+        char name_before_frame[MAX_TIMELINE_GROUP_NAME];
+        memcpy(name_before_frame, group->name, sizeof(name_before_frame));
+        igSetNextItemWidth(155.0f * dpi_scale);
+        bool name_changed = igInputText("Name", group->name, sizeof(group->name), ImGuiInputTextFlags_EnterReturnsTrue, NULL, NULL);
+        if (igIsItemActivated()) {
+          g_group_name_edit_undo.active = true;
+          g_group_name_edit_undo.index = group_index;
+          memcpy(g_group_name_edit_undo.before, name_before_frame, sizeof(g_group_name_edit_undo.before));
+        }
+        if (name_changed) ui_mark_unsaved(ui);
+        if (igIsItemDeactivatedAfterEdit() && g_group_name_edit_undo.active && g_group_name_edit_undo.index == group_index) {
+          undo_command_t *command = commands_create_group_name_change(ui, group_index, g_group_name_edit_undo.before);
+          if (command) undo_manager_register_command(&ui->undo_manager, command);
+          g_group_name_edit_undo.active = false;
+        }
+
+        float color_before_frame[4];
+        memcpy(color_before_frame, group->color, sizeof(color_before_frame));
+        igSameLine(0, 5.0f * dpi_scale);
+        igSetNextItemWidth(45.0f * dpi_scale);
+        bool color_changed = igColorEdit3("Color", group->color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+        if (igIsItemActivated()) {
+          g_group_color_edit_undo.active = true;
+          g_group_color_edit_undo.index = group_index;
+          memcpy(g_group_color_edit_undo.before, color_before_frame, sizeof(g_group_color_edit_undo.before));
+        }
+        if (color_changed) ui_mark_unsaved(ui);
+        if (igIsItemDeactivatedAfterEdit() && g_group_color_edit_undo.active && g_group_color_edit_undo.index == group_index) {
+          undo_command_t *command = commands_create_group_color_change(ui, group_index, g_group_color_edit_undo.before);
+          if (command) undo_manager_register_command(&ui->undo_manager, command);
+          g_group_color_edit_undo.active = false;
+        }
+
+        igSameLine(0, 8.0f * dpi_scale);
+        bool visible_before = group->visible;
+        if (igCheckbox("Show in viewport", &group->visible)) {
+          undo_command_t *command = commands_create_group_visibility_change(ui, group_index, visible_before);
+          if (command) undo_manager_register_command(&ui->undo_manager, command);
+        }
+
+        if (group_index == 0) {
+          group->start_offset = 0;
+          igBeginDisabled(true);
+        }
+        int offset_before_frame = group->start_offset;
+        int offset_value = group->start_offset;
+        igSetNextItemWidth(120.0f * dpi_scale);
+        bool offset_changed = igDragInt("Start offset", &offset_value, 1.0f, -1000000, 1000000, "%d ticks", ImGuiSliderFlags_AlwaysClamp);
+        if (igIsItemActivated()) {
+          g_group_offset_edit_undo.active = true;
+          g_group_offset_edit_undo.index = group_index;
+          g_group_offset_edit_undo.before = offset_before_frame;
+        }
+        if (offset_changed) {
+          model_set_group_start_offset(ts, group_index, offset_value);
+          ui_mark_unsaved(ui);
+        }
+        if (igIsItemDeactivatedAfterEdit() && g_group_offset_edit_undo.active && g_group_offset_edit_undo.index == group_index) {
+          undo_command_t *command = commands_create_group_start_offset_change(ui, group_index, g_group_offset_edit_undo.before);
+          if (command) undo_manager_register_command(&ui->undo_manager, command);
+          g_group_offset_edit_undo.active = false;
+        }
+        if (group_index == 0) igEndDisabled();
+
+        const ft_world *world = model_group_world_at_tick(ts, group_index, ts->current_tick);
+        const int player_count = gh_world_player_count(host, world);
+        // A row costs a selectable, a split draw list, a label query and a call
+        // into the game, so a large cast is worth clipping: only the rows the
+        // clipper hands back are built.
+        ImGuiListClipper *clipper = ImGuiListClipper_ImGuiListClipper();
+        ImGuiListClipper_Begin(clipper, player_count, -1.f);
+        while (ImGuiListClipper_Step(clipper)) {
+          for (int local_index = clipper->DisplayStart; local_index < clipper->DisplayEnd; ++local_index) {
+            int i = model_group_track_index(ts, group_index, local_index);
+            if (i < 0) {
+              // The clipper counts this index either way, so the row has to take
+              // up its line rather than shift everything below it up.
+              igTextDisabled("--");
+              continue;
+            }
+            player_track_t *track = &ts->player_tracks[i];
+            igPushID_Int(i);
+            bool selected = i == ts->selected_player_track_index;
+            // The editor's own label for the track. Who the player is (a
+            // nickname, a number, a car) is the game's to say, and it says it
+            // through player_label further down this row.
+            char row_label[160];
+            snprintf(row_label, sizeof(row_label), "%s", track->name[0] ? track->name : "Track");
+
+            ImDrawList *row_draw_list = igGetWindowDrawList();
+            ImVec4 row_color = {0.18f, 0.18f, 0.18f, 0.55f};
+            ImVec4 row_selected_color = {0.30f, 0.30f, 0.30f, 0.70f};
+            ImVec4 row_hovered_color = {0.25f, 0.25f, 0.25f, 0.75f};
+            ImVec4 row_active_color = {0.34f, 0.34f, 0.34f, 0.80f};
+
+            // Keep Selectable's native text-height layout so the label and the timing text placed on
+            // the same line share a baseline. Draw the persistent tint in a lower channel after the
+            // exact item rectangle is known.
+            ImDrawList_ChannelsSplit(row_draw_list, 2);
+            ImDrawList_ChannelsSetCurrent(row_draw_list, 1);
+            float row_left_padding = 12.0f * dpi_scale;
+            igIndent(row_left_padding);
+            igPushStyleColor_Vec4(ImGuiCol_Header, row_selected_color);
+            igPushStyleColor_Vec4(ImGuiCol_HeaderHovered, row_hovered_color);
+            igPushStyleColor_Vec4(ImGuiCol_HeaderActive, row_active_color);
+            bool track_clicked = igSelectable_Bool(row_label, selected, ImGuiSelectableFlags_AllowDoubleClick | ImGuiSelectableFlags_SpanAllColumns,
+                                                   (ImVec2){0, 0});
+            igPopStyleColor(3);
+            igUnindent(row_left_padding);
+
+            ImVec2 row_min = igGetItemRectMin();
+            ImVec2 row_max = igGetItemRectMax();
+            ImDrawList_ChannelsSetCurrent(row_draw_list, 0);
+            ImDrawList_AddRectFilled(row_draw_list, row_min, row_max, igGetColorU32_Vec4(row_color), 3.0f * dpi_scale, ImDrawFlags_RoundCornersAll);
+
+            ImDrawList_ChannelsSetCurrent(row_draw_list, 1);
+            ImU32 rail_color = igGetColorU32_Vec4((ImVec4){0.65f, 0.65f, 0.65f, 0.85f});
+            ImVec2 rail_min = {row_min.x + 1.0f * dpi_scale, row_min.y + 2.0f * dpi_scale};
+            ImVec2 rail_max = {row_min.x + 4.0f * dpi_scale, row_max.y - 2.0f * dpi_scale};
+            ImDrawList_AddRectFilled(row_draw_list, rail_min, rail_max, rail_color, 1.5f * dpi_scale, ImDrawFlags_RoundCornersAll);
+            ImDrawList_ChannelsMerge(row_draw_list);
+            if (track_clicked) interaction_select_track(ts, i);
+
+            if (igBeginPopupContextItem("##track_context", ImGuiPopupFlags_MouseButtonRight)) {
+              interaction_select_track(ts, i);
+              char track_name_before_frame[MAX_TRACK_NAME];
+              memcpy(track_name_before_frame, track->name, sizeof(track_name_before_frame));
+              igSetNextItemWidth(180.0f * dpi_scale);
+              bool track_name_changed = igInputText("Track name", track->name, sizeof(track->name), ImGuiInputTextFlags_EnterReturnsTrue, NULL, NULL);
+              if (igIsItemActivated()) {
+                g_track_name_edit_undo.active = true;
+                g_track_name_edit_undo.index = i;
+                memcpy(g_track_name_edit_undo.before, track_name_before_frame, sizeof(g_track_name_edit_undo.before));
+              }
+              if (track_name_changed) ui_mark_unsaved(ui);
+              if (igIsItemDeactivatedAfterEdit() && g_track_name_edit_undo.active && g_track_name_edit_undo.index == i) {
+                undo_command_t *command = commands_create_track_name_change(ui, i, g_track_name_edit_undo.before);
+                if (command) undo_manager_register_command(&ui->undo_manager, command);
+                g_track_name_edit_undo.active = false;
+              }
+              if (ts->group_count > 1 && igBeginMenu("Clone to group", !ts->recording)) {
+                for (int target_group = 0; target_group < ts->group_count; ++target_group) {
+                  if (target_group == group_index) continue;
+                  if (igMenuItem_Bool(ts->groups[target_group]->name, NULL, false, true)) {
+                    pending_clone_track = i;
+                    pending_clone_group = target_group;
+                  }
+                }
+                igEndMenu();
+              }
+              igSeparator();
+              if (igMenuItem_Bool(ICON_FA_TRASH " Delete Player Track", NULL, false, true)) {
+                if (g_remove_confirm_needed && track->snippet_count > 0) {
+                  g_pending_remove_index = i;
+                  g_open_remove_confirm = true;
+                } else {
+                  pending_track_remove = i;
+                }
+              }
+              igEndPopup();
+            }
+
+            // Whatever the game wants shown next to a player in a list: DDNet puts
+            // the finish time or the last checkpoint there.
+            char annotation[64];
+            if (gh_player_label(host, world, local_index, annotation, sizeof(annotation)) && annotation[0]) {
+              igSameLine(0, 10.f * dpi_scale);
+              igTextDisabled("%s", annotation);
+            }
+            ui_render_game_ui_slot(ui, FT_UI_PLAYER_ROW, i);
+            igPopID();
+          }
+        }
+        ImGuiListClipper_End(clipper);
+        ImGuiListClipper_destroy(clipper);
+
+        igSeparator();
+      }
+      igPopID();
+    }
+    if (!group_clipper) break;
+  }
+  if (group_clipper) {
+    ImGuiListClipper_End(group_clipper);
+    ImGuiListClipper_destroy(group_clipper);
+  }
+    if (pending_clone_track >= 0) {
+      timeline_data_snapshot_t *before = commands_capture_timeline_data(ts);
+      if (before && model_clone_track_to_group(ts, pending_clone_track, pending_clone_group, NULL))
+        register_timeline_data_change(ui, before, "Clone Track to Group");
+      else commands_free_timeline_data_snapshot(before);
+    }
+    if (pending_track_remove >= 0) {
+      undo_command_t *cmd = commands_create_remove_track(ui, pending_track_remove);
+      if (cmd) undo_manager_register_command(&ui->undo_manager, cmd);
+    }
+    if (pending_group_remove >= 0) {
+      timeline_data_snapshot_t *before = commands_capture_timeline_data(ts);
+      if (before && model_remove_group(ts, pending_group_remove)) register_timeline_data_change(ui, before, "Delete Group");
+      else commands_free_timeline_data_snapshot(before);
+    }
+  }
+  if (g_open_remove_confirm) {
+    igOpenPopup_Str("Confirm remove player", 0);
+    g_open_remove_confirm = false;
+  }
+  if (igBeginPopupModal("Confirm remove player", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+    igText("This player has inputs. Remove anyway?");
+    static bool dont_ask_again = false;
+    igCheckbox("Do not ask again", &dont_ask_again);
+    if (igButton("Yes", (ImVec2){0, 0})) {
+      undo_command_t *cmd = commands_create_remove_track(ui, g_pending_remove_index);
+      undo_manager_register_command(&ui->undo_manager, cmd);
+      if (dont_ask_again) g_remove_confirm_needed = false;
+      g_pending_remove_index = -1;
+      igCloseCurrentPopup();
+    }
+    igSameLine(0, 10);
+    if (igButton("Cancel", (ImVec2){0, 0})) {
+      g_pending_remove_index = -1;
+      igCloseCurrentPopup();
+    }
+    igEndPopup();
+  }
+  igEnd();
+}
+
+void ui_cycle_camera_mode(ui_handler_t *ui) {
+  if (!ui || !ui->gfx_handler) return;
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const unsigned count = game_camera_mode_count(host);
+  if (count == 0) return;
+
+  camera_t *camera = &ui->gfx_handler->renderer.camera;
+  camera->mode = (camera->mode + 1) % count;
+  config_save(ui);
+
+  // The engine's own modes are driven from the keyboard, and the keyboard goes
+  // wherever the focus is. Landing in one of them with the timeline focused
+  // would leave the camera unresponsive with nothing on screen to say why.
+  if (game_camera_mode_is_freecam(host, camera->mode) || game_camera_mode_is_top_down(host, camera->mode))
+    igSetWindowFocus_Str("Viewport");
+}
+
+// --- the 3D viewport camera --------------------------------------------------
+//
+// One function per mode, each writing only its own state. The mode itself is
+// not a thing this file decides: it is the game's camera mode list, read every
+// frame, so what the user picked in the toolbar and what the renderer projects
+// with can never drift apart. The 2D path below is left exactly as it was,
+// because panning a plane and orbiting a volume have nothing useful in common.
+
+// Which of the renderer's 3D modes the selected game camera mode asks for. The
+// engine appends the freecam and the plan view to every 3D game's list and
+// drives both itself; everything else is a target the game supplies, orbited.
+static camera3_mode_t camera3_mode_for(const game_host_t *host, unsigned mode) {
+  if (game_camera_mode_is_freecam(host, mode)) return CAMERA3_FREECAM;
+  if (game_camera_mode_is_top_down(host, mode)) return CAMERA3_TOP_DOWN;
+  return CAMERA3_ORBIT;
+}
+
+// A plan view: the wheel changes how much world fits on screen, a right-drag
+// slides that window over the ground. Neither its height nor its clipping is
+// touched here; both were sized from the level when it loaded and stay put.
+static void camera3_update_top_down(gfx_handler_t *handler, float scroll_y, bool dragging, double raw_dx,
+                                    double raw_dy) {
+  camera3_t *c = &handler->renderer.camera3;
+
+  if (scroll_y != 0.f)
+    c->top_down_extent =
+        glm_clamp(c->top_down_extent * (1.f - scroll_y * 0.1f), CAMERA3_MIN_EXTENT, CAMERA3_MAX_EXTENT);
+
+  if (!dragging || handler->viewport[1] <= 0.f) return;
+  // Orthographic X and Z have the same world-units-per-pixel scale. Subtracting
+  // the drag makes this a grab-and-pan gesture: the world follows the mouse,
+  // matching the editor's 2D camera.
+  const float units_per_pixel = 2.f * c->top_down_extent / handler->viewport[1];
+  c->top_down_center[0] -= (float)raw_dx * units_per_pixel;
+  c->top_down_center[2] -= (float)raw_dy * units_per_pixel;
+}
+
+// Flying. The wheel trims the speed rather than the distance, because a speed
+// that suits crossing a level is unusable for lining up a nearby shot.
+static void camera3_update_freecam(gfx_handler_t *handler, float scroll_y, bool dragging, double raw_dx,
+                                   double raw_dy) {
+  camera3_t *c = &handler->renderer.camera3;
+  keybind_manager_t *keys = &handler->user_interface.keybinds;
+
+  if (dragging) {
+    c->free_yaw += (float)raw_dx * 0.005f;
+    c->free_pitch += (float)raw_dy * 0.005f;
+    c->free_pitch = glm_clamp(c->free_pitch, -CAMERA3_MAX_PITCH, CAMERA3_MAX_PITCH);
+  }
+  if (scroll_y != 0.f) c->free_speed = glm_clamp(c->free_speed * (1.f + scroll_y * 0.15f), 0.5f, 10000.f);
+
+  // Flying is driven entirely from the keyboard, and letters are what other
+  // panels are being used with: a shortcut that flies the camera while someone
+  // is working in the timeline or a plugin window is a bug, not a shortcut.
+  // Turning needs no such gate, because it is driven by the mouse and already
+  // asks whether the cursor is over the viewport.
+  if (!handler->user_interface.viewport_focused) return;
+
+  vec3 forward, right, up;
+  renderer_camera3_forward(handler, forward);
+  glm_vec3_cross(forward, (vec3){0.f, 1.f, 0.f}, right);
+  glm_vec3_normalize(right);
+  // The camera's own up, so rising while pitched moves along the view rather
+  // than along the world axis.
+  glm_vec3_cross(right, forward, up);
+  glm_vec3_normalize(up);
+
+  vec3 move = {0.f, 0.f, 0.f};
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_FORWARD)) glm_vec3_add(move, forward, move);
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_BACK)) glm_vec3_sub(move, forward, move);
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_RIGHT)) glm_vec3_add(move, right, move);
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_LEFT)) glm_vec3_sub(move, right, move);
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_UP)) glm_vec3_add(move, up, move);
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_DOWN)) glm_vec3_sub(move, up, move);
+  if (glm_vec3_norm(move) <= 0.f) return;
+
+  glm_vec3_normalize(move);
+  float speed = c->free_speed * igGetIO_Nil()->DeltaTime;
+  if (keybinds_is_action_held(keys, ACTION_FREECAM_FAST)) speed *= 4.f;
+  glm_vec3_scale(move, speed, move);
+  glm_vec3_add(c->free_eye, move, c->free_eye);
+}
+
+// Circling a point. Who owns that point depends on the mode the game declared:
+// it places the whole camera in a directed mode and only the pivot in a free
+// one, where the mouse owns the angles.
+static void camera3_update_orbit(gfx_handler_t *handler, float intra, float scroll_y, bool dragging, double raw_dx,
+                                 double raw_dy, bool directed) {
+  camera3_t *c = &handler->renderer.camera3;
+
+  if (!directed) {
+    if (dragging) {
+      c->orbit_yaw += (float)raw_dx * 0.005f;
+      c->orbit_pitch += (float)raw_dy * 0.005f;
+      // Stop just short of the poles: looking straight down makes the up vector
+      // ambiguous and the view flips.
+      c->orbit_pitch = glm_clamp(c->orbit_pitch, -CAMERA3_MAX_PITCH, CAMERA3_MAX_PITCH);
+    }
+    if (scroll_y != 0.f)
+      c->orbit_distance =
+          glm_clamp(c->orbit_distance * (1.f - scroll_y * 0.1f), CAMERA3_MIN_EXTENT, CAMERA3_MAX_EXTENT);
+  }
+
+  // Let the game place the camera. It is given the same pair of worlds and the
+  // same interpolation the renderer uses, so a locked camera tracks a smoothly
+  // drawn player instead of stepping once per tick.
+  timeline_state_t *ts = &handler->user_interface.timeline;
+  const int group_index = model_track_group_index(ts, ts->selected_player_track_index);
+  const ft_world *previous = NULL;
+  const ft_world *current = NULL;
+  if (group_index >= 0) model_group_world_pair(ts, group_index, ts->current_tick, &previous, &current);
+
+  ft_camera_frame frame = {0};
+  frame.struct_size = sizeof(frame);
+  frame.mode = handler->renderer.camera.mode;
+  frame.world = current;
+  frame.previous_world = previous;
+  frame.alpha = intra;
+  frame.player = model_group_local_track_index(ts, ts->selected_player_track_index);
+  frame.recording = ts->recording;
+
+  ft_camera view;
+  engine_api_camera_get(&view);
+  view.use_view_proj = false;
+  if (gh_camera_update(&handler->game_host, &frame, &view)) {
+    c->orbit_target[0] = view.target.x;
+    c->orbit_target[1] = view.target.y;
+    c->orbit_target[2] = view.target.z;
+    // Retain a pivot and heading for switching to a user-controlled camera.
+    // A directed game may also provide its exact lens and roll. In a free mode only
+    // the pivot is kept: the angles and the distance are the user's, and a game
+    // that wanted them should have declared the mode directed.
+    vec3 offset = {view.eye.x - view.target.x, view.eye.y - view.target.y, view.eye.z - view.target.z};
+    const float distance = glm_vec3_norm(offset);
+    if (directed && distance > 0.01f) {
+      c->orbit_distance = distance;
+      c->orbit_pitch = asinf(glm_clamp(offset[1] / distance, -1.f, 1.f));
+      c->orbit_yaw = atan2f(offset[2], offset[0]);
+    }
+    if (directed && view.use_view_proj) {
+      bool finite = true;
+      for (int i = 0; i < 16; ++i) finite = finite && isfinite(view.view_proj[i]);
+      // ABI float arrays need not have cglm's SIMD alignment.
+      mat4 matrix;
+      memcpy(matrix, view.view_proj, sizeof(matrix));
+      const float determinant = glm_mat4_det(matrix);
+      finite = finite && isfinite(determinant) && determinant != 0.f;
+      if (finite) {
+        c->directed_camera = view;
+        c->directed_camera_valid = true;
+      }
+    }
+    return;
+  }
+
+  // The game declined to place it, so the engine orbits the selected player.
+  if (!current) return;
+  const int player_index = frame.player >= 0 ? frame.player : 0;
+  ft_value pos_val;
+  if (!gh_entity_prop_get(&handler->game_host, current, FT_ENTITY_CLASS_PLAYER, player_index, 0, &pos_val) ||
+      pos_val.kind != FT_VALUE_VEC3)
+    return;
+
+  ft_value prev_val;
+  const bool interpolate = previous &&
+                           gh_entity_prop_get(&handler->game_host, previous, FT_ENTITY_CLASS_PLAYER, player_index, 0,
+                                              &prev_val) &&
+                           prev_val.kind == FT_VALUE_VEC3;
+  c->orbit_target[0] = interpolate ? glm_lerp(prev_val.as.v3.x, pos_val.as.v3.x, intra) : pos_val.as.v3.x;
+  c->orbit_target[1] = interpolate ? glm_lerp(prev_val.as.v3.y, pos_val.as.v3.y, intra) : pos_val.as.v3.y;
+  c->orbit_target[2] = interpolate ? glm_lerp(prev_val.as.v3.z, pos_val.as.v3.z, intra) : pos_val.as.v3.z;
+}
+
+static void on_camera3_update(gfx_handler_t *handler, bool hovered, float intra) {
+  camera3_t *c = &handler->renderer.camera3;
+  camera_t *camera = &handler->renderer.camera;
+  game_host_t *host = &handler->game_host;
+  keybind_manager_t *keys = &handler->user_interface.keybinds;
+
+  const ft_camera_mode *selected = game_camera_mode(host, camera->mode);
+  bool directed = selected && (selected->flags & FT_CAMERA_MODE_DIRECTED) != 0;
+
+  double raw_dx = 0.0, raw_dy = 0.0;
+  input_mouse_delta(&raw_dx, &raw_dy);
+  const bool drag_button = input_mouse_down(GLFW_MOUSE_BUTTON_RIGHT);
+
+  // A drag in a game-driven mode has nothing to turn: the game rewrites the
+  // camera every frame. Dropping to the first mode the user does own makes the
+  // drag do what it looks like it does, and makes the toolbar say so, instead
+  // of silently detaching the view from the mode it still claims to be in.
+  if (directed && hovered && drag_button) {
+    for (unsigned i = 0; i < game_camera_mode_count(host); ++i) {
+      const ft_camera_mode *candidate = game_camera_mode(host, i);
+      if (candidate && (candidate->flags & FT_CAMERA_MODE_FREE)) {
+        camera->mode = i;
+        directed = false;
+        break;
+      }
+    }
+  }
+
+  // The selected mode is the only thing that decides which camera runs, and
+  // this is where the one being entered is seeded from the one being left.
+  renderer_camera3_set_mode(handler, camera3_mode_for(host, camera->mode));
+  c->directed_camera_valid = false;
+
+  // A drag has to start over the viewport, but may wander off it once it has.
+  c->dragging = drag_button && (hovered || c->dragging);
+
+  // The wheel zooms only through the zoom binds, so unbinding them frees it.
+  float scroll_y = 0.f;
+  if (keybinds_is_view_action_pressed(keys, ACTION_ZOOM_IN, true, hovered)) scroll_y = 1.f;
+  if (keybinds_is_view_action_pressed(keys, ACTION_ZOOM_OUT, true, hovered)) scroll_y = -1.f;
+
+  switch (c->mode) {
+  case CAMERA3_TOP_DOWN:
+    camera3_update_top_down(handler, scroll_y, c->dragging, raw_dx, raw_dy);
+    return;
+  case CAMERA3_FREECAM:
+    camera3_update_freecam(handler, scroll_y, c->dragging, raw_dx, raw_dy);
+    return;
+  case CAMERA3_ORBIT:
+    camera3_update_orbit(handler, intra, scroll_y, c->dragging, raw_dx, raw_dy, directed);
+    return;
+  }
+}
+
+void on_camera_update(gfx_handler_t *handler, bool hovered, float intra) {
+  if (!handler->level) return;
+  if (game_is_3d(&handler->game_host)) {
+    on_camera3_update(handler, hovered, intra);
+    return;
+  }
+  camera_t *camera = &handler->renderer.camera;
+  ImGuiIO *io = igGetIO_Nil();
+
+  // The wheel zooms only through the zoom binds, so unbinding them frees it. Its notches come from
+  // the GLFW callback: imgui holds back the mouse position events queued behind a wheel event, so
+  // reading both from imgui made panning stutter exactly while zooming.
+  float scroll_y = 0.0f;
+  if (keybinds_is_view_action_pressed(&handler->user_interface.keybinds, ACTION_ZOOM_IN, true, hovered)) scroll_y = 1.0f;
+  if (keybinds_is_view_action_pressed(&handler->user_interface.keybinds, ACTION_ZOOM_OUT, true, hovered)) scroll_y = -1.0f;
+  if (scroll_y != 0.0f) {
+    // (a larger zoom shows more)
+    float zoom_factor = 1.0f + scroll_y * 0.1f;
+    camera->zoom_wanted /= zoom_factor;
+    camera->zoom_wanted = glm_clamp(camera->zoom_wanted, camera_rig_min_zoom(handler), camera_rig_max_zoom(handler));
+  }
+  float smoothing_factor = 1.0f - expf(-10.0f * io->DeltaTime); // Adjust 10.0f for speed
+  camera->zoom = camera->zoom + (camera->zoom_wanted - camera->zoom) * smoothing_factor;
+
+  float viewport_ratio = (float)handler->viewport[0] / (float)handler->viewport[1];
+  float map_ratio = handler->world_width / handler->world_height;
+  float aspect = (float)viewport_ratio / (float)map_ratio;
+
+  // Panning uses the summed GLFW motion for this frame so it stays in step with the mouse no matter
+  // how many events arrived between frames. Not gated on io->WantCaptureMouse: the viewport is an
+  // imgui window, so that flag is set the whole time the cursor is over it; `hovered` decides where
+  // a pan may start.
+  double raw_dx = 0.0, raw_dy = 0.0;
+  input_mouse_delta(&raw_dx, &raw_dy);
+  bool pan_button_down = input_mouse_down(GLFW_MOUSE_BUTTON_RIGHT);
+
+  game_host_t *host = &handler->game_host;
+  const ft_camera_mode *mode = game_camera_mode(host, camera->mode);
+  const bool directed = mode && (mode->flags & FT_CAMERA_MODE_DIRECTED) != 0;
+
+  // Panning out of a directed mode drops back to a free one, so a drag always
+  // does something.
+  if (directed && hovered && pan_button_down) {
+    for (unsigned i = 0; i < game_camera_mode_count(host); ++i) {
+      const ft_camera_mode *candidate = game_camera_mode(host, i);
+      if (candidate && (candidate->flags & FT_CAMERA_MODE_FREE)) {
+        camera->mode = i;
+        break;
+      }
+    }
+  }
+
+  // Let the game place the camera. It is given the same pair of worlds and the
+  // same interpolation the renderer uses, so a locked camera tracks a smoothly
+  // drawn player instead of stepping once per tick.
+  {
+    timeline_state_t *ts = &handler->user_interface.timeline;
+    const int group_index = model_track_group_index(ts, ts->selected_player_track_index);
+    const ft_world *previous = NULL;
+    const ft_world *current = NULL;
+    if (group_index >= 0) model_group_world_pair(ts, group_index, ts->current_tick, &previous, &current);
+
+    ft_camera_frame frame = {0};
+    frame.struct_size = sizeof(frame);
+    frame.mode = camera->mode;
+    frame.world = current;
+    frame.previous_world = previous;
+    frame.alpha = intra;
+    frame.player = model_group_local_track_index(ts, ts->selected_player_track_index);
+    frame.recording = ts->recording;
+
+    ft_camera view;
+    engine_api_camera_get(&view);
+    if (gh_camera_update(host, &frame, &view)) {
+      if (handler->world_width > 0.f) camera->pos[0] = view.position.x / handler->world_width;
+      if (handler->world_height > 0.f) camera->pos[1] = view.position.y / handler->world_height;
+      camera->is_dragging = false;
+      return;
+    }
+  }
+
+  // Nobody is directing the camera, so the user drives it. Only start a pan
+  // inside the viewport, but keep it running once started even if the cursor
+  // wanders over a panel.
+  if (pan_button_down && (hovered || camera->is_dragging)) {
+    if (!camera->is_dragging) {
+      camera->is_dragging = true;
+      double mouse_x = 0.0, mouse_y = 0.0;
+      input_cursor_pos(&mouse_x, &mouse_y);
+      camera->drag_start_pos[0] = (float)mouse_x;
+      camera->drag_start_pos[1] = (float)mouse_y;
+    }
+
+    const float scale = renderer_projection_scale(handler);
+    const float dx = (float)raw_dx / (handler->viewport[0] * scale);
+    const float dy = (float)raw_dy / (handler->viewport[1] * scale * aspect);
+    const float max_map_size = fmax(handler->world_width, handler->world_height) * 0.001;
+    camera->pos[0] -= (dx * 2) / max_map_size;
+    camera->pos[1] -= (dy * 2) / max_map_size;
+  } else {
+    camera->is_dragging = false;
+  }
+}
+
+void camera_init(camera_t *camera) {
+  memset(camera, 0, sizeof(camera_t));
+  camera->zoom = 1.0f;
+  camera->zoom_wanted = 1.0f;
+  camera->mode = 0;
+}
+
+void ui_init_config(ui_handler_t *ui) {
+  ui->mouse_sens = 200.f;
+  ui->mouse_max_distance = 400.f;
+  ui->vsync = true;
+  ui->fps_limit = 0;
+  ui->frames_in_flight = 2;
+  ui->audio_volume = 1.f;
+  ui->follow_playhead = true;
+  ui->lod_bias = -0.5f;
+  ui->bg_color[0] = 0.253f;
+  ui->bg_color[1] = 0.253f;
+  ui->bg_color[2] = 0.253f;
+  ui->auto_save_enabled = false;
+  ui->auto_save_interval_sec = 60;
+  ui->last_auto_save_time = 0.0;
+  prediction_settings_default(&ui->configured_prediction);
+  render_state_defaults(ui);
+  keybinds_init(&ui->keybinds);
+  config_load(ui);
+}
+
+static void ui_apply_theme(void) {
+  ImGuiStyle *style = igGetStyle();
+
+  style->WindowPadding = (ImVec2){12.0f, 12.0f};
+  style->FramePadding = (ImVec2){8.0f, 4.0f};
+  style->ItemSpacing = (ImVec2){8.0f, 8.0f};
+  style->ItemInnerSpacing = (ImVec2){6.0f, 6.0f};
+
+  style->WindowRounding = 8.0f;
+  style->ChildRounding = 4.0f;
+  style->FrameRounding = 4.0f;
+  style->ScrollbarRounding = 4.0f;
+  style->FrameBorderSize = 1.0f;
+  style->WindowBorderSize = 1.0f;
+
+  ImVec4 *colors = style->Colors;
+
+  colors[ImGuiCol_WindowBg] = (ImVec4){0.10f, 0.11f, 0.12f, 1.00f};
+  colors[ImGuiCol_PopupBg] = (ImVec4){0.10f, 0.11f, 0.12f, 1.00f};
+  colors[ImGuiCol_ChildBg] = (ImVec4){0.10f, 0.11f, 0.12f, 1.00f};
+
+  colors[ImGuiCol_FrameBg] = (ImVec4){0.15f, 0.16f, 0.17f, 1.00f};
+  colors[ImGuiCol_FrameBgHovered] = (ImVec4){0.20f, 0.22f, 0.23f, 1.00f};
+  colors[ImGuiCol_FrameBgActive] = (ImVec4){0.12f, 0.13f, 0.14f, 1.00f};
+
+  colors[ImGuiCol_Border] = (ImVec4){0.23f, 0.25f, 0.27f, 1.00f};
+  colors[ImGuiCol_BorderShadow] = (ImVec4){0.00f, 0.00f, 0.00f, 0.00f};
+
+  colors[ImGuiCol_Button] = (ImVec4){0.16f, 0.45f, 0.85f, 1.00f};
+  colors[ImGuiCol_ButtonHovered] = (ImVec4){0.26f, 0.55f, 0.95f, 1.00f};
+  colors[ImGuiCol_ButtonActive] = (ImVec4){0.11f, 0.35f, 0.75f, 1.00f};
+
+  colors[ImGuiCol_Text] = (ImVec4){0.88f, 0.89f, 0.91f, 1.00f};
+  colors[ImGuiCol_TextDisabled] = (ImVec4){0.54f, 0.57f, 0.60f, 1.00f};
+
+  colors[ImGuiCol_TitleBg] = (ImVec4){0.10f, 0.11f, 0.12f, 1.00f};
+  colors[ImGuiCol_TitleBgActive] = (ImVec4){0.15f, 0.16f, 0.17f, 1.00f};
+  colors[ImGuiCol_TitleBgCollapsed] = (ImVec4){0.05f, 0.06f, 0.07f, 1.00f};
+
+  colors[ImGuiCol_Header] = (ImVec4){0.16f, 0.45f, 0.85f, 0.50f};
+  colors[ImGuiCol_HeaderHovered] = (ImVec4){0.16f, 0.45f, 0.85f, 0.80f};
+  colors[ImGuiCol_HeaderActive] = (ImVec4){0.16f, 0.45f, 0.85f, 1.00f};
+
+  colors[ImGuiCol_SliderGrab] = (ImVec4){0.16f, 0.45f, 0.85f, 1.00f};
+  colors[ImGuiCol_SliderGrabActive] = (ImVec4){0.26f, 0.55f, 0.95f, 1.00f};
+
+  colors[ImGuiCol_CheckMark] = (ImVec4){0.88f, 0.89f, 0.91f, 1.00f};
+
+  colors[ImGuiCol_Tab] = (ImVec4){0.15f, 0.16f, 0.17f, 1.00f};
+  colors[ImGuiCol_TabHovered] = (ImVec4){0.26f, 0.55f, 0.95f, 0.80f};
+  colors[ImGuiCol_TabSelected] = (ImVec4){0.16f, 0.45f, 0.85f, 1.00f};
+  colors[ImGuiCol_TabDimmed] = (ImVec4){0.10f, 0.11f, 0.12f, 1.00f};
+  colors[ImGuiCol_TabDimmedSelected] = (ImVec4){0.15f, 0.16f, 0.17f, 1.00f};
+
+  colors[ImGuiCol_DockingPreview] = (ImVec4){0.16f, 0.45f, 0.85f, 0.70f};
+}
+
+static void ui_apply_interface_size(void) {
+  extern bool g_is_headless;
+  // Headless there is no screen to fit, only the theme.
+  if (g_is_headless) {
+    ui_apply_theme();
+    return;
+  }
+  // As the editor has always built it: ImGui's sizes at the automatic scale and the theme over
+  // them. The user's size then goes over all of it, and the text follows from the next frame on.
+  ImGuiStyle *style = igGetStyle();
+  ImGuiStyle *fresh = ImGuiStyle_ImGuiStyle();
+  ImGuiStyle_ScaleAllSizes(fresh, gfx_get_auto_ui_scale() * 0.5f);
+  *style = *fresh;
+  ImGuiStyle_destroy(fresh);
+  ui_apply_theme();
+  if (gfx_get_ui_size() != 1.f) ImGuiStyle_ScaleAllSizes(style, gfx_get_ui_size());
+  style->FontSizeBase = style->_NextFrameFontSizeBase = UI_FONT_SIZE * gfx_get_ui_scale();
+}
+
+void ui_init(ui_handler_t *ui, gfx_handler_t *gfx_handler) {
+  extern bool g_is_headless;
+  if (!g_is_headless) {
+    ImGuiIO *io = igGetIO_Nil();
+    ImFontAtlas *atlas = io->Fonts;
+    const float scale = gfx_get_ui_scale();
+    ui->font = ImFontAtlas_AddFontFromFileTTF(io->Fonts, "data/fonts/Roboto-SemiBold.ttf", UI_FONT_SIZE * scale, NULL, NULL);
+
+    static const ImWchar icons_ranges[] = {ICON_MIN_FA, ICON_MAX_16_FA, 0};
+    ImFontConfig *icons_config = ImFontConfig_ImFontConfig();
+    icons_config->MergeMode = true;
+    icons_config->PixelSnapH = true;
+    ImFontAtlas_AddFontFromFileTTF(atlas, "data/fonts/fa-solid-900.ttf", 15.0f * scale, icons_config, icons_ranges);
+    ImFontConfig_destroy(icons_config);
+
+    ImFontConfig *icon_cfg = ImFontConfig_ImFontConfig();
+    icon_cfg->PixelSnapH = true;
+    ui->icon_font = ImFontAtlas_AddFontFromFileTTF(atlas, "data/fonts/fa-solid-900.ttf", 15.0f * scale, icon_cfg, icons_ranges);
+    ImFontConfig_destroy(icon_cfg);
+  }
+
+  ui_apply_interface_size();
+
+  ui->gfx_handler = gfx_handler;
+  camera_timeline_default(&ui->camera_timeline);
+  camera_editor_reset(ui);
+  video_export_defaults(&ui->video_options);
+  strncpy(ui->loaded_level_name, "unnamed_level", sizeof(ui->loaded_level_name) - 1);
+  ui->loaded_level_path[0] = '\0';
+  ui->current_project_path[0] = '\0';
+  ui->has_unsaved_changes = false;
+  ui->show_ui = true;
+  ui->show_timeline_events_window = false;
+  ui->show_snippet_editor_window = false;
+  ui->focus_snippet_editor_window = false;
+  ui->show_effects_window = false;
+  ui->focus_effects_window = false;
+  ui->effects_snippet_id = -1;
+  ui->show_plugin_manager = false;
+  ui->pending_action = UI_PENDING_NONE;
+  ui->pending_path[0] = '\0';
+  ui->pending_confirmed = false;
+  ui->show_unsaved_prompt = false;
+  timeline_init(ui);
+  camera_init(&gfx_handler->renderer.camera);
+  config_apply_game_editor_state(ui);
+  undo_manager_init(&ui->undo_manager);
+  undo_manager_init(&ui->parked_undo_manager);
+
+  ui->plugin_api = api_init(ui);
+  ui->plugin_context.imgui_context = igGetCurrentContext();
+  ui->plugin_context.is_headless = g_is_headless;
+  ui->plugin_context.ui_visible = ui->show_ui;
+  // Points into the host's slot table, which outlives every plugin.
+  ui->plugin_context.active_game_id = game_host_active_id(&gfx_handler->game_host);
+  plugin_manager_init(&ui->plugin_manager, &ui->plugin_context, &ui->plugin_api, ui);
+  plugin_manager_load_all(&ui->plugin_manager, "plugins");
+}
+
+void ui_add_recent_project(ui_handler_t *ui, const char *path) {
+  // A render worker opens a snapshot of the project, not the user's project.
+  extern bool g_is_render_worker;
+  if (g_is_render_worker) return;
+  char path_copy[1024];
+  strncpy(path_copy, path, sizeof(path_copy) - 1);
+  path_copy[sizeof(path_copy) - 1] = '\0';
+
+  int found_idx = -1;
+  for (int i = 0; i < ui->num_recent_projects; i++) {
+    if (strcmp(ui->recent_projects[i], path_copy) == 0) {
+      found_idx = i;
+      break;
+    }
+  }
+
+  if (found_idx != -1) {
+    for (int i = found_idx; i > 0; i--) {
+      strcpy(ui->recent_projects[i], ui->recent_projects[i - 1]);
+    }
+  } else {
+    if (ui->num_recent_projects < 10) {
+      ui->num_recent_projects++;
+    }
+    for (int i = ui->num_recent_projects - 1; i > 0; i--) {
+      strcpy(ui->recent_projects[i], ui->recent_projects[i - 1]);
+    }
+  }
+  strncpy(ui->recent_projects[0], path_copy, 1023);
+  ui->recent_projects[0][1023] = '\0';
+  config_save(ui);
+}
+
+static void ui_request_project_switch(ui_handler_t *ui, ui_pending_action_t action, const char *path);
+
+// Carries out a confirmed project switch. Called at the top of a frame, before
+// anything has drawn: opening a project can swap the active game, and the old
+// game's level and resources must not go away between the passes that render
+// them and the panels that read them.
+void ui_run_pending_project_switch(ui_handler_t *ui) {
+  game_host_browser_sync(&ui->gfx_handler->game_host);
+  if (ui->pending_action == UI_PENDING_NONE || !ui->pending_confirmed) return;
+
+  const ui_pending_action_t action = ui->pending_action;
+  const int game_index = ui->pending_game_index;
+  char variant[FT_ID_MAX];
+  snprintf(variant, sizeof(variant), "%s", ui->pending_variant_id);
+  char path[sizeof(ui->pending_path)];
+  snprintf(path, sizeof(path), "%s", ui->pending_path);
+  ui->pending_action = UI_PENDING_NONE;
+  ui->pending_path[0] = '\0';
+  ui->pending_confirmed = false;
+
+  switch (action) {
+  case UI_PENDING_NEW_PROJECT:
+    // Opening the picker is observational; the current project remains live.
+    game_host_browse_clear(&ui->gfx_handler->game_host);
+    ui->splash_stage = SPLASH_STAGE_GAME;
+    ui->show_splash = true;
+    break;
+  case UI_PENDING_OPEN_PROJECT:
+    // A project names the game it was authored under, so whatever the start
+    // screen was showing has no say in it.
+    game_host_browse_clear(&ui->gfx_handler->game_host);
+    if (path[0] && !load_project(ui, path)) log_error(LOG_SOURCE, "Could not load project from '%s'.", path);
+    break;
+  case UI_PENDING_LOAD_LEVEL:
+    if (path[0]) {
+      if (game_index >= 0) {
+        if (!gfx_activate_game(ui->gfx_handler, game_index)) break;
+        game_host_set_variant(&ui->gfx_handler->game_host, variant);
+      }
+      on_level_load_path(ui->gfx_handler, path);
+    }
+    break;
+  case UI_PENDING_OPEN_RECORDING:
+    if (path[0]) {
+      if (game_index >= 0) {
+        if (!gfx_activate_game(ui->gfx_handler, game_index)) break;
+        game_host_set_variant(&ui->gfx_handler->game_host, variant);
+      }
+      recording_import_open(ui, path, true);
+    }
+    break;
+  case UI_PENDING_SWITCH_BACKEND:
+    ui->backend_switch_failed =
+        !switch_project_backend(ui, game_index, ui->backend_switch_message, sizeof(ui->backend_switch_message));
+    if (!ui->backend_switch_failed)
+      snprintf(ui->backend_switch_message, sizeof(ui->backend_switch_message), "%s", logger_warnings());
+    ui->show_backend_switch_message = ui->backend_switch_failed || ui->backend_switch_message[0];
+    break;
+  case UI_PENDING_NONE:
+    break;
+  }
+}
+
+// What the prompt says it is about to discard the work for.
+static const char *pending_action_phrase(ui_handler_t *ui) {
+  switch (ui->pending_action) {
+  case UI_PENDING_OPEN_PROJECT:
+    return "opening another project";
+  case UI_PENDING_LOAD_LEVEL:
+    return "loading another level";
+  case UI_PENDING_OPEN_RECORDING:
+    return "starting a project from a demo";
+  default:
+    return "starting a new project";
+  }
+}
+
+// Why the project stayed on its physics, after the user asked to switch them, or what the other
+// physics do not play as these did.
+static void render_backend_switch_message(ui_handler_t *ui) {
+  const char *popup_id = ui->backend_switch_failed ? "Physics Not Switched###BackendSwitch" : "Physics Switched###BackendSwitch";
+  if (ui->show_backend_switch_message) {
+    ui->show_backend_switch_message = false;
+    igOpenPopup_Str(popup_id, ImGuiPopupFlags_None);
+  }
+  ImGuiViewport *viewport = igGetMainViewport();
+  igSetNextWindowPos((ImVec2){viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + viewport->WorkSize.y * 0.5f},
+                     ImGuiCond_Appearing, (ImVec2){0.5f, 0.5f});
+  if (!igBeginPopupModal(popup_id, NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+  const float dpi = gfx_get_ui_scale();
+  igPushTextWrapPos(420.0f * dpi);
+  igTextUnformatted(ui->backend_switch_message[0] ? ui->backend_switch_message : "The project could not be moved.", NULL);
+  igPopTextWrapPos();
+  igSpacing();
+  if (igButton("OK", (ImVec2){110.0f * dpi, 0.0f})) igCloseCurrentPopup();
+  igEndPopup();
+}
+
+static void render_unsaved_prompt(ui_handler_t *ui) {
+  const char *popup_id = "Unsaved Changes##PendingAction";
+
+  if (ui->show_unsaved_prompt) {
+    ui->show_unsaved_prompt = false;
+    igOpenPopup_Str(popup_id, ImGuiPopupFlags_None);
+  }
+
+  ImVec2 center;
+  ImGuiViewport *viewport = igGetMainViewport();
+  center.x = viewport->WorkPos.x + viewport->WorkSize.x * 0.5f;
+  center.y = viewport->WorkPos.y + viewport->WorkSize.y * 0.5f;
+  igSetNextWindowPos(center, ImGuiCond_Appearing, (ImVec2){0.5f, 0.5f});
+
+  if (igBeginPopupModal(popup_id, NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    // Saved through the file dialog, which answers after the Save button's frame.
+    if (ui->pending_confirmed || ui->pending_action == UI_PENDING_NONE) {
+      igCloseCurrentPopup();
+      igEndPopup();
+      return;
+    }
+    if (ui->current_project_path[0] != '\0') {
+      igText("'%s' has unsaved changes.", ui->current_project_path);
+    } else {
+      igText("The current project has unsaved changes.");
+    }
+    igText("Save them before %s?", pending_action_phrase(ui));
+
+    igSpacing();
+    igSeparator();
+    igSpacing();
+
+    float dpi = gfx_get_ui_scale();
+    ImVec2 button_size = {110.0f * dpi, 0.0f};
+
+    if (igButton("Save", button_size)) {
+      // a cancelled or failed save leaves the dialog up instead of moving on
+      if (ui->current_project_path[0] == '\0') {
+        open_project_dialog(ui, true, save_as_chosen_then_switch);
+      } else if (save_project(ui, ui->current_project_path)) {
+        ui->pending_confirmed = true;
+        igCloseCurrentPopup();
+      }
+    }
+    igSameLine(0.0f, 8.0f);
+    if (igButton("Don't Save", button_size)) {
+      ui->pending_confirmed = true;
+      igCloseCurrentPopup();
+    }
+    igSameLine(0.0f, 8.0f);
+    if (igButton("Cancel", button_size)) {
+      ui->pending_action = UI_PENDING_NONE;
+      ui->pending_path[0] = '\0';
+      igCloseCurrentPopup();
+    }
+    igEndPopup();
+  }
+}
+
+// --- splash: choosing a game -------------------------------------------------
+
+// The splash screen's sizes, given at a scale of 1 and following the text from there.
+static float splash_px(float value) { return value * gfx_get_ui_scale(); }
+
+// Thumbnails are loaded once per game and kept for the session. Cached here
+// rather than in the host because they are purely a UI concern.
+typedef struct {
+  texture_t *texture;
+  struct ImTextureRef_c *ref;
+  bool attempted;
+} game_thumbnail_t;
+
+static game_thumbnail_t g_game_thumbnails[32];
+// A family's card image, by the slot of the member that provides it.
+static game_thumbnail_t g_family_thumbnails[32];
+#define THUMBNAIL_SLOTS ((int)(sizeof(g_game_thumbnails) / sizeof(g_game_thumbnails[0])))
+
+static struct ImTextureRef_c *splash_thumbnail(game_thumbnail_t *cache, gfx_handler_t *gfx,
+                                               const game_module_slot_t *slot, int index, const char *relative) {
+  if (index < 0 || index >= THUMBNAIL_SLOTS) return NULL;
+  game_thumbnail_t *entry = &cache[index];
+  if (entry->attempted) return entry->ref;
+  entry->attempted = true;
+  if (!relative || !*relative) return NULL;
+
+  char path[GAME_HOST_MAX_PATH];
+  snprintf(path, sizeof(path), "data/games/%s/%s", slot->id, relative);
+  FILE *file = fs_open(path, "rb");
+  if (!file) return NULL;
+  fclose(file);
+
+  entry->texture = renderer_load_texture(gfx, path);
+  if (entry->texture) {
+    entry->ref = ImTextureRef_ImTextureRef_TextureID((ImTextureID)ImGui_ImplVulkan_AddTexture(
+        entry->texture->sampler, entry->texture->image_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+  }
+  return entry->ref;
+}
+
+static struct ImTextureRef_c *splash_game_thumbnail(gfx_handler_t *gfx, const game_module_slot_t *slot, int index) {
+  return splash_thumbnail(g_game_thumbnails, gfx, slot, index, slot->module ? slot->module->info.thumbnail : NULL);
+}
+
+static struct ImTextureRef_c *splash_family_thumbnail(gfx_handler_t *gfx, const game_module_slot_t *slot, int index) {
+  const ft_game_info *info = slot->module ? &slot->module->info : NULL;
+  if (!info) return NULL;
+  return splash_thumbnail(g_family_thumbnails, gfx, slot, index,
+                          info->family_thumbnail ? info->family_thumbnail : info->thumbnail);
+}
+
+// Height over width of a loaded thumbnail, 9:16 when there is none.
+static float thumbnail_aspect(const game_thumbnail_t *cache, int index) {
+  if (index >= 0 && index < THUMBNAIL_SLOTS) {
+    const texture_t *texture = cache[index].texture;
+    if (texture && texture->width > 0) return (float)texture->height / (float)texture->width;
+  }
+  return 9.0f / 16.0f;
+}
+
+// --- families: one card for a game in several modules -------------------------
+
+static const char *slot_family(const game_module_slot_t *slot) {
+  return slot->usable && slot->module ? slot->module->info.family : NULL;
+}
+
+static bool slot_in_family(const game_module_slot_t *slot, const char *family) {
+  const char *own = slot_family(slot);
+  return own && family && strcmp(own, family) == 0;
+}
+
+// The member each family's card opened last, for the session.
+typedef struct {
+  char family[64];
+  int index;
+} family_choice_t;
+static family_choice_t g_family_choices[8];
+
+static void family_remember(const char *family, int index) {
+  for (int i = 0; i < (int)(sizeof(g_family_choices) / sizeof(g_family_choices[0])); ++i) {
+    family_choice_t *choice = &g_family_choices[i];
+    if (!choice->family[0] || strcmp(choice->family, family) == 0) {
+      snprintf(choice->family, sizeof(choice->family), "%s", family);
+      choice->index = index;
+      return;
+    }
+  }
+}
+
+// The member a family's card opens: the one in use, else the one chosen last,
+// else the first in the family's order.
+static int family_representative(const game_host_t *host, const char *family) {
+  if (host->active >= 0 && slot_in_family(&host->slots[host->active], family)) return host->active;
+  for (int i = 0; i < (int)(sizeof(g_family_choices) / sizeof(g_family_choices[0])); ++i) {
+    const family_choice_t *choice = &g_family_choices[i];
+    if (choice->family[0] && strcmp(choice->family, family) == 0 && choice->index < host->count &&
+        slot_in_family(&host->slots[choice->index], family))
+      return choice->index;
+  }
+  int first = -1;
+  for (int i = 0; i < host->count; ++i)
+    if (slot_in_family(&host->slots[i], family) &&
+        (first < 0 || host->slots[i].module->info.family_order < host->slots[first].module->info.family_order))
+      first = i;
+  return first;
+}
+
+// Returns true when a game was chosen. Choosing one here costs nothing: the
+// game is built far enough to draw its own start screen and no further, and
+// whatever the editor already has open stays open and untouched until the user
+// actually starts a run.
+static bool render_splash_game_picker(ui_handler_t *ui, float width) {
+  (void)width;
+  game_host_t *host = &ui->gfx_handler->game_host;
+  bool chosen = false;
+
+  igTextColored((ImVec4){0.85f, 0.90f, 1.00f, 1.00f}, "%s", "Games");
+  igTextDisabled("Everything the editor simulates and draws comes from the game you pick.");
+  igSpacing();
+
+  // A grid of whole-card click targets drawn straight to the draw list, with no
+  // nested buttons.
+  const ImVec2 grid_avail = igGetContentRegionAvail();
+  const float card_width = splash_px(320.0f);
+  const float card_margin = splash_px(5.0f);
+  int columns = (int)(grid_avail.x / (card_width + card_margin * 2.0f));
+  if (columns < 1) columns = 1;
+
+  igPushStyleVar_Vec2(ImGuiStyleVar_CellPadding, (ImVec2){card_margin, card_margin});
+  if (igBeginTable("SplashGameGrid", columns, ImGuiTableFlags_SizingStretchSame, (ImVec2){0, 0}, 0)) {
+    for (int i = 0; i < host->count; ++i) {
+      const game_module_slot_t *slot = &host->slots[i];
+      // (a backend of another game is opened by that game's start screen)
+      if (!slot->usable || slot->module->info.backend_of) continue;
+
+      // A family is one card, at its first member's place, opening the member
+      // family_representative picks.
+      const char *family = slot_family(slot);
+      int opens = i;
+      if (family) {
+        bool seen = false;
+        for (int j = 0; j < i && !seen; ++j) seen = slot_in_family(&host->slots[j], family);
+        if (seen) continue;
+        opens = family_representative(host, family);
+      }
+
+      igTableNextColumn();
+      igPushID_Int(i);
+
+      struct ImTextureRef_c *thumbnail = family ? splash_family_thumbnail(ui->gfx_handler, &host->slots[opens], opens)
+                                                : splash_game_thumbnail(ui->gfx_handler, slot, i);
+      const float aspect = family ? thumbnail_aspect(g_family_thumbnails, opens) : thumbnail_aspect(g_game_thumbnails, i);
+
+      const ImVec2 cursor_pos = igGetCursorScreenPos();
+      float actual_card_w = igGetColumnWidth(-1) - splash_px(4.0f);
+      if (actual_card_w < splash_px(110.0f)) actual_card_w = card_width;
+      const float actual_thumb_h = actual_card_w * aspect;
+      const float total_item_h = actual_thumb_h;
+
+      const ImVec2 card_min = cursor_pos;
+      const ImVec2 card_max = {cursor_pos.x + actual_card_w, cursor_pos.y + total_item_h};
+      ImDrawList *draw_list = igGetWindowDrawList();
+
+      const bool clicked = igInvisibleButton("##game_card", (ImVec2){actual_card_w, total_item_h}, 0);
+      const bool hovered = igIsItemHovered(0);
+
+      const ImU32 bg_color = hovered ? IM_COL32(35, 46, 68, 245) : IM_COL32(22, 26, 36, 230);
+      ImDrawList_AddRectFilled(draw_list, card_min, card_max, bg_color, splash_px(8.0f), ImDrawFlags_None);
+
+      const ImVec2 thumb_min = card_min;
+      const ImVec2 thumb_max = {card_min.x + actual_card_w, card_min.y + actual_thumb_h};
+      if (thumbnail) {
+        ImDrawList_AddImageRounded(draw_list, *thumbnail, thumb_min, thumb_max, (ImVec2){0, 0}, (ImVec2){1, 1}, 0xFFFFFFFF, splash_px(8.0f),
+                                   ImDrawFlags_RoundCornersAll);
+      } else {
+        // Without an image the card still says what it is.
+        ImDrawList_AddRectFilled(draw_list, thumb_min, thumb_max, IM_COL32(18, 22, 30, 240), splash_px(8.0f), ImDrawFlags_RoundCornersAll);
+        const char *name = family ? family : slot->module->info.display_name;
+        const ImVec2 txt_sz = igCalcTextSize(name, NULL, false, -1.0f);
+        const ImVec2 txt_pos = {thumb_min.x + actual_card_w * 0.5f - txt_sz.x * 0.5f,
+                                thumb_min.y + actual_thumb_h * 0.5f - txt_sz.y * 0.5f};
+        ImDrawList_AddText_Vec2(draw_list, txt_pos, IM_COL32(200, 210, 225, 255), name, NULL);
+      }
+
+      // Only the hovered card stands out: the game browsed last is not a
+      // choice still in effect here.
+      const ImU32 border_color = hovered ? IM_COL32(90, 175, 255, 255) : IM_COL32(48, 56, 75, 140);
+      ImDrawList_AddRect(draw_list, card_min, card_max, border_color, splash_px(8.0f), ImDrawFlags_None, hovered ? 1.8f : 1.0f);
+
+      if (clicked) chosen = game_host_browse(host, opens);
+      igPopID();
+    }
+    igEndTable();
+  }
+  igPopStyleVar(1);
+
+  // Anything that failed to load is listed too, so a broken module is visible
+  // rather than silently absent.
+  bool any_usable = false;
+  for (int i = 0; i < host->count; ++i) {
+    if (host->slots[i].usable) {
+      any_usable = true;
+      continue;
+    }
+    igTextDisabled("%s could not be loaded: %s", host->slots[i].path, host->slots[i].error);
+  }
+  if (!any_usable) igTextDisabled("No game modules found in games/.");
+
+  return chosen;
+}
+
+// The start screen of a family's member: its members side by side, the one
+// shown highlighted, each switching the start screen to itself.
+static void render_splash_family_switcher(ui_handler_t *ui) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  const int browsed = game_host_browsed_index(host);
+  if (browsed < 0) return;
+  const char *family = slot_family(&host->slots[browsed]);
+  if (!family) return;
+
+  int members[16];
+  int count = 0;
+  for (int i = 0; i < host->count && count < 16; ++i)
+    if (slot_in_family(&host->slots[i], family)) members[count++] = i;
+  if (count < 2) return;
+  for (int i = 1; i < count; ++i) // by family_order, then discovery
+    for (int j = i; j > 0 && host->slots[members[j]].module->info.family_order <
+                                 host->slots[members[j - 1]].module->info.family_order;
+         --j) {
+      const int t = members[j];
+      members[j] = members[j - 1];
+      members[j - 1] = t;
+    }
+
+  const float gap = splash_px(10.0f);
+  float card_w = (igGetContentRegionAvail().x - gap * (float)(count - 1)) / (float)count;
+  if (card_w > splash_px(240.0f)) card_w = splash_px(240.0f);
+  ImDrawList *draw_list = igGetWindowDrawList();
+  for (int m = 0; m < count; ++m) {
+    const int i = members[m];
+    const game_module_slot_t *slot = &host->slots[i];
+    struct ImTextureRef_c *thumbnail = splash_game_thumbnail(ui->gfx_handler, slot, i);
+    const float card_h = card_w * thumbnail_aspect(g_game_thumbnails, i);
+
+    if (m > 0) igSameLine(0.0f, gap);
+    igPushID_Int(i);
+    const ImVec2 min = igGetCursorScreenPos();
+    const ImVec2 max = {min.x + card_w, min.y + card_h};
+    const bool clicked = igInvisibleButton("##family_member", (ImVec2){card_w, card_h}, 0);
+    const bool hovered = igIsItemHovered(0);
+    const bool current = i == browsed;
+    if (thumbnail) {
+      const ImU32 tint = current || hovered ? 0xFFFFFFFF : IM_COL32(255, 255, 255, 150);
+      ImDrawList_AddImageRounded(draw_list, *thumbnail, min, max, (ImVec2){0, 0}, (ImVec2){1, 1}, tint, splash_px(6.0f),
+                                 ImDrawFlags_RoundCornersAll);
+    } else {
+      ImDrawList_AddRectFilled(draw_list, min, max, IM_COL32(18, 22, 30, 240), splash_px(6.0f), ImDrawFlags_RoundCornersAll);
+      const char *name = slot->module->info.family_member ? slot->module->info.family_member
+                                                          : slot->module->info.display_name;
+      const ImVec2 size = igCalcTextSize(name, NULL, false, -1.0f);
+      ImDrawList_AddText_Vec2(draw_list, (ImVec2){min.x + (card_w - size.x) * 0.5f, min.y + (card_h - size.y) * 0.5f},
+                              IM_COL32(200, 210, 225, 255), name, NULL);
+    }
+    const ImU32 border = current ? IM_COL32(120, 200, 255, 255) : hovered ? IM_COL32(90, 175, 255, 255) : IM_COL32(48, 56, 75, 140);
+    ImDrawList_AddRect(draw_list, min, max, border, splash_px(6.0f), ImDrawFlags_None, current ? 2.5f : hovered ? 1.8f : 1.0f);
+    if (clicked && !current && game_host_browse(host, i)) family_remember(family, i);
+    igPopID();
+  }
+}
+
+static void render_splash_variant_selector(game_host_t *host) {
+  const ft_game_module *module = game_host_browsed_module(host);
+  if (!module || !module->constraints.variants || module->constraints.variant_count <= 1) return;
+
+  const char *current = game_host_browsed_variant(host);
+  const ft_game_variant *current_variant = &module->constraints.variants[0];
+  for (uint32_t i = 0; i < module->constraints.variant_count; ++i) {
+    if (current && strcmp(module->constraints.variants[i].id, current) == 0) {
+      current_variant = &module->constraints.variants[i];
+      break;
+    }
+  }
+
+  igAlignTextToFramePadding();
+  igTextDisabled("Game mode");
+  igSameLine(0.0f, splash_px(10.0f));
+  igSetNextItemWidth(splash_px(220.0f));
+  if (igBeginCombo("##SplashGameMode", current_variant->display_name, 0)) {
+    for (uint32_t i = 0; i < module->constraints.variant_count; ++i) {
+      const ft_game_variant *variant = &module->constraints.variants[i];
+      if (igSelectable_Bool(variant->display_name, variant == current_variant, 0, (ImVec2){0, 0}))
+        game_host_browsed_set_variant(host, variant->id);
+    }
+    igEndCombo();
+  }
+}
+
+// Backing out of the start screen drops whatever game it was only showing and
+// leaves the editor with exactly what it had.
+static void splash_dismiss(ui_handler_t *ui) {
+  game_host_browse_clear(&ui->gfx_handler->game_host);
+  ui->show_splash = false;
+  igCloseCurrentPopup();
+}
+
+// Capture the chosen game/ruleset with the request. The browser remains
+// independent while the unsaved-work prompt is pending; only confirmation can
+// activate a game or change its live ruleset.
+void ui_splash_open(ui_handler_t *ui, ui_pending_action_t action, const char *path) {
+  if (!ui || !path || !*path) return;
+  ui_splash_open_with(ui, action, path, game_host_browsed_index(&ui->gfx_handler->game_host));
+}
+
+void ui_splash_open_with(ui_handler_t *ui, ui_pending_action_t action, const char *path, int game_index) {
+  if (!ui || !path || !*path) return;
+  ui_request_project_switch(ui, action, path);
+  if (action == UI_PENDING_LOAD_LEVEL || action == UI_PENDING_OPEN_RECORDING) {
+    game_host_t *host = &ui->gfx_handler->game_host;
+    ui->pending_game_index = game_index;
+    // (the ruleset the start screen shows is the browsed game's; another one starts with its first)
+    snprintf(ui->pending_variant_id, sizeof(ui->pending_variant_id), "%s",
+             game_index == game_host_browsed_index(host) ? game_host_browsed_variant(host) : "");
+  }
+  ui->show_splash = false;
+  igCloseCurrentPopup();
+}
+
+// A file picked from the start screen. The dialog answers outside the screen's popup, which
+// ui_splash_open has to close, so the screen opens it the next time it draws.
+static struct {
+  ui_pending_action_t action;
+  char path[1024];
+} g_splash_pick;
+
+static void splash_pick(ui_pending_action_t action, const char *path) {
+  if (!path) return;
+  g_splash_pick.action = action;
+  snprintf(g_splash_pick.path, sizeof(g_splash_pick.path), "%s", path);
+}
+
+static void splash_level_chosen(void *user, const char *path) {
+  (void)user;
+  splash_pick(UI_PENDING_LOAD_LEVEL, path);
+}
+
+static void splash_recording_chosen(void *user, const char *path) {
+  (void)user;
+  splash_pick(UI_PENDING_OPEN_RECORDING, path);
+}
+
+static void splash_project_chosen(void *user, const char *path) {
+  (void)user;
+  splash_pick(UI_PENDING_OPEN_PROJECT, path);
+}
+
+static void render_splash_screen(ui_handler_t *ui) {
+  if (!igIsPopupOpen_Str("Splash Screen", ImGuiPopupFlags_None)) {
+    igOpenPopup_Str("Splash Screen", ImGuiPopupFlags_None);
+  }
+
+  ImVec2 center;
+  ImGuiViewport *viewport = igGetMainViewport();
+  center.x = viewport->WorkPos.x + viewport->WorkSize.x * 0.5f;
+  center.y = viewport->WorkPos.y + viewport->WorkSize.y * 0.5f;
+  igSetNextWindowPos(center, ImGuiCond_Always, (ImVec2){0.5f, 0.5f});
+
+  // Never past the screen, which a large interface size would otherwise take it.
+  float win_w = viewport->WorkSize.x * 0.88f;
+  if (win_w < splash_px(920.0f)) win_w = splash_px(920.0f);
+  if (win_w > splash_px(1220.0f)) win_w = splash_px(1220.0f);
+  if (win_w > viewport->WorkSize.x) win_w = viewport->WorkSize.x;
+
+  float win_h = viewport->WorkSize.y * 0.86f;
+  if (win_h < splash_px(660.0f)) win_h = splash_px(660.0f);
+  if (win_h > splash_px(780.0f)) win_h = splash_px(780.0f);
+  if (win_h > viewport->WorkSize.y) win_h = viewport->WorkSize.y;
+
+  igSetNextWindowSize((ImVec2){win_w, win_h}, ImGuiCond_Always);
+
+  ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize;
+
+  igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){splash_px(24.0f), splash_px(24.0f)});
+  igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){splash_px(14.0f), splash_px(14.0f)});
+  igPushStyleVar_Float(ImGuiStyleVar_WindowRounding, splash_px(12.0f));
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 1.5f);
+
+  if (igBeginPopupModal("Splash Screen", NULL, window_flags)) {
+    if (g_splash_pick.action != UI_PENDING_NONE) {
+      ui_splash_open(ui, g_splash_pick.action, g_splash_pick.path);
+      g_splash_pick.action = UI_PENDING_NONE;
+    }
+    float sidebar_w = splash_px(250.0f);
+
+    // Left sidebar column
+    igBeginChild_Str("SplashSidebar", (ImVec2){sidebar_w, 0}, false, ImGuiWindowFlags_NoScrollbar);
+    {
+      igSpacing();
+      igPushFont(ui->font, splash_px(48.0f));
+      igTextColored((ImVec4){0.35f, 0.75f, 1.00f, 1.00f}, "%s", "FrameTee");
+      igPopFont();
+      igTextDisabled("A TAS Engine and Editor");
+
+      igSpacing();
+      igSeparator();
+      igSpacing();
+
+      igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){0.10f, 0.5f});
+      igPushStyleVar_Float(ImGuiStyleVar_FrameRounding, splash_px(6.0f));
+
+      const float btn_w = -1.0f, btn_h = splash_px(42.0f);
+      if (ui->splash_stage == SPLASH_STAGE_START && igButton(ICON_FA_ARROW_LEFT "  Games", (ImVec2){btn_w, btn_h}))
+        ui->splash_stage = SPLASH_STAGE_GAME;
+
+      const ft_game_module *level_game = game_host_browsed_module(&ui->gfx_handler->game_host);
+      const char *level_ext = level_game ? level_game->constraints.level_extension : NULL;
+      if (ui->splash_stage == SPLASH_STAGE_START && level_ext) {
+        char extension[32], level_label[64];
+        level_extension_label(level_ext, extension, sizeof(extension));
+        snprintf(level_label, sizeof(level_label), ICON_FA_MAP "  Load Local %s", extension);
+        if (igButton(level_label, (ImVec2){btn_w, btn_h})) {
+          // The open is deferred until the next frame, after any unsaved-work prompt.
+          const file_dialog_t dialog = {.filter_name = level_game->constraints.level_filter_name, .filter_ext = level_ext};
+          file_dialog_open(&dialog, splash_level_chosen, ui);
+        }
+      }
+
+      if (ui->splash_stage == SPLASH_STAGE_START && level_game && (level_game->constraints.caps & FT_CAP_RECORDINGS)) {
+        const char *kind = level_game->constraints.recording_filter_name ? level_game->constraints.recording_filter_name : "Recording";
+        char recording_label[64];
+        snprintf(recording_label, sizeof(recording_label), ICON_FA_FILM "  Load %s", kind);
+        if (igButton(recording_label, (ImVec2){btn_w, btn_h})) {
+          // Like a level: opened next frame, after any unsaved-work prompt, as a new project.
+          const file_dialog_t dialog = {
+              .filter_name = kind,
+              .filter_ext = level_game->constraints.recording_extension ? level_game->constraints.recording_extension : "*"};
+          file_dialog_open(&dialog, splash_recording_chosen, ui);
+        }
+      }
+
+      if (igButton(ICON_FA_FOLDER_OPEN "  Load Project", (ImVec2){btn_w, btn_h})) open_project_dialog(ui, false, splash_project_chosen);
+
+      igPopStyleVar(2);
+
+      if (ui->num_recent_projects > 0) {
+        igSpacing();
+        igSeparator();
+        igSpacing();
+
+        igTextColored((ImVec4){0.70f, 0.75f, 0.85f, 1.00f}, "%s", ICON_FA_CLOCK " Recent Projects");
+        igSpacing();
+
+        igPushStyleVar_Float(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        igPushStyleVar_Float(ImGuiStyleVar_FrameRounding, splash_px(5.0f));
+        igPushStyleColor_Vec4(ImGuiCol_Button, (ImVec4){0.12f, 0.14f, 0.18f, 0.60f});
+        igPushStyleColor_Vec4(ImGuiCol_ButtonHovered, (ImVec4){0.22f, 0.28f, 0.38f, 0.85f});
+        igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){0.0f, 0.5f});
+
+        igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){0.0f, 0.0f});
+        igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){0.0f, splash_px(6.0f)});
+        if (igBeginChild_Str("RecentProjectsList", (ImVec2){0.0f, 0.0f}, false, ImGuiWindowFlags_None)) {
+          for (int i = 0; i < ui->num_recent_projects; i++) {
+            const char *path = ui->recent_projects[i];
+            const char *filename = strrchr(path, '/');
+            if (!filename) filename = strrchr(path, '\\');
+            if (!filename) filename = path;
+            else filename++;
+
+            char item_lbl[1050];
+            snprintf(item_lbl, sizeof(item_lbl), "%s  %s", ICON_FA_FILE, filename);
+
+            // Projects in different folders can share a file name, so the label alone is no ID.
+            igPushID_Int(i);
+            const bool clicked = igButton(item_lbl, (ImVec2){-1.0f, splash_px(32.0f)});
+            igPopID();
+            if (clicked) ui_splash_open(ui, UI_PENDING_OPEN_PROJECT, path);
+            if (igIsItemHovered(ImGuiHoveredFlags_None)) {
+              igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){splash_px(8.0f), splash_px(6.0f)});
+              if (igBeginTooltip()) {
+                igPushTextWrapPos(splash_px(380.0f));
+                igTextUnformatted(path, NULL);
+                igPopTextWrapPos();
+                igEndTooltip();
+              }
+              igPopStyleVar(1);
+            }
+          }
+        }
+        igEndChild();
+        igPopStyleVar(2);
+
+        igPopStyleVar(3);
+        igPopStyleColor(2);
+      }
+    }
+    igEndChild();
+
+    igSameLine(0, splash_px(18.0f));
+
+    // Right main panel: the game picker first, then whatever the chosen game
+    // wants a run to start from.
+    igBeginChild_Str("SplashMainPanel", (ImVec2){0, 0}, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    {
+      ImVec2 avail = igGetContentRegionAvail();
+      if (ui->splash_stage == SPLASH_STAGE_GAME) {
+        if (render_splash_game_picker(ui, avail.x)) ui->splash_stage = SPLASH_STAGE_START;
+      } else {
+        const ft_game_module *shown = game_host_browsed_module(&ui->gfx_handler->game_host);
+        render_splash_family_switcher(ui);
+        render_splash_variant_selector(&ui->gfx_handler->game_host);
+
+        ft_ui_frame frame = {0};
+        frame.struct_size = sizeof(frame);
+        frame.slot = FT_UI_SPLASH;
+        frame.tick = ui->timeline.current_tick;
+        frame.player = ui->timeline.selected_player_track_index;
+        engine_api_fill_state(&frame.state);
+        gh_browsed_ui(&ui->gfx_handler->game_host, &frame);
+
+        // A game with no start screen of its own still gets a usable one: the
+        // sidebar can open a level or a project.
+        if (!game_provides_splash(&ui->gfx_handler->game_host))
+          igTextDisabled("%s has no start screen. Open a level or a project from the left.",
+                         shown ? shown->info.display_name : "This game");
+      }
+    }
+    igEndChild();
+
+    // clicking the backdrop puts you back on the current project, which is
+    // still there however many other games were looked at on the way.
+    if (ui->gfx_handler->level != NULL &&
+        (igIsKeyPressed_Bool(ImGuiKey_Escape, false) ||
+         (igIsMouseClicked_Bool(ImGuiMouseButton_Left, false) && !igIsAnyItemActive() &&
+          !igIsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)))) {
+      splash_dismiss(ui);
+    }
+
+    igEndPopup();
+  }
+
+  igPopStyleVar(4);
+}
+
+// Input is held back while a file dialog is up (main.c), so the editor says why nothing answers.
+static void render_file_dialog_note(void) {
+  if (!file_dialog_active()) return;
+  const char *text = "Waiting for the file dialog...";
+  ImGuiViewport *viewport = igGetMainViewport();
+  const ImVec2 size = igCalcTextSize(text, NULL, false, 0.f);
+  const float pad = 8.f * gfx_get_ui_scale();
+  const ImVec2 pos = {roundf(viewport->WorkPos.x + (viewport->WorkSize.x - size.x) * 0.5f), viewport->WorkPos.y + 3.f * pad};
+  ImDrawList *draw = igGetForegroundDrawList_ViewportPtr(viewport);
+  ImDrawList_AddRectFilled(draw, (ImVec2){pos.x - 2.f * pad, pos.y - pad}, (ImVec2){pos.x + size.x + 2.f * pad, pos.y + size.y + pad},
+                           IM_COL32(0, 0, 0, 210), pad, 0);
+  ImDrawList_AddText_Vec2(draw, pos, IM_COL32(255, 255, 255, 255), text, NULL);
+}
+
+void ui_update(ui_handler_t *ui) {
+  // Before anything simulates this frame, so a recording that just finished opening is replayed
+  // by every world at once.
+  recordings_update(&ui->timeline);
+  interaction_update_recording_input(ui);
+
+  keybinds_process_inputs(ui);
+  model_playback_budget_frame(&ui->timeline, ui->timeline.is_playing || ui->timeline.is_reversing || ui->camera_editor.playing);
+  interaction_handle_playback_and_shortcuts(&ui->timeline);
+  // After the timeline's playback, so a camera that owns the clock has the last word on the tick.
+  camera_editor_update(ui);
+}
+
+void ui_render(ui_handler_t *ui) {
+  if (g_interface_size_changed) {
+    g_interface_size_changed = false;
+    ui_apply_interface_size();
+  }
+  // A dialog's answer acts like the click that asked for it, before anything else this frame.
+  file_dialog_update();
+  // Read by plugins for the same reason the panels below are gated: see
+  // tas_context_t::ui_visible. Set before the update that reads it.
+  ui->plugin_context.ui_visible = ui->show_ui;
+  plugin_manager_update_all(&ui->plugin_manager);
+
+  // Pinned to the right edge, so it runs after everything that appends to the
+  // menu bar: the editor's menus, the game's, and every plugin's. Anything
+  // drawn after this would be pushed off past it.
+  if (ui->show_fps && ui->show_ui) {
+    if (igBeginMainMenuBar()) {
+      ImVec2 region_avail = igGetContentRegionAvail();
+      ImGuiIO *io = igGetIO_Nil();
+      char fps_text[64];
+      snprintf(fps_text, sizeof(fps_text), "FPS: %.1f (%.2f ms)", io->Framerate, 1000.0f / io->Framerate);
+      ImVec2 fps_size = igCalcTextSize(fps_text, NULL, false, 0.0f);
+      igSetCursorPosX(igGetCursorPosX() + region_avail.x - fps_size.x);
+      igText("%s", fps_text);
+      igEndMainMenuBar();
+    }
+  }
+
+  // Tab drops every panel the editor and the game own, so the level is left
+  // with nothing over it but the menu bar. Input, shortcuts, the dock layout
+  // and plugin work all carry on: what goes away is what is drawn. An empty
+  // dock node takes no room, so the viewport grows into the space.
+  if (ui->show_ui) {
+    if (!ui->timeline.ui) ui->timeline.ui = ui;
+    render_timeline(ui);
+    camera_window_render(ui);
+    render_window_render(ui);
+    render_player_manager(ui);
+    render_snippet_editor_panel(ui);
+    input_effects_editor_render(ui);
+
+    undo_manager_render_history_window(&ui->undo_manager);
+    render_timeline_events_window(ui);
+    if (ui->show_plugin_manager) {
+      plugin_manager_render_ui(&ui->plugin_manager, &ui->show_plugin_manager);
+    }
+    // Drawn even under the start screen: browsing another game there cannot
+    // touch this one, and an open that can only lands at the top of the next
+    // frame, so the project stays on screen until it is really replaced.
+    if (ui->gfx_handler->level != NULL) {
+      ui_render_game_ui_slot(ui, FT_UI_PANELS, ui->timeline.selected_player_track_index);
+      // Only for a game that does not place the editor in a panel of its own.
+      starting_state_render_window(ui);
+    }
+  }
+
+  // Tab drops this one too, like any window; its shortcut brings the interface back.
+  if (ui->show_ui) keybinds_render_settings_window(ui);
+  render_quit_prompt(ui);
+
+  // Not a panel: the prompt answers something just asked for, a shortcut or closing the window, with
+  // the interface down as much as up.
+  render_unsaved_prompt(ui);
+  render_backend_switch_message(ui);
+  recording_import_render(ui);
+
+  // with nothing loaded the splash is the only thing to show, otherwise it is up because
+  // "New Project" raised it and the user can still dismiss it. A demo being imported from it is
+  // the exception: it brings its level once it is imported.
+  if ((ui->gfx_handler->level == NULL && !recording_import_active()) || ui->show_splash) {
+    render_splash_screen(ui);
+  }
+  render_file_dialog_note();
+}
+
+#define WORD_TO_BINARY_PATTERN "%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c"
+#define WORD_TO_BINARY(word)                                                                                                      \
+  ((word) & 0x8000 ? '1' : '0'), ((word) & 0x4000 ? '1' : '0'), ((word) & 0x2000 ? '1' : '0'), ((word) & 0x1000 ? '1' : '0'),     \
+      ((word) & 0x0800 ? '1' : '0'), ((word) & 0x0400 ? '1' : '0'), ((word) & 0x0200 ? '1' : '0'), ((word) & 0x0100 ? '1' : '0'), \
+      ((word) & 0x0080 ? '1' : '0'), ((word) & 0x0040 ? '1' : '0'), ((word) & 0x0020 ? '1' : '0'), ((word) & 0x0010 ? '1' : '0'), \
+      ((word) & 0x0008 ? '1' : '0'), ((word) & 0x0004 ? '1' : '0'), ((word) & 0x0002 ? '1' : '0'), ((word) & 0x0001 ? '1' : '0')
+
+// draw the recording overlay text in the top-right corner
+static void draw_recording_overlay(ImVec2 start) {
+  const char *text = "Recording... (ESC to Stop, F4 to Discard)";
+  ImVec2 text_size = igCalcTextSize(text, NULL, false, 0.0f);
+  ImVec2 avail = igGetContentRegionAvail();
+
+  ImVec2 text_pos = {start.x + avail.x - text_size.x - 20.0f, start.y};
+  ImDrawList_AddText_Vec2(igGetWindowDrawList(), text_pos, IM_COL32(255, 50, 50, 255), text, NULL);
+}
+
+// draw the telemetry text (character stats and input state)
+static void draw_character_inspector(ui_handler_t *ui, ImVec2 start) {
+  igPushFont(ui->font, 25.f * gfx_get_ui_scale());
+
+  // set the absolute y position, but let imgui handle x boundaries
+  igSetCursorScreenPos((ImVec2){start.x, start.y});
+
+  // push a 10px layout margin for the left side
+  igIndent(10.0f);
+
+  // The readout is the game's: it formats the lines, the editor draws them.
+  {
+    game_host_t *host = &ui->gfx_handler->game_host;
+    const ft_world *world = model_world_at_tick(&ui->timeline, ui->timeline.current_tick);
+    const int local_index = model_group_local_track_index(&ui->timeline, ui->timeline.selected_player_track_index);
+
+    float speed_scale = ui->timeline.is_reversing ? 2.0f : 1.0f;
+    float alpha = fminf((igGetTime() - ui->timeline.last_update_time) / (1.f / (ui->timeline.playback_speed * speed_scale)), 1.f);
+    if (ui->timeline.is_reversing) alpha = 1.f - alpha;
+
+    enum { MAX_STATUS_LINES = 24,
+           STATUS_LINE_SIZE = 128 };
+    static char lines[MAX_STATUS_LINES][STATUS_LINE_SIZE];
+    const unsigned count = gh_status_lines(host, world, local_index, alpha, &lines[0][0], MAX_STATUS_LINES, STATUS_LINE_SIZE);
+    for (unsigned i = 0; i < count; ++i)
+      igText("%s", lines[i]);
+  }
+
+  // input state
+  input_record_t Input = ui->timeline.player_tracks[ui->timeline.selected_player_track_index].current_input;
+  if (!ui->timeline.recording) {
+    int group_index = model_track_group_index(&ui->timeline, ui->timeline.selected_player_track_index);
+    Input = recordings_display_input(&ui->timeline, ui->timeline.selected_player_track_index,
+                                     model_group_playhead_tick(&ui->timeline, group_index));
+  }
+
+  igText("");
+  igText("Input:");
+  {
+    // One line per field the game declared, which is also exactly what the
+    // snippet editor edits and what gets written to the project.
+    game_host_t *host = &ui->gfx_handler->game_host;
+    const ft_input_schema *schema = game_input_schema(host);
+    for (uint32_t i = 0; schema && i < schema->field_count; ++i) {
+      const ft_input_field *field = &schema->fields[i];
+      if (field->flags & (FT_INPUT_FLAG_INTERNAL | FT_INPUT_FLAG_EDITOR_HIDDEN)) continue;
+      const char *label = field->display_name ? field->display_name : field->id;
+
+      if (field->kind == FT_INPUT_VEC2) {
+        const ft_vec2 value = engine_input_get_vec2(host, &Input, (int)i);
+        igText("%s: %.0f, %.0f", label, value.x, value.y);
+      } else if (field->kind == FT_INPUT_FLOAT) {
+        igText("%s: %.3f", label, engine_input_get_float(host, &Input, (int)i));
+      } else if (field->kind == FT_INPUT_ENUM && field->enum_labels) {
+        const long long value = engine_input_get(host, &Input, (int)i);
+        const long long index = value - field->min_value;
+        igText("%s: %s", label, (index >= 0 && index < field->enum_count) ? field->enum_labels[index] : "?");
+      } else {
+        igText("%s: %lld", label, engine_input_get(host, &Input, (int)i));
+      }
+    }
+  }
+
+  // restore layout defaults
+  igUnindent(10.0f);
+  igPopFont();
+}
+
+static void begin_viewport_window(const ui_handler_t *ui) {
+  igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){0, 0});
+  // With zero padding, a window border clips the outer image pixels. The
+  // viewport fills the content rectangle and must never acquire scroll offsets.
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 0.f);
+  igPushStyleVar_Float(ImGuiStyleVar_FrameBorderSize, 0.f);
+  igSetNextWindowScroll((ImVec2){0, 0});
+  if (!ui->show_ui) {
+    // With the interface down (Tab) the viewport is all there is: a window of
+    // its own over the whole OS window, without the menu bar or the docks
+    // (the docked "Viewport" keeps its place for when the interface returns).
+    // Kept behind, so the prompts and dialogs still come over it.
+    ImGuiViewport *main = igGetMainViewport();
+    igSetNextWindowPos(main->Pos, ImGuiCond_Always, (ImVec2){0.0f, 0.0f});
+    igSetNextWindowSize(main->Size, ImGuiCond_Always);
+    igSetNextWindowViewport(main->ID);
+    igPushStyleVar_Float(ImGuiStyleVar_WindowRounding, 0.0f);
+    igBegin("##ViewportFullscreen", NULL,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollWithMouse |
+                ImGuiWindowFlags_NoBringToFrontOnFocus);
+    igPopStyleVar(1);
+    return;
+  }
+  igBegin("Viewport", NULL, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+}
+
+void ui_begin_frame(ui_handler_t *ui) {
+  // Tab takes the menu bar and the docks away too: the viewport alone
+  if (ui->show_ui) {
+    render_menu_bar(ui);
+    setup_docking(ui);
+  } else {
+    // Kept alive though, so a docked window something still begins (a plugin's) stays docked, and
+    // hidden, rather than coming loose of a dockspace that is gone.
+    igDockSpace(main_dockspace(), (ImVec2){0.0f, 0.0f}, ImGuiDockNodeFlags_KeepAliveOnly, NULL);
+  }
+  // Resolve the docked content rectangle before the camera and Vulkan render
+  // target use it. The later Begin appends the image to this same window;
+  // ImGui keeps its layout fixed for the remainder of the frame.
+  begin_viewport_window(ui);
+  *(ImVec2_c *)&ui->viewport_window_pos = igGetCursorScreenPos();
+  ImVec2 avail = igGetContentRegionAvail();
+  ui->gfx_handler->viewport[0] = fmaxf(1.f, floorf(avail.x));
+  ui->gfx_handler->viewport[1] = fmaxf(1.f, floorf(avail.y));
+  // A capture is only worth comparing against another one taken the same way,
+  // and the window manager is free to ignore the size the window asked for --
+  // it may tile it, or half it. Pinning the drawn region here fixes both the
+  // aspect the camera projects with and the pixels --screenshot reads back,
+  // whatever the window ended up being.
+  {
+    const char *forced = getenv("FRAMETEE_VIEWPORT_SIZE");
+    if (forced != NULL) {
+      int w = 0, h = 0;
+      if (sscanf(forced, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+        ui->gfx_handler->viewport[0] = (float)w;
+        ui->gfx_handler->viewport[1] = (float)h;
+      }
+    }
+  }
+  // Previewing a video, the picture takes the video's shape inside the panel.
+  ui->viewport_panel_pos = ui->viewport_window_pos;
+  ui->viewport_panel_size = avail;
+  float x = ui->viewport_window_pos.x, y = ui->viewport_window_pos.y;
+  render_fit_viewport(ui, &x, &y, &ui->gfx_handler->viewport[0], &ui->gfx_handler->viewport[1]);
+  ui->viewport_window_pos.x = x;
+  ui->viewport_window_pos.y = y;
+  const ImVec2 end = {ui->viewport_window_pos.x + ui->gfx_handler->viewport[0],
+                      ui->viewport_window_pos.y + ui->gfx_handler->viewport[1]};
+  ui->viewport_hovered = igIsWindowHovered(0) && igIsMouseHoveringRect(ui->viewport_window_pos, end, true);
+  ui->viewport_focused = igIsWindowFocused(0);
+  igEnd();
+  igPopStyleVar(3);
+}
+
+bool ui_render_late(ui_handler_t *ui) {
+  bool hovered = false;
+
+  if (!ui->gfx_handler->offscreen_initialized || ui->gfx_handler->offscreen_texture == NULL)
+    return false;
+
+  begin_viewport_window(ui);
+  ImVec2 start = ui->viewport_window_pos;
+  const ImVec2 viewport_content_pos = start;
+  if (ui->render.preview)
+    ImDrawList_AddRectFilled(igGetWindowDrawList(), ui->viewport_panel_pos,
+                             (ImVec2){ui->viewport_panel_pos.x + ui->viewport_panel_size.x,
+                                      ui->viewport_panel_pos.y + ui->viewport_panel_size.y},
+                             IM_COL32(0, 0, 0, 255), 0.f, 0);
+  igSetCursorScreenPos(start);
+
+  ImVec2 img_size = {ui->gfx_handler->viewport[0], ui->gfx_handler->viewport[1]};
+  igImage(*ui->gfx_handler->offscreen_texture, img_size, (ImVec2){0, 0}, (ImVec2){1, 1});
+  igPopStyleVar(3);
+
+  ui->viewport_hovered = igIsItemHovered(0);
+  ui->viewport_focused = igIsWindowFocused(0);
+  hovered = ui->viewport_hovered;
+
+  start.x += 10.0f;
+  start.y += 10.0f;
+
+  // Camera path handles are drawn over the image and take a click before it
+  // can pick a player.
+  const bool camera_took_mouse = camera_editor_viewport_overlay(ui, viewport_content_pos.x, viewport_content_pos.y, hovered);
+
+  // handle raycast/click interaction
+  if (!camera_took_mouse && hovered && igIsMouseClicked_Bool(ImGuiMouseButton_Left, false)) {
+    ImGuiIO *io = igGetIO_Nil();
+    float mx = io->MousePos.x - viewport_content_pos.x;
+    float my = io->MousePos.y - viewport_content_pos.y;
+    float wx, wy;
+    screen_to_world(ui->gfx_handler, mx, my, &wx, &wy);
+
+    game_host_t *host = &ui->gfx_handler->game_host;
+
+    bool click_used = snippet_editor_take_world_click(ui, wx, wy);
+
+    if (!click_used)
+      click_used = starting_state_take_world_click(ui, wx, wy);
+
+    if (!click_used) {
+      int best_match = -1;
+      float best_dist = 1.5f;
+
+      // Picking a player only needs its position, which every game reports the
+      // same way. Every visible group is drawn into the same viewport, so all
+      // of them are searched.
+      for (int group_index = 0; group_index < ui->timeline.group_count; ++group_index) {
+        if (!ui->timeline.groups[group_index]->visible) continue;
+        const ft_world *group_world = model_group_world_at_tick(&ui->timeline, group_index, ui->timeline.current_tick);
+        if (!group_world) continue;
+
+        const int players = gh_world_player_count(host, group_world);
+        for (int local_index = 0; local_index < players; ++local_index) {
+          ft_player_view view;
+          if (!gh_world_player_view(host, group_world, local_index, &view)) continue;
+          const float dx = view.position.x - wx;
+          const float dy = view.position.y - wy;
+          const float dist = sqrtf(dx * dx + dy * dy);
+          if (dist < best_dist) {
+            best_dist = dist;
+            best_match = model_group_track_index(&ui->timeline, group_index, local_index);
+          }
+        }
+      }
+
+      if (best_match != -1) {
+        interaction_select_track(&ui->timeline, best_match);
+        interaction_select_track(&ui->timeline, -1);
+      }
+    }
+  }
+
+  if (hovered && snippet_editor_is_picking())
+    igSetTooltip("Click to choose the aim position");
+
+
+  // draw overlays & menus
+  if (ui->timeline.recording) {
+    draw_recording_overlay(start);
+  }
+
+  // With the interface down there is no panel left to hover, so the key works
+  // wherever the cursor is: it is the way back. Not while a field has the
+  // keyboard, where Tab is the field's.
+  if ((hovered || ui->timeline.recording || !ui->show_ui) && !igIsAnyItemActive() && input_key_pressed(GLFW_KEY_TAB, false)) {
+    ui->show_ui = !ui->show_ui;
+  }
+
+  // The readout is for editing inputs; the Camera and Render tabs frame the video instead.
+  if (ui->timeline.selected_player_track_index >= 0 && !camera_editor_owns_clock(ui)) {
+    draw_character_inspector(ui, start);
+  }
+
+  igEnd();
+  return hovered;
+}
+
+void ui_post_level_load(ui_handler_t *ui) {
+  // Anything derived from a level is derived by the game that loaded it; the
+  // editor only resets what it owns.
+  ui->timeline.current_tick = 0;
+  ui->timeline.event_count = 0;
+  ++ui->timeline.event_revision;
+  camera_timeline_default(&ui->camera_timeline);
+  camera_editor_reset(ui);
+  render_state_new_project(ui);
+}
+
+void ui_cleanup(ui_handler_t *ui) {
+  config_save(ui); // a render worker's is a no-op
+  plugin_manager_shutdown(&ui->plugin_manager);
+  snippet_editor_cleanup();
+  undo_manager_cleanup(&ui->undo_manager);
+  timeline_cleanup(&ui->timeline);
+  keybinds_cleanup(&ui->keybinds);
+  file_dialog_shutdown();
+}
+
+void ui_toggle_style_push(bool on) {
+  const ImVec4 *colors = igGetStyle()->Colors;
+  igPushStyleColor_Vec4(ImGuiCol_Button, colors[on ? ImGuiCol_Button : ImGuiCol_FrameBg]);
+  igPushStyleColor_Vec4(ImGuiCol_ButtonHovered, colors[on ? ImGuiCol_ButtonHovered : ImGuiCol_FrameBgHovered]);
+  igPushStyleColor_Vec4(ImGuiCol_ButtonActive, colors[on ? ImGuiCol_ButtonActive : ImGuiCol_FrameBgActive]);
+  igPushStyleColor_Vec4(ImGuiCol_Text, colors[on ? ImGuiCol_Text : ImGuiCol_TextDisabled]);
+}
+
+void ui_toggle_style_pop(void) { igPopStyleColor(4); }
+
+bool ui_icon_button(ui_handler_t *ui, const char *icon, ImVec2 size) {
+  ImGuiWindow *window = igGetCurrentWindow();
+  if (window->SkipItems) return false;
+
+  ImGuiContext *g = igGetCurrentContext();
+  const ImGuiStyle *style = &g->Style;
+  const ImGuiID id = igGetID_Str(icon);
+
+  float dpi = gfx_get_ui_scale();
+  ImVec2 pos = window->DC.CursorPos;
+
+  if (size.x <= 0.0f) size.x = 30.0f * dpi;
+  if (size.y <= 0.0f) size.y = igGetFrameHeight();
+
+  const ImRect bb = {pos, {pos.x + size.x, pos.y + size.y}};
+  igItemSize_Vec2(size, style->FramePadding.y);
+  if (!igItemAdd(bb, id, NULL, 0)) return false;
+
+  bool hovered, held;
+  bool pressed = igButtonBehavior(bb, id, &hovered, &held, 0);
+
+  // Render button background & border
+  ImGuiCol col_idx = held ? ImGuiCol_ButtonActive : (hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+  ImU32 col = igGetColorU32_Col(col_idx, 1.0f);
+  igRenderFrame(bb.Min, bb.Max, col, true, style->FrameRounding);
+
+  ImFont *font = (ui && ui->icon_font) ? ui->icon_font : igGetFont();
+
+  if (ui && ui->icon_font) {
+    igPushFont(ui->icon_font, 0.0f);
+  }
+
+  float font_size = igGetFontSize();
+  float max_font_size = size.y * 0.55f;
+  if (font_size > max_font_size) {
+    font_size = max_font_size;
+  }
+
+  ImVec2 text_size = {0};
+  if (font) {
+    text_size = ImFont_CalcTextSizeA(font, font_size, 3.402823466e+38F, -1.0f, icon, NULL, NULL);
+  } else {
+    text_size = igCalcTextSize(icon, NULL, false, -1.0f);
+  }
+
+  if (ui && ui->icon_font) {
+    igPopFont();
+  }
+
+  // Calculate top-left for AddText so icon visual center matches button frame center
+  ImVec2 center = {(bb.Min.x + bb.Max.x) * 0.5f, (bb.Min.y + bb.Max.y) * 0.5f};
+  ImVec2 text_pos = {
+      roundf(center.x - text_size.x * 0.5f),
+      roundf(center.y - text_size.y * 0.5f)};
+
+  ImDrawList_AddText_FontPtr(
+      igGetWindowDrawList(),
+      font,
+      font_size,
+      text_pos,
+      igGetColorU32_Col(ImGuiCol_Text, 1.0f),
+      icon,
+      NULL,
+      0.0f,
+      NULL);
+
+  return pressed;
+}
+
+void ui_quick_save(ui_handler_t *ui) {
+  if (ui->current_project_path[0] != '\0') save_project(ui, ui->current_project_path);
+  else ui_save_project_as(ui);
+}
+
+// Every entry point that would throw away unsaved work funnels through here:
+// the request is recorded, and either the prompt answers for it or it is
+// already settled. `path` is ignored for UI_PENDING_NEW_PROJECT.
+static void ui_request_project_switch(ui_handler_t *ui, ui_pending_action_t action, const char *path) {
+  ui->pending_action = action;
+  ui->pending_game_index = -1;
+  ui->pending_variant_id[0] = '\0';
+  snprintf(ui->pending_path, sizeof(ui->pending_path), "%s", path ? path : "");
+  ui->pending_confirmed = !ui->has_unsaved_changes;
+  ui->show_unsaved_prompt = ui->has_unsaved_changes;
+}
+
+void ui_request_new_project(ui_handler_t *ui) {
+  ui_request_project_switch(ui, UI_PENDING_NEW_PROJECT, NULL);
+  ui->pending_confirmed = true;
+  ui->show_unsaved_prompt = false;
+}
+
+static void project_open_chosen(void *user, const char *path) {
+  if (path) ui_request_project_switch(user, UI_PENDING_OPEN_PROJECT, path);
+}
+
+void ui_request_open_project(ui_handler_t *ui, const char *path) {
+  // Asking for the file first means a cancelled dialog asks nothing else.
+  if (!path) open_project_dialog(ui, false, project_open_chosen);
+  else ui_request_project_switch(ui, UI_PENDING_OPEN_PROJECT, path);
+}
+
+void ui_request_load_level(ui_handler_t *ui, const char *path) {
+  if (!path || !*path) return;
+  ui_request_project_switch(ui, UI_PENDING_LOAD_LEVEL, path);
+}
+
+void ui_request_load_level_with(ui_handler_t *ui, const char *path, int game_index) {
+  if (!path || !*path) return;
+  ui_request_project_switch(ui, UI_PENDING_LOAD_LEVEL, path);
+  ui->pending_game_index = game_index;
+}
+
+bool ui_request_switch_backend(ui_handler_t *ui, int game_index) {
+  game_host_t *host = &ui->gfx_handler->game_host;
+  if (!ui->gfx_handler->level || !game_host_same_game(host, host->active, game_index)) return false;
+  if (game_index == host->active) return true;
+  // (the project goes along, so there is nothing to ask about)
+  ui_request_project_switch(ui, UI_PENDING_SWITCH_BACKEND, NULL);
+  ui->pending_game_index = game_index;
+  ui->pending_confirmed = true;
+  ui->show_unsaved_prompt = false;
+  return true;
+}
+
+void ui_mark_unsaved(ui_handler_t *ui) {
+  if (ui) {
+    ui->has_unsaved_changes = true;
+  }
+}
+
+void timeline_mark_unsaved(timeline_state_t *ts) {
+  if (ts && ts->ui) {
+    ts->ui->has_unsaved_changes = true;
+  }
+}
+
+void ui_check_auto_save(ui_handler_t *ui) {
+  if (!ui->auto_save_enabled) return;
+  if (ui->current_project_path[0] == '\0') return;
+  if (!ui->has_unsaved_changes) return;
+
+  double now = glfwGetTime();
+  if (ui->last_auto_save_time <= 0.0) {
+    ui->last_auto_save_time = now;
+    return;
+  }
+
+  if (now - ui->last_auto_save_time >= (double)ui->auto_save_interval_sec) {
+    log_info(LOG_SOURCE, "Auto-saving project to '%s'...", ui->current_project_path);
+    save_project(ui, ui->current_project_path);
+    ui->last_auto_save_time = now;
+  }
+}

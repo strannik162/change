@@ -1,0 +1,447 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libx11-dev \
+          libwayland-dev \
+          libxkbcommon-dev \
+          libxrandr-dev \
+          libxinerama-dev \
+          libxcursor-dev \
+          libxi-dev \
+          libgtk-3-dev \
+          libglfw3-dev \
+          libcurl4-openssl-dev \
+          libfreetype6-dev \
+          libavformat-dev \
+          libavcodec-dev \
+          libavutil-dev \
+          libswscale-dev \
+          pkg-config
+
+    - name: Setup Vulkan SDK
+      uses: humbletim/install-vulkan-sdk@v1.2
+      with:
+        version: 1.3.296.0
+        cache: true
+
+    - name: Configure CMake
+      run: >-
+        cmake -S . -B build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_DISABLE_FIND_PACKAGE_glfw3=ON
+        -DGLFW_BUILD_WAYLAND=ON
+        -DGLFW_LIBRARY_TYPE=STATIC
+        -DBUILD_GAMES=ON
+        -DBUILD_PLUGINS=ON
+        '-DFRAMETEE_PLUGIN_ALLOWLIST=example_c;example_cpp;physics_profiler;random_input_filler'
+        -DFRAMETEE_BUILD_TMUF=ON
+        -DFRAMETEE_BUILD_CUBE_EXAMPLE=OFF
+        -DFRAMETEE_BUILD_PLATFORMER_EXAMPLE=OFF
+        -DFRAMETEE_BUILD_RUST_EXAMPLE=OFF
+        -DFRAMETEE_REQUIRE_VIDEO_EXPORT=ON
+
+    - name: Build
+      run: cmake --build build --config Release --parallel
+
+    - name: Prepare Artifact
+      run: |
+        set -euo pipefail
+        cmake --install build \
+          --prefix "$PWD/artifact/frametee-linux" \
+          --component Runtime \
+          --strip
+
+        (
+          cd artifact/frametee-linux
+          test -f data/games/ddnet/shaders/map.frag.spv
+          test -f data/games/ddnet/skins/default.png
+          test -f data/games/ddnet/textures/emoticons.png
+          test -f data/fonts/DejaVuSans.ttf
+          test -f data/fonts/DejaVuSans-LICENSE.txt
+          test -f data/games/tmuf/thumbnail.png
+          test -f data/games/tmuf/README.txt
+          # A plugin is a directory holding its library, its manifest and any
+          # resources it ships. The directory names the plugin on every
+          # platform, and the library inside carries that name.
+          test -f plugins/example_c/libexample_c.so
+          test -f plugins/example_cpp/libexample_cpp.so
+          test -f plugins/physics_profiler/libphysics_profiler.so
+          test -f plugins/random_input_filler/librandom_input_filler.so
+          test -f plugins/physics_profiler/plugin.toml
+          test -f plugins/random_input_filler/plugin.toml
+          test -z "$(find plugins -type f ! -name '*.so*' ! -name '*.toml' -print -quit)"
+          test ! -d data/textures
+          test ! -f data/fonts/JetBrainsMono-Medium.ttf
+          test -z "$(find . -type f \( -name '*.o' -o -name '*.a' -o -name '*.cmake' -o -name '*.pdb' -o -name '*.glsl' \) -print -quit)"
+          find . -type f -print | sort
+        )
+
+    - name: Verify Relocated Artifact
+      run: |
+        set -euo pipefail
+        # Run the smoke test from a copy that has no build tree next to it. In
+        # place, an absolute build-tree RUNPATH resolves and hides exactly the
+        # breakage users hit after unpacking a release elsewhere.
+        relocated="$RUNNER_TEMP/frametee-relocated"
+        rm -rf "$relocated"
+        mkdir -p "$relocated"
+        cp -a artifact/frametee-linux/. "$relocated/"
+        rm -rf build
+
+        cd "$relocated"
+        while IFS= read -r binary; do
+          resolved=$(ldd "$binary")
+          if grep -q "not found" <<<"$resolved"; then
+            echo "::error::$binary has unresolved libraries"
+            printf '%s\n' "$resolved"
+            exit 1
+          fi
+          # Everything has to come either from the bundle itself or from the
+          # system; nothing may point back into the checkout.
+          if grep -q "$GITHUB_WORKSPACE" <<<"$resolved"; then
+            echo "::error::$binary still resolves libraries inside the checkout"
+            printf '%s\n' "$resolved"
+            exit 1
+          fi
+        done < <(find . -type f \( -name "frametee" -o -name "*.so*" \) -print)
+
+        ./frametee --list-games | tee "$RUNNER_TEMP/frametee-game-modules.txt"
+        grep -Eq '^  ddnet[[:space:]]' "$RUNNER_TEMP/frametee-game-modules.txt"
+        grep -Eq '^  tmuf[[:space:]]' "$RUNNER_TEMP/frametee-game-modules.txt"
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: frametee-linux
+        # The directory itself, so the zip unpacks into frametee-linux/
+        # rather than spilling its files where it is unpacked.
+        path: artifact/
+
+  build-windows:
+    name: Windows (MinGW-w64)
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup MinGW-w64 environment
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        cache: true
+        path-type: strict
+        install: >-
+          make
+          tar
+          xz
+        pacboy: >-
+          toolchain:p
+          cmake:p
+          ninja:p
+          pkgconf:p
+          zlib:p
+          vulkan-headers:p
+          vulkan-loader:p
+          glslang:p
+          x264:p
+          svt-av1:p
+          libvpl:p
+          ffnvcodec-headers:p
+          amf-headers:p
+          nasm:p
+          rust:p
+
+    # MSYS2's packages are built for everyone, and the release bundles every
+    # DLL they link: its FFmpeg links nearly every codec and filter library
+    # (aom, rav1e, librsvg with cairo and glib, gnutls, SDL2, whisper.cpp, ...;
+    # about 100 DLLs, 145 MB), its x265 has a 12-bit encoder, its curl OpenSSL
+    # for SSH and libidn2 with libunistring, its FreeType HarfBuzz with GLib.
+    # These are built with only what frametee uses and installed into the
+    # UCRT64 prefix, where the steps below find them like packages:
+    # - x265: 8-bit with the 10-bit encoder linked in, the export's two depths
+    # - FFmpeg: the MP4 muxer, x264, x265, SVT-AV1, AAC and the hardware encoders
+    # - curl: HTTP(S) over Schannel, for the DDNet module's downloads
+    # - FreeType: no HarfBuzz, PNG, Brotli, bzip2 or system zlib
+    - name: Cache dependencies
+      id: deps-cache
+      uses: actions/cache@v4
+      with:
+        path: deps-ucrt64
+        key: deps-ucrt64-x265-4.3-ffmpeg-9.0.2-curl-8.22.0-freetype-2.14.3-v1
+
+    - name: Build dependencies
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        # Built for /ucrt64 and installed there (each finds the ones before
+        # it), staged under deps-ucrt64 for the cache.
+        stage="$(cygpath -u "$GITHUB_WORKSPACE")/deps-ucrt64"
+        # MSYS paths: tar takes "D:..." for a remote host
+        temp="$(cygpath -u "$RUNNER_TEMP")"
+        fetch() {
+          curl -sSfL -o "$temp/$(basename "$2")" "$2"
+          mkdir -p "$temp/$1"
+          tar -xf "$temp/$(basename "$2")" -C "$temp/$1" --strip-components=1
+        }
+        install_stage() {
+          cp -r "$stage/ucrt64/." /ucrt64/
+        }
+        # All first: the curl built below replaces MSYS2's.
+        fetch x265 https://github.com/Multicorewareinc/x265/releases/download/4.3/x265_4.3.tar.gz
+        fetch ffmpeg https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+        fetch curl https://curl.se/download/curl-8.22.0.tar.xz
+        fetch freetype https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz
+
+        cmake -S "$temp/x265/source" -B "$temp/x265-10" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_CLI=OFF -DENABLE_SHARED=OFF
+        cmake --build "$temp/x265-10"
+        mkdir -p "$temp/x265-8"
+        cp "$temp/x265-10/libx265.a" "$temp/x265-8/libx265_main10.a"
+        cmake -S "$temp/x265/source" -B "$temp/x265-8" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/ucrt64 -DENABLE_SHARED=ON -DENABLE_CLI=OFF -DCMAKE_DLL_NAME_WITH_SOVERSION=ON \
+          -DEXTRA_LIB=x265_main10.a -DEXTRA_LINK_FLAGS=-L. -DLINKED_10BIT=ON
+        cmake --build "$temp/x265-8"
+        cmake --install "$temp/x265-8" --strip --prefix "$stage/ucrt64"
+        install_stage
+
+        (
+          cd "$temp/ffmpeg"
+          ./configure --prefix=/ucrt64 \
+            --enable-shared --disable-static --disable-programs --disable-doc --disable-debug \
+            --disable-everything --disable-autodetect \
+            --disable-avdevice --disable-avfilter --disable-swresample --disable-network \
+            --enable-gpl --enable-libx264 --enable-libx265 --enable-libsvtav1 \
+            --enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va --enable-dxva2 \
+            --enable-encoder=libx264,libx265,libsvtav1,aac,h264_nvenc,hevc_nvenc,av1_nvenc,h264_amf,hevc_amf,av1_amf,h264_qsv,hevc_qsv,av1_qsv \
+            --enable-parser=h264,hevc,av1 \
+            --enable-muxer=mp4 --enable-protocol=file
+          make -j"$(nproc)"
+          make install DESTDIR="$stage"
+        )
+        install_stage
+
+        cmake -S "$temp/curl" -B "$temp/curl-build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/ucrt64 -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF \
+          -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF \
+          -DENABLE_CURL_MANUAL=OFF -DHTTP_ONLY=ON -DCURL_USE_SCHANNEL=ON -DCURL_USE_OPENSSL=OFF \
+          -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF \
+          -DUSE_WIN32_IDN=ON -DUSE_NGHTTP2=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DCURL_ZLIB=OFF \
+          -DCURL_USE_GSSAPI=OFF -DCURL_DISABLE_LDAP=ON
+        cmake --build "$temp/curl-build"
+        cmake --install "$temp/curl-build" --strip --prefix "$stage/ucrt64"
+
+        cmake -S "$temp/freetype" -B "$temp/freetype-build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/ucrt64 -DBUILD_SHARED_LIBS=ON -DFT_DISABLE_HARFBUZZ=ON \
+          -DFT_DISABLE_PNG=ON -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_ZLIB=ON
+        cmake --build "$temp/freetype-build"
+        cmake --install "$temp/freetype-build" --strip --prefix "$stage/ucrt64"
+
+    - name: Install dependencies
+      shell: msys2 {0}
+      run: cp -r "$(cygpath -u "$GITHUB_WORKSPACE")/deps-ucrt64/ucrt64/." /ucrt64/
+
+    - name: Configure CMake
+      shell: msys2 {0}
+      run: >-
+        cmake -S . -B build -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DBUILD_GAMES=ON
+        -DBUILD_PLUGINS=ON
+        '-DFRAMETEE_PLUGIN_ALLOWLIST=example_c;example_cpp;physics_profiler;random_input_filler'
+        -DFRAMETEE_BUILD_TMUF=ON
+        -DFRAMETEE_BUILD_CUBE_EXAMPLE=OFF
+        -DFRAMETEE_BUILD_PLATFORMER_EXAMPLE=OFF
+        -DFRAMETEE_BUILD_RUST_EXAMPLE=OFF
+        -DFRAMETEE_REQUIRE_VIDEO_EXPORT=ON
+
+    - name: Build
+      shell: msys2 {0}
+      run: cmake --build build --config Release --parallel
+
+    - name: Prepare Artifact
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        require_file() {
+          if [ ! -f "$1" ]; then
+            echo "::error::Required release file is missing: $1"
+            exit 1
+          fi
+        }
+
+        cmake --install build \
+          --prefix "$PWD/artifact/frametee-windows" \
+          --component Runtime \
+          --strip
+
+        # The application imports the Vulkan loader before main() is reached.
+        # Bundle the redistributable loader deliberately instead of assuming a
+        # graphics driver installed vulkan-1.dll system-wide. This fixes startup
+        # on affected Intel integrated-graphics driver installations; the loader
+        # still discovers the machine's actual Intel ICD through the registry.
+        require_file /ucrt64/bin/vulkan-1.dll
+        cp /ucrt64/bin/vulkan-1.dll artifact/frametee-windows/
+
+        # MinGW, curl/Schannel, FreeType and FFmpeg are dynamically linked. ldd reports
+        # the complete transitive UCRT64 DLL closure for the executable and
+        # every loadable game; Windows finds these beside frametee.exe. Keep the
+        # dependency report in the runner temp directory, outside the release.
+        runtime_list="$RUNNER_TEMP/frametee-runtime-dlls.txt"
+        # games/ too: the engine adds it to the DLL search path (fs_load_library),
+        # where a plugin finds a game's library (the profiler links SM64's).
+        export PATH="$PWD/artifact/frametee-windows:$PWD/artifact/frametee-windows/games:$PATH"
+        while IFS= read -r binary; do
+          ldd "$binary" || true
+        done < <(find artifact/frametee-windows -type f \
+          \( -iname "*.exe" -o -iname "*.dll" \) -print) |
+          awk '$3 ~ /^\/ucrt64\/bin\/.*\.dll$/ { print $3 }' |
+          sort -u > "$runtime_list"
+        while IFS= read -r library; do
+          [ -z "$library" ] || cp "$library" artifact/frametee-windows/
+        done < "$runtime_list"
+
+        while IFS= read -r binary; do
+          if ldd "$binary" | grep -q "not found"; then
+            ldd "$binary"
+            exit 1
+          fi
+        done < <(find artifact/frametee-windows -type f \
+          \( -iname "*.exe" -o -iname "*.dll" \) -print)
+
+        # Exercise the same bundled libcurl DLL closure outside MSYS2's bin
+        # directory. The WinSSL build uses Windows' Schannel trust store, so a
+        # release does not depend on /ucrt64/etc/ssl existing on the end-user
+        # machine. The normal OpenSSL curl build did, which made every HTTPS
+        # map and skin request fail after the CA bundle was left out.
+        network_smoke="$RUNNER_TEMP/frametee-network-smoke"
+        mkdir -p "$network_smoke"
+        cp /ucrt64/bin/curl.exe "$network_smoke/"
+        find artifact/frametee-windows -maxdepth 1 -type f -iname "*.dll" \
+          -exec cp {} "$network_smoke/" \;
+        curl_version=$("$network_smoke/curl.exe" --version)
+        printf '%s\n' "$curl_version"
+        if ! grep -qi 'Schannel' <<<"$curl_version"; then
+          echo "::error::The release libcurl is not using Windows Schannel"
+          exit 1
+        fi
+        "$network_smoke/curl.exe" --fail --silent --show-error \
+          --output "$RUNNER_TEMP/frametee-maps.json" \
+          https://raw.githubusercontent.com/Teero888/tw-thumbs/refs/heads/master/maps.json
+        require_file "$RUNNER_TEMP/frametee-maps.json"
+
+        (
+          cd artifact/frametee-windows
+          require_file data/games/ddnet/shaders/map.frag.spv
+          require_file data/games/ddnet/skins/default.png
+          require_file data/games/ddnet/textures/emoticons.png
+          require_file data/fonts/DejaVuSans.ttf
+          require_file data/fonts/DejaVuSans-LICENSE.txt
+          require_file data/games/tmuf/thumbnail.png
+          require_file data/games/tmuf/README.txt
+          require_file vulkan-1.dll
+          # MP4 export: FFmpeg's DLLs come along with the rest of the closure.
+          if ! compgen -G "avcodec-*.dll" > /dev/null || ! compgen -G "avformat-*.dll" > /dev/null; then
+            echo "::error::The release is missing FFmpeg's DLLs, so MP4 export would not load"
+            exit 1
+          fi
+          # See the Linux job: one directory per plugin, named after it.
+          require_file plugins/example_c/example_c.dll
+          require_file plugins/example_cpp/example_cpp.dll
+          require_file plugins/physics_profiler/physics_profiler.dll
+          require_file plugins/random_input_filler/random_input_filler.dll
+          require_file plugins/physics_profiler/plugin.toml
+          require_file plugins/random_input_filler/plugin.toml
+          test -z "$(find plugins -type f ! -iname '*.dll' ! -iname '*.toml' -print -quit)"
+          test ! -d data/textures
+          test ! -f data/fonts/JetBrainsMono-Medium.ttf
+          test -z "$(find . -type f \( -name '*.o' -o -name '*.a' -o -name '*.cmake' -o -name '*.pdb' -o -name '*.glsl' -o -name '*.ilk' -o -name '*.lib' -o -name '*.exp' \) -print -quit)"
+          # With only Windows' own directories on PATH, as on a user's machine:
+          # the bundle's DLLs above are on it, which hid a game that could not
+          # find them beside the executable.
+          PATH="$(cygpath -u "$SYSTEMROOT")/System32:$(cygpath -u "$SYSTEMROOT")" \
+            ./frametee.exe --list-games | tee "$RUNNER_TEMP/frametee-game-modules.txt"
+          grep -Eq '^  ddnet[[:space:]]' "$RUNNER_TEMP/frametee-game-modules.txt"
+          grep -Eq '^  tmuf[[:space:]]' "$RUNNER_TEMP/frametee-game-modules.txt"
+          find . -type f -print | sort
+        )
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: frametee-windows
+        # The directory itself, so the zip unpacks into frametee-windows/
+        # rather than spilling its files where it is unpacked.
+        path: artifact/
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        # Each artifact holds its platform's directory: merged, they are
+        # artifacts/frametee-linux/ and artifacts/frametee-windows/.
+        merge-multiple: true
+
+    - name: Create archives
+      run: |
+        set -euo pipefail
+        # download-artifact restores contents but not the executable bit, so
+        # frametee arrives as 0644 and the release archive would ship a file
+        # users have to chmod before it will run.
+        chmod +x artifacts/frametee-linux/frametee
+        find artifacts/frametee-linux -type f -name "*.so*" -exec chmod +x {} +
+        test -x artifacts/frametee-linux/frametee
+
+        tar -czvf frametee-linux.tar.gz -C artifacts frametee-linux
+        (cd artifacts && zip -r ../frametee-windows.zip frametee-windows)
+
+        # Both archives extract into one platform-named directory, and tar
+        # records the executable mode instead of requiring a manual chmod.
+        tar -tvzf frametee-linux.tar.gz frametee-linux/frametee | grep -q '^-rwxr-xr-x'
+        unzip -Z1 frametee-windows.zip | grep -x 'frametee-windows/frametee.exe' > /dev/null
+        test "$(tar -tzf frametee-linux.tar.gz | cut -d/ -f1 | sort -u)" = "frametee-linux"
+        test "$(unzip -Z1 frametee-windows.zip | cut -d/ -f1 | sort -u)" = "frametee-windows"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          frametee-linux.tar.gz
+          frametee-windows.zip
+        generate_release_notes: true

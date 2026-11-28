@@ -1,0 +1,856 @@
+cmake_minimum_required(VERSION 3.14)
+
+# Prefer Clang for a default build when both C and C++ drivers are available.
+# Explicit compiler selections and toolchain files always take precedence.
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE
+   AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE}
+   AND NOT DEFINED CMAKE_C_COMPILER
+   AND NOT DEFINED CMAKE_CXX_COMPILER
+   AND NOT DEFINED ENV{CC}
+   AND NOT DEFINED ENV{CXX})
+    find_program(FRAMETEE_CLANG_C_COMPILER NAMES clang)
+    find_program(FRAMETEE_CLANG_CXX_COMPILER NAMES clang++)
+
+    if(FRAMETEE_CLANG_C_COMPILER AND FRAMETEE_CLANG_CXX_COMPILER)
+        set(CMAKE_C_COMPILER "${FRAMETEE_CLANG_C_COMPILER}" CACHE FILEPATH "C compiler")
+        set(CMAKE_CXX_COMPILER "${FRAMETEE_CLANG_CXX_COMPILER}" CACHE FILEPATH "C++ compiler")
+        message(STATUS "Clang found; using it as the default FrameTee compiler")
+	endif()
+    unset(FRAMETEE_CLANG_C_COMPILER CACHE)
+    unset(FRAMETEE_CLANG_CXX_COMPILER CACHE)
+endif()
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED TRUE)
+
+# Option to enable sanitizers
+option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+# The tests (tests/, and those of the libraries and plugins that check this),
+# off by default: a build makes the editor, its games and plugins.
+option(BUILD_TESTING "Build the tests" OFF)
+
+# source files
+project(frametee)
+if(BUILD_TESTING)
+    enable_testing()
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	message(STATUS "No build type selected, defaulting to Release")
+	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type (default Release)" FORCE)
+endif()
+
+# Keep every build-tree runpath relative to the binary that carries it, so the
+# layout the release workflow copies out of build/ keeps resolving once it is
+# unpacked somewhere else. Without this CMake bakes in absolute build paths.
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+
+option(ENABLE_AGGRESSIVE_OPTIM "Enable aggressive optimizations with LTO and native tuning" OFF)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(PGO)
+
+if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+    add_compile_options(
+        /wd4018 # signed/unsigned mismatch
+        /wd4068 # unknown pragma
+        /wd4100 # unreferenced parameter
+        /wd4152 # function/data pointer conversion
+        /wd4201 # nameless struct/union
+        /wd4242 # conversion from type1 to type2, possible loss of data
+        /wd4244 # conversion from type1 to type2, possible loss of data
+        /wd4267 # conversion from size_t to type, possible loss of data
+        /wd4324 # structure padded due to alignment specifier
+        /wd4456 # declaration hides previous local declaration
+        /wd4710 # function not inlined
+        /wd4820 # padding added after data member
+        /wd4996 # deprecated functions
+        /wd5045 # Spectre mitigation info
+        /wd5287 # operands are different enum types
+    )
+endif()
+
+
+# The engine. Nothing here knows about any particular game: physics, level
+# formats, visuals and per-game panels all live in games/<id>/ behind
+# include/frametee/game_abi.h.
+set(SRCS 
+	src/main.c
+	src/system/save.c
+	src/system/config.c
+	src/system/input.c
+	src/system/window_state.c
+	src/system/input_repeat.c
+	src/system/raw_mouse.c
+	src/system/file_dialog.c
+	src/system/fs.c
+	src/system/sha256.c
+	src/logger/logger.c
+	src/engine/game_host.c
+	src/engine/engine_api.c
+	src/engine/entity_match.c
+	src/engine/input_record.c
+	src/engine/prediction.c
+	src/audio/audio.c
+	src/audio/audio_timeline.c
+	src/plugins/api_impl.c
+	src/plugins/plugin_manager.c
+	src/scripting/script_engine.c
+	src/renderer/graphics_backend.c
+	src/renderer/renderer.c
+	src/export/video_export.c
+	src/user_interface/keybinds.c
+	src/user_interface/input_effects.c
+	src/user_interface/input_effects_editor.c
+	src/user_interface/player_profile.c
+	src/user_interface/starting_state.c
+	src/user_interface/input_lanes.c
+	src/user_interface/snippet_editor.c
+	src/user_interface/timeline_events.c
+	src/user_interface/undo_redo.c
+	src/user_interface/user_interface.c
+	src/user_interface/camera/camera_timeline.c
+	src/user_interface/camera/camera_rig.c
+	src/user_interface/camera/camera_window.c
+	src/user_interface/render/render_profile.c
+	src/user_interface/render/render_window.c
+	src/user_interface/timeline/timeline.c
+	src/user_interface/timeline/timeline_commands.c
+	src/user_interface/timeline/timeline_interaction.c
+	src/user_interface/timeline/timeline_model.c
+	src/user_interface/timeline/timeline_recordings.c
+	src/user_interface/recording_import.c
+	src/user_interface/timeline/timeline_renderer.c
+)
+
+# find dependencies
+find_package(Vulkan REQUIRED)
+
+# Try to find an existing glfw3 installation first; fall back to fetching it if unavailable.
+# 3.4 is a hard minimum: raylib (games/example_platformer) uses GLFW 3.4-only API
+# such as GLFW_MOUSE_PASSTHROUGH and glfwGetPlatform.
+# On Windows it is always the fetched one, with its event loop changed by
+# cmake/glfw/patch_win32_mouse_motion.cmake: stock GLFW's loop does not end while a
+# mouse polling at 4-8 kHz moves, which stalls the whole editor.
+if(NOT WIN32)
+    find_package(glfw3 3.4 CONFIG QUIET)
+    if(NOT glfw3_FOUND)
+        find_package(glfw3 3.4 QUIET)
+    endif()
+endif()
+
+if(NOT glfw3_FOUND)
+    message(STATUS "Fetching GLFW 3.4")
+    include(FetchContent)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    # GLFW 3.4 defaults to both Wayland and X11 on Linux. Keep both backends
+    # so one binary works in either session; do not force Wayland off here.
+    # (the release archive rather than a clone: the patch is done by CMake, so
+    # nothing but CMake is needed to fetch and patch it; the replacement's hash is
+    # in the command so that a fetched source is patched again when it changes)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS cmake/glfw/win32_poll_events.c.in)
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/glfw/win32_poll_events.c.in GLFW_PATCH_SHA256)
+    FetchContent_Declare(
+        glfw
+        URL https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+        URL_HASH SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        PATCH_COMMAND ${CMAKE_COMMAND} -DREPLACEMENT_SHA256=${GLFW_PATCH_SHA256}
+                      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/glfw/patch_win32_mouse_motion.cmake
+    )
+    FetchContent_MakeAvailable(glfw)
+    # the fetched library is static and ends up inside loadable game modules
+    set_target_properties(glfw PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # raylib's cmake/GlfwImport.cmake keys off glfw3_FOUND; without this it also
+    # adds its own bundled glfw and collides with the target created above.
+    set(glfw3_FOUND TRUE)
+endif()
+
+set(GLFW_LINK_TARGET glfw)
+if(TARGET glfw::glfw)
+    set(GLFW_LINK_TARGET glfw::glfw)
+elseif(TARGET glfw)
+    set(GLFW_LINK_TARGET glfw)
+endif()
+
+set(PLATFORM_LIBS)
+if(UNIX AND NOT APPLE)
+    find_package(X11 REQUIRED)
+    list(APPEND PLATFORM_LIBS X11)
+endif()
+
+# find vulkan glslangvalidator for shader compilation
+find_program(GLSLANG_VALIDATOR glslangValidator HINTS ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE})
+if(NOT GLSLANG_VALIDATOR)
+    message(FATAL_ERROR "glslangValidator not found. Please ensure Vulkan SDK is installed.")
+endif()
+
+# stb library
+add_library(stb INTERFACE)
+target_include_directories(stb INTERFACE ${CMAKE_SOURCE_DIR}/libs/stb)
+
+# miniaudio: the output device and sample decoding (with stb_vorbis for Ogg).
+# The rest of it (its own engine, node graph, resource manager, encoders)
+# goes unused.
+find_package(Threads REQUIRED)
+add_library(miniaudio STATIC ${CMAKE_SOURCE_DIR}/src/audio/miniaudio_impl.c)
+target_include_directories(miniaudio PUBLIC ${CMAKE_SOURCE_DIR}/libs/miniaudio)
+target_include_directories(miniaudio PRIVATE ${CMAKE_SOURCE_DIR}/libs/stb)
+# Vendored code: its warnings are not ours to fix.
+target_compile_options(miniaudio PRIVATE $<$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>:-w>)
+target_compile_definitions(miniaudio PUBLIC MA_NO_ENGINE MA_NO_NODE_GRAPH MA_NO_RESOURCE_MANAGER MA_NO_GENERATION
+                                            MA_NO_ENCODING)
+target_link_libraries(miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX)
+    target_link_libraries(miniaudio PUBLIC m)
+endif()
+
+# toml library
+add_library(toml STATIC ${CMAKE_SOURCE_DIR}/libs/toml/src/tomlc17.c)
+target_include_directories(toml PUBLIC ${CMAKE_SOURCE_DIR}/libs/toml/src)
+
+# imgui sources
+set(IMGUI_SOURCES 
+    libs/cimgui/imgui/imgui.cpp
+    libs/cimgui/imgui/imgui_draw.cpp
+    libs/cimgui/imgui/imgui_demo.cpp
+    libs/cimgui/imgui/imgui_widgets.cpp
+    libs/cimgui/imgui/imgui_tables.cpp
+    libs/cimgui/imgui/backends/imgui_impl_vulkan.cpp
+    libs/cimgui/imgui/backends/imgui_impl_glfw.cpp
+)
+add_executable(${PROJECT_NAME} ${SRCS} ${IMGUI_SOURCES})
+# UTF-8 as the process's code page (src/system/windows/frametee.manifest), for
+# every path the modules and libraries open with the C library. MinGW embeds it
+# as a resource (taking the place of its default manifest); MSVC's linker
+# merges a .manifest source into its own.
+if(MINGW)
+    enable_language(RC)
+    target_sources(${PROJECT_NAME} PRIVATE src/system/windows/frametee.rc)
+    set_source_files_properties(src/system/windows/frametee.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/system/windows/frametee.manifest")
+elseif(MSVC)
+    target_sources(${PROJECT_NAME} PRIVATE src/system/windows/frametee.manifest)
+endif()
+
+# Force-include the cached GLFW monitor and window-state wrappers instead of renaming the GLFW
+# entry points with -D: a -D rename also hits their declarations in glfw3.h, so
+# on Windows (where glfw3.h marks them __declspec(dllimport)) the wrappers turn
+# into unresolved __imp_mock_glfw* imports at link time.
+set(IMGUI_GLFW_CACHE_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/imgui_glfw_cache.h")
+if(MSVC)
+    set(IMGUI_GLFW_CACHE_FLAGS "/FI${IMGUI_GLFW_CACHE_HEADER}")
+else()
+    set(IMGUI_GLFW_CACHE_FLAGS "-include;${IMGUI_GLFW_CACHE_HEADER}")
+endif()
+set_source_files_properties(libs/cimgui/imgui/backends/imgui_impl_glfw.cpp PROPERTIES
+    COMPILE_DEFINITIONS "IMGUI_IMPL_API=extern \"C\""
+    COMPILE_OPTIONS "${IMGUI_GLFW_CACHE_FLAGS}"
+    OBJECT_DEPENDS "${IMGUI_GLFW_CACHE_HEADER}"
+)
+set_source_files_properties(libs/cimgui/imgui/backends/imgui_impl_vulkan.cpp PROPERTIES
+    COMPILE_DEFINITIONS "IMGUI_IMPL_API=extern \"C\""
+)
+
+if(UNIX)
+    # On Linux/macOS, this flag adds all symbols to the dynamic symbol table
+    target_link_options(${PROJECT_NAME} PRIVATE -rdynamic)
+elseif(WIN32)
+    # On Windows, this enables the executable to export symbols like a DLL
+    set_target_properties(${PROJECT_NAME} PROPERTIES ENABLE_EXPORTS ON)
+    set_property(SOURCE ${IMGUI_SOURCES} PROPERTY COMPILE_DEFINITIONS "IMGUI_API=__declspec(dllexport)")
+    set_property(SOURCE libs/cimgui/imgui/backends/imgui_impl_glfw.cpp APPEND PROPERTY COMPILE_DEFINITIONS "IMGUI_IMPL_API=extern \"C\"")
+    set_property(SOURCE libs/cimgui/imgui/backends/imgui_impl_vulkan.cpp APPEND PROPERTY COMPILE_DEFINITIONS "IMGUI_IMPL_API=extern \"C\"")
+endif()
+
+set(IMGUI_STATIC "yes" CACHE STRING "Build as a static library" FORCE)
+# cimgui configuration
+add_subdirectory(libs/cimgui)
+# Override cimgui's interface compile definitions so it doesn't leak escaped quotes to C files
+set_target_properties(cimgui PROPERTIES INTERFACE_COMPILE_DEFINITIONS "IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1")
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE 
+    CIMGUI_DEFINE_ENUMS_AND_STRUCTS=1
+    CIMGUI_USE_GLFW=1
+    CIMGUI_USE_VULKAN=1
+    CIMGUI_NO_EXPORT=1
+    # APP_USE_VULKAN_DEBUG_REPORT=1
+)
+
+# add and link libs
+# cglm defaults to a shared build, which leaves the executable with a
+# NEEDED libcglm.so.0 that only resolves inside the build tree. Nothing links
+# it out of process, so build it static and fold it into the binaries that use
+# it; PIC is required because the game modules are shared libraries.
+set(CGLM_STATIC ON CACHE BOOL "Build cglm as a static library" FORCE)
+set(CGLM_SHARED OFF CACHE BOOL "Do not build cglm as a shared library" FORCE)
+add_subdirectory(libs/cglm)
+set_target_properties(cglm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(libs/nfd)
+# Super Mario 64: the game as a library (libs/sm64_physics, self-contained),
+# once per version, and its modules (games/sm64). They run with the user's ROM.
+option(FRAMETEE_BUILD_SM64 "Build the native SM64 game module" OFF)
+if(FRAMETEE_BUILD_SM64)
+    # Shared: each version's module and its plugins use one copy of the game.
+    # One library per version (sm64_physics_us, _jp, _eu, _sh), each a game
+    # module of its own (games/sm64).
+    set(SM64_PHYSICS_SHARED ON CACHE BOOL "Build sm64_physics as a shared library" FORCE)
+    set(FRAMETEE_SM64_VERSIONS us jp eu sh)
+    foreach(SM64_VERSION ${FRAMETEE_SM64_VERSIONS})
+        set(SM64_TARGET_SUFFIX "_${SM64_VERSION}")
+        add_subdirectory(libs/sm64_physics "${CMAKE_BINARY_DIR}/libs/sm64_physics_${SM64_VERSION}")
+    endforeach()
+    unset(SM64_VERSION)
+    unset(SM64_TARGET_SUFFIX)
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    nfd
+    stb
+    miniaudio
+    toml
+    cglm
+    cimgui
+    ${GLFW_LINK_TARGET}
+    ${PLATFORM_LIBS}
+    Vulkan::Vulkan
+)
+
+# jemalloc as the allocator since it's quite a bit faster
+option(FRAMETEE_JEMALLOC "Link jemalloc as the allocator (Linux)" ON)
+if(FRAMETEE_JEMALLOC AND UNIX AND NOT APPLE AND NOT ENABLE_SANITIZERS)
+    include(ExternalProject)
+    include(ProcessorCount)
+    ProcessorCount(JEMALLOC_JOBS)
+    if(JEMALLOC_JOBS EQUAL 0)
+        set(JEMALLOC_JOBS 1)
+    endif()
+    find_program(JEMALLOC_MAKE NAMES gmake make REQUIRED)
+    ExternalProject_Add(jemalloc_build
+        URL https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2
+        URL_HASH SHA256=2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        BUILD_IN_SOURCE TRUE
+        # (its C++ part uses a libstdc++ internal newer GCCs lack; operator new
+        # goes through malloc anyway)
+        CONFIGURE_COMMAND <SOURCE_DIR>/configure --disable-cxx --disable-stats --disable-prof CC=${CMAKE_C_COMPILER}
+        BUILD_COMMAND ${JEMALLOC_MAKE} -j${JEMALLOC_JOBS} build_lib_static
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS <SOURCE_DIR>/lib/libjemalloc_pic.a
+    )
+    ExternalProject_Get_Property(jemalloc_build SOURCE_DIR)
+    add_dependencies(${PROJECT_NAME} jemalloc_build)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${SOURCE_DIR}/lib/libjemalloc_pic.a Threads::Threads ${CMAKE_DL_LIBS} m)
+    unset(SOURCE_DIR)
+    message(STATUS "Allocator: jemalloc 5.3.0")
+endif()
+
+find_package(PkgConfig QUIET)
+# Native Wayland supplies keyboard repeat settings through a protocol listener.
+# X11-only builds can omit the client library.
+if(UNIX AND NOT APPLE AND PkgConfig_FOUND)
+    pkg_check_modules(FRAMETEE_WAYLAND QUIET IMPORTED_TARGET wayland-client)
+    if(TARGET PkgConfig::FRAMETEE_WAYLAND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::FRAMETEE_WAYLAND)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE FT_HAS_WAYLAND=1)
+    endif()
+endif()
+# MP4 export needs FFmpeg's libraries. Without them the editor still builds,
+# with rendering disabled; release builds ask for it so they cannot ship
+# without it by accident.
+option(FRAMETEE_REQUIRE_VIDEO_EXPORT "Fail to configure when FFmpeg is not found" OFF)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FRAMETEE_VIDEO_FFMPEG QUIET IMPORTED_TARGET
+        libavformat libavcodec libavutil libswscale)
+endif()
+if(TARGET PkgConfig::FRAMETEE_VIDEO_FFMPEG)
+    target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::FRAMETEE_VIDEO_FFMPEG)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FT_HAS_FFMPEG=1)
+    message(STATUS "MP4 export: enabled (libavcodec ${FRAMETEE_VIDEO_FFMPEG_libavcodec_VERSION})")
+elseif(FRAMETEE_REQUIRE_VIDEO_EXPORT)
+    message(FATAL_ERROR "MP4 export needs FFmpeg (libavformat, libavcodec, libavutil, libswscale) through pkg-config")
+else()
+    message(STATUS "MP4 export: disabled (FFmpeg not found)")
+endif()
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+    $<$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>: -Wall -Wextra -pedantic>
+    $<$<C_COMPILER_ID:MSVC>: /W4 /wd4324>
+    $<$<AND:$<CONFIG:Debug>,$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>>: -g -DDEBUG>
+    $<$<AND:$<CONFIG:Debug>,$<C_COMPILER_ID:MSVC>>: /Zi /Od /DDEBUG>
+
+    $<$<AND:$<CONFIG:Release>,$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>>: -O3 -funroll-loops -mfpmath=sse -fomit-frame-pointer -fno-trapping-math -fno-signed-zeros>
+    $<$<AND:$<CONFIG:Release>,$<C_COMPILER_ID:MSVC>>: /Ox /Ob2 /Oi /GL /DNDEBUG>
+
+    $<$<AND:$<BOOL:${ENABLE_SANITIZERS}>,$<CONFIG:Debug>,$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>>:-fsanitize=address,undefined>
+)
+
+
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/src)
+# The game module ABI. Kept in its own root so a game module can consume it
+# without seeing any engine internals.
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/libs)
+
+# sanitizer options
+if(ENABLE_SANITIZERS)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+        # create suppression file for gtk, vulkan loader, pango, and fontconfig-related leaks
+        set(SUPPRESSION_FILE "${CMAKE_BINARY_DIR}/asan_suppressions.txt")
+        file(WRITE ${SUPPRESSION_FILE}
+            "# Suppressions for GTK-related memory leaks\n"
+            "leak:*gtk_*\n"
+            "leak:*g_object_*\n"
+            "leak:*gdk_*\n"
+            "leak:*glib_*\n"
+            "leak:*pango_*\n"
+            "leak:*cairo_*\n"
+            "leak:*GObject*\n"
+            "leak:*Gdk*\n"
+            "leak:*Gtk*\n"
+            "leak:*GLib*\n"
+            "# Suppressions for Vulkan loader-related memory leaks\n"
+            "leak:*vulkan-icd-loader*\n"
+            "leak:*setup_loader_term_phys_devs*\n"
+            "leak:*terminator_EnumeratePhysicalDevices*\n"
+            "leak:*vkEnumeratePhysicalDevices*\n"
+            "# Suppressions for FontConfig-related memory leaks\n"
+            "leak:*libfontconfig*\n"
+            "leak:*FcFontRenderPrepare*\n"
+            "leak:*FcFontSetMatch*\n"
+            "leak:*FcValueSave*\n"
+            "leak:*FcLangSetCopy*\n"
+        )
+        # create wrapper script to set lsan_options
+        set(WRAPPER_SCRIPT "${CMAKE_BINARY_DIR}/scripts/frametee.sh")
+        file(WRITE ${WRAPPER_SCRIPT}
+            "#!/bin/sh\n"
+            "export LSAN_OPTIONS=suppressions=${CMAKE_BINARY_DIR}/asan_suppressions.txt\n"
+            "exec ${CMAKE_BINARY_DIR}/frametee \"$@\"\n"
+        )
+        # make the wrapper script executable
+        execute_process(COMMAND chmod +x ${WRAPPER_SCRIPT})
+        message(STATUS "Sanitizer wrapper script created at ${WRAPPER_SCRIPT}. Use './frametee.sh' to run with suppressions.")
+    else()
+        message(WARNING "Sanitizers are only supported for GCC and Clang compilers.")
+    endif()
+endif()
+
+# compile and copy shaders
+# create shaders output directory in build folder
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/data/shaders)
+
+# shader compilation
+file(GLOB SHADER_SOURCES 
+    "${CMAKE_SOURCE_DIR}/data/shaders/*.vert.glsl" 
+    "${CMAKE_SOURCE_DIR}/data/shaders/*.frag.glsl"
+)
+message(STATUS "Shader sources found: ${SHADER_SOURCES}")
+if(NOT SHADER_SOURCES)
+    message(WARNING "No shader sources found in ${CMAKE_SOURCE_DIR}/data/shaders/. Check the directory and file extensions.")
+endif()
+
+set(SHADER_OUTPUTS "")
+foreach(SHADER ${SHADER_SOURCES})
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    string(REPLACE ".glsl" ".spv" SHADER_OUTPUT_NAME ${SHADER_NAME})
+    set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/data/shaders/${SHADER_OUTPUT_NAME}")
+    list(APPEND SHADER_OUTPUTS ${SHADER_OUTPUT})
+
+    add_custom_command(
+        OUTPUT ${SHADER_OUTPUT}
+        COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER} -o ${SHADER_OUTPUT}
+        DEPENDS ${SHADER}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Compiling shader ${SHADER_NAME} to ${SHADER_OUTPUT}"
+    )
+endforeach()
+
+# custom target for shaders
+add_custom_target(
+    compile_shaders
+    DEPENDS ${SHADER_OUTPUTS}
+    COMMENT "Compiling all GLSL shaders to SPIR-V"
+)
+
+# ensure shaders are compiled before the main target
+add_dependencies(${PROJECT_NAME} compile_shaders)
+
+# create plugins directory in build folder
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory 
+        ${CMAKE_BINARY_DIR}/plugins
+    COMMENT "Creating plugins directory in build folder"
+)
+
+# copy textures folder to build directory
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory 
+        ${CMAKE_SOURCE_DIR}/data/textures 
+        ${CMAKE_BINARY_DIR}/data/textures
+    COMMENT "Copying textures to build directory"
+)
+
+# copy fonts folder to build directory
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory 
+        ${CMAKE_SOURCE_DIR}/data/fonts 
+        ${CMAKE_BINARY_DIR}/data/fonts
+    COMMENT "Copying fonts to build directory"
+)
+
+# copy compiled shaders to build directory
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        ${SHADER_OUTPUTS} 
+        ${CMAKE_BINARY_DIR}/data/shaders/
+    COMMENT "Copying compiled shaders to build directory"
+)
+
+# =================================================================================================
+# GAME MODULES
+# =================================================================================================
+# Each subdirectory of games/ is an independent shared library implementing
+# include/frametee/game_abi.h. They are built here purely for convenience: a
+# module has no build-time dependency on the engine and can be compiled
+# out-of-tree, in any language that can produce a C-callable shared library.
+option(BUILD_GAMES "Build the bundled game modules" ON)
+set(FRAMETEE_DEFAULT_GAME "" CACHE STRING "Game module id to start with by default; empty selects the first installed module")
+target_compile_definitions(${PROJECT_NAME} PRIVATE FRAMETEE_DEFAULT_GAME_ID="${FRAMETEE_DEFAULT_GAME}")
+set(FRAMETEE_ABI_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include" CACHE PATH "Location of the FrameTee game ABI header")
+
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/games
+    COMMENT "Creating games directory in build folder"
+)
+
+if(BUILD_GAMES)
+    file(GLOB GAME_ENTRIES "${CMAKE_SOURCE_DIR}/games/*")
+    foreach(GAME_DIR ${GAME_ENTRIES})
+        if(IS_DIRECTORY "${GAME_DIR}" AND EXISTS "${GAME_DIR}/CMakeLists.txt")
+            add_subdirectory("${GAME_DIR}")
+            get_property(GAME_TARGETS DIRECTORY "${GAME_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+            foreach(GAME_TARGET ${GAME_TARGETS})
+                set_target_properties(${GAME_TARGET} PROPERTIES
+                    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/games"
+                    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/games"
+                    # Keep build-tree runtime paths relocatable. Release
+                    # artifacts preserve the build's games/ and libs/ layout,
+                    # so bundled game dependencies continue to resolve after
+                    # the artifact is moved away from the CI checkout.
+                    BUILD_RPATH_USE_ORIGIN ON
+                )
+                # On Windows the modules link the executable's import library,
+                # so the dependency runs the other way and adding it here would
+                # close a cycle. They are ALL targets either way.
+                if(NOT WIN32)
+                    add_dependencies(${PROJECT_NAME} ${GAME_TARGET})
+                endif()
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+# =================================================================================================
+# GAME MODULE ASSETS
+# =================================================================================================
+# Each game keeps its assets under data/games/<id>/, which is what
+# engine->resolve_data_path() hands back to a module. Shaders there are compiled
+# the same way the engine's own are.
+#
+# This runs after the modules are added so that a game left out of the build
+# leaves its data out with it. data/games/tmuf alone is 1.7 GB of Packs and
+# GameData that no build without a tmuf module can use, and the glob is not free
+# either: CONFIGURE_DEPENDS re-walks every directory it covers on each build. A
+# data directory with no games/<id> beside it belongs to a module built out of
+# tree, so it is always copied.
+set(GAME_ASSET_GLOBS "")
+set(GAME_SHADER_GLOBS "")
+file(GLOB GAME_DATA_ENTRIES "${CMAKE_SOURCE_DIR}/data/games/*")
+foreach(GAME_DATA_ENTRY ${GAME_DATA_ENTRIES})
+    if(NOT IS_DIRECTORY "${GAME_DATA_ENTRY}")
+        list(APPEND GAME_ASSET_GLOBS "${GAME_DATA_ENTRY}")
+        continue()
+    endif()
+    get_filename_component(GAME_DATA_ID "${GAME_DATA_ENTRY}" NAME)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/games/${GAME_DATA_ID}/CMakeLists.txt" AND
+       NOT TARGET ${GAME_DATA_ID}_game)
+        message(STATUS "Game assets: skipping data/games/${GAME_DATA_ID}, "
+                       "the ${GAME_DATA_ID} module is not part of this build")
+        continue()
+    endif()
+    list(APPEND GAME_ASSET_GLOBS "${GAME_DATA_ENTRY}/*")
+    list(APPEND GAME_SHADER_GLOBS
+        "${GAME_DATA_ENTRY}/shaders/*.vert.glsl"
+        "${GAME_DATA_ENTRY}/shaders/*.frag.glsl")
+    # Shared code the stages #include (GL_GOOGLE_include_directive), never compiled on its own.
+    list(APPEND GAME_SHADER_INCLUDE_GLOBS "${GAME_DATA_ENTRY}/shaders/*.glsl.inc")
+endforeach()
+
+file(GLOB GAME_SHADER_SOURCES ${GAME_SHADER_GLOBS})
+file(GLOB GAME_SHADER_INCLUDES ${GAME_SHADER_INCLUDE_GLOBS})
+set(GAME_SHADER_OUTPUTS "")
+foreach(SHADER ${GAME_SHADER_SOURCES})
+    file(RELATIVE_PATH SHADER_REL "${CMAKE_SOURCE_DIR}/data" "${SHADER}")
+    string(REPLACE ".glsl" ".spv" SHADER_REL_SPV "${SHADER_REL}")
+    set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/data/${SHADER_REL_SPV}")
+    get_filename_component(SHADER_OUT_DIR "${SHADER_OUTPUT}" DIRECTORY)
+    list(APPEND GAME_SHADER_OUTPUTS ${SHADER_OUTPUT})
+    add_custom_command(
+        OUTPUT ${SHADER_OUTPUT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT_DIR}"
+        COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER} -o ${SHADER_OUTPUT}
+        DEPENDS ${SHADER} ${GAME_SHADER_INCLUDES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Compiling game shader ${SHADER_REL}"
+    )
+endforeach()
+add_custom_target(compile_game_shaders ALL DEPENDS ${GAME_SHADER_OUTPUTS})
+add_dependencies(${PROJECT_NAME} compile_game_shaders)
+
+# Copy non-shader game assets next to the compiled shaders. Each file is an
+# actual build output so changing a texture (or adding one via CONFIGURE_DEPENDS)
+# updates the build tree even when the FrameTee executable does not need to be
+# relinked.
+file(GLOB_RECURSE GAME_ASSET_SOURCES CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    ${GAME_ASSET_GLOBS}
+)
+set(GAME_ASSET_OUTPUTS "")
+foreach(ASSET ${GAME_ASSET_SOURCES})
+    # Per-game ignore rules describe source-tree housekeeping, never runtime
+    # assets. SM64 stages platform-specific locked runtimes separately below.
+    if(ASSET MATCHES "/\\.gitignore$" OR ASSET MATCHES "/games/sm64/runtime/")
+        continue()
+    endif()
+    if(ASSET MATCHES "/shaders/.*\\.(glsl|spv)$")
+        continue()
+    endif()
+    # The SM64 ROM is always supplied beside the executable by the player.
+    # Do not copy an arbitrary local ROM into build or release data.
+    if(ASSET MATCHES "/games/sm64/.*\\.(n64|N64|z64|Z64|v64|V64)$")
+        continue()
+    endif()
+    file(RELATIVE_PATH ASSET_REL "${CMAKE_SOURCE_DIR}/data" "${ASSET}")
+    set(ASSET_OUTPUT "${CMAKE_BINARY_DIR}/data/${ASSET_REL}")
+    get_filename_component(ASSET_OUT_DIR "${ASSET_OUTPUT}" DIRECTORY)
+    list(APPEND GAME_ASSET_OUTPUTS "${ASSET_OUTPUT}")
+    add_custom_command(
+        OUTPUT "${ASSET_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ASSET_OUT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ASSET}" "${ASSET_OUTPUT}"
+        # An unchanged file is not copied, so the copy keeps its old time and
+        # would stay older than a source that was only touched (a checkout):
+        # mark it current, or it is copied again on every build.
+        COMMAND ${CMAKE_COMMAND} -E touch_nocreate "${ASSET_OUTPUT}"
+        DEPENDS "${ASSET}"
+        COMMENT "Copying game asset ${ASSET_REL}"
+        VERBATIM
+    )
+endforeach()
+add_custom_target(copy_game_assets ALL DEPENDS ${GAME_ASSET_OUTPUTS})
+add_dependencies(${PROJECT_NAME} copy_game_assets)
+if(TARGET sm64_version_data)
+    add_dependencies(sm64_version_data compile_game_shaders copy_game_assets)
+endif()
+
+# =================================================================================================
+# PLUGINS INTEGRATION
+# =================================================================================================
+option(BUILD_PLUGINS "Build all default plugins" ON)
+set(FRAMETEE_PLUGIN_ALLOWLIST "" CACHE STRING
+    "Semicolon-separated plugin directory names to build; empty builds every discovered plugin")
+if(BUILD_PLUGINS)
+    set(HOST_APP_DIR "${CMAKE_SOURCE_DIR}" CACHE PATH "Path to the FrameTee project root" FORCE)
+    file(GLOB PLUGIN_ENTRIES "${CMAKE_SOURCE_DIR}/plugins/*")
+    foreach(PLUGIN_DIR ${PLUGIN_ENTRIES})
+        get_filename_component(PLUGIN_NAME "${PLUGIN_DIR}" NAME)
+        if(FRAMETEE_PLUGIN_ALLOWLIST AND NOT PLUGIN_NAME IN_LIST FRAMETEE_PLUGIN_ALLOWLIST)
+            continue()
+        endif()
+        if(IS_DIRECTORY "${PLUGIN_DIR}" AND EXISTS "${PLUGIN_DIR}/CMakeLists.txt")
+            # Built out of the way: plugins/<name> in the build tree is the
+            # plugin's runtime directory, which holds what a release holds and
+            # nothing else, so the digest the editor shows over it means the
+            # same thing here as it does in an install.
+            add_subdirectory("${PLUGIN_DIR}" "${CMAKE_BINARY_DIR}/plugin-build/${PLUGIN_NAME}")
+            get_property(PLUGIN_TARGETS DIRECTORY "${PLUGIN_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+            foreach(TARGET ${PLUGIN_TARGETS})
+                # A plugin owns a directory named after it, holding its library,
+                # its manifest and whatever resources it ships. The directory
+                # name is the same on every platform, so it is what the editor
+                # and config.toml call the plugin, and the library inside takes
+                # that name too.
+                set_target_properties(${TARGET} PROPERTIES
+                    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/${PLUGIN_NAME}"
+                    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/${PLUGIN_NAME}"
+                    OUTPUT_NAME "${PLUGIN_NAME}"
+                    BUILD_RPATH_USE_ORIGIN ON
+                )
+                # A plugin's loadable binary is part of the end-user runtime;
+                # its build directory, import library, and debug intermediates
+                # are not. Installing the target keeps that distinction exact.
+                get_target_property(PLUGIN_TARGET_TYPE ${TARGET} TYPE)
+                if(PLUGIN_TARGET_TYPE STREQUAL "SHARED_LIBRARY" OR
+                   PLUGIN_TARGET_TYPE STREQUAL "MODULE_LIBRARY")
+                    # MSVC does not prefix DLLs, but MinGW does unless told
+                    # otherwise. Keep one stable Windows plugin filename (and
+                    # therefore one stable configuration key) across both
+                    # toolchains.
+                    if(WIN32)
+                        set_target_properties(${TARGET} PROPERTIES PREFIX "")
+                    endif()
+                    # A plugin's own directory, first on its search path, so it
+                    # can carry the libraries it depends on beside itself as it
+                    # can on Windows. Appended rather than assigned: a plugin
+                    # that named directories of its own keeps them, and only it
+                    # knows where they are.
+                    if(NOT WIN32 AND NOT APPLE)
+                        get_target_property(PLUGIN_RPATH ${TARGET} INSTALL_RPATH)
+                        if(PLUGIN_RPATH)
+                            set_target_properties(${TARGET} PROPERTIES INSTALL_RPATH "$ORIGIN;${PLUGIN_RPATH}")
+                        else()
+                            set_target_properties(${TARGET} PROPERTIES INSTALL_RPATH "$ORIGIN")
+                        endif()
+                    endif()
+                    install(TARGETS ${TARGET}
+                        RUNTIME DESTINATION "plugins/${PLUGIN_NAME}" COMPONENT Runtime
+                        LIBRARY DESTINATION "plugins/${PLUGIN_NAME}" COMPONENT Runtime
+                    )
+                    # The manifest is what the editor may read about a plugin it
+                    # has not loaded, so it ships in the same directory.
+                    if(EXISTS "${PLUGIN_DIR}/plugin.toml")
+                        # A custom target rather than a POST_BUILD step: the
+                        # plugin's own target belongs to its subdirectory and
+                        # cannot be extended from here.
+                        add_custom_target(${TARGET}_manifest ALL
+                            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                                "${PLUGIN_DIR}/plugin.toml"
+                                "${CMAKE_BINARY_DIR}/plugins/${PLUGIN_NAME}/plugin.toml"
+                            DEPENDS "${PLUGIN_DIR}/plugin.toml"
+                            VERBATIM
+                        )
+                        add_dependencies(${TARGET}_manifest ${TARGET})
+                        install(FILES "${PLUGIN_DIR}/plugin.toml"
+                            DESTINATION "plugins/${PLUGIN_NAME}" COMPONENT Runtime
+                        )
+                    endif()
+                endif()
+            endforeach()
+
+        endif()
+    endforeach()
+endif()
+
+# =================================================================================================
+# MINIMAL RUNTIME INSTALL
+# =================================================================================================
+# Release packaging installs this component instead of copying whole build
+# directories. Build trees contain object files, generated project files,
+# import libraries, debug databases, and optional developer plugins; none of
+# those belong in an end-user archive.
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME DESTINATION "." COMPONENT Runtime
+)
+
+# These are the fonts loaded by the UI and the DDNet renderer. Keep their
+# licenses beside them; JetBrains Mono and the legacy engine texture directory
+# are not runtime inputs.
+install(FILES
+    "${CMAKE_SOURCE_DIR}/data/fonts/DejaVuSans.ttf"
+    "${CMAKE_SOURCE_DIR}/data/fonts/DejaVuSans-LICENSE.txt"
+    "${CMAKE_SOURCE_DIR}/data/fonts/Roboto-SemiBold.ttf"
+    "${CMAKE_SOURCE_DIR}/data/fonts/fa-solid-900.ttf"
+    "${CMAKE_SOURCE_DIR}/data/fonts/OFL.txt"
+    DESTINATION "data/fonts"
+    COMPONENT Runtime
+)
+install(FILES ${SHADER_OUTPUTS}
+    DESTINATION "data/shaders"
+    COMPONENT Runtime
+)
+
+if(TARGET ddnet_game)
+    # (and Unique Race, its other backend, built from the same sources, which reads DDNet's data)
+    install(TARGETS ddnet_game unique_game
+        RUNTIME DESTINATION "games" COMPONENT Runtime
+        LIBRARY DESTINATION "games" COMPONENT Runtime
+    )
+
+    # PNG assets are copied from the source tree and SPIR-V files are generated
+    # in the build tree. Source GLSL is useful for development, not at runtime.
+    install(DIRECTORY "${CMAKE_BINARY_DIR}/data/games/ddnet/"
+        DESTINATION "data/games/ddnet"
+        COMPONENT Runtime
+        FILES_MATCHING
+        PATTERN "*.png"
+        PATTERN "*.spv"
+        PATTERN "*.flac"
+        PATTERN "LICENSE.txt"
+    )
+
+    # DDNet's physics libraries are shared on ELF and static on Windows. Only
+    # shared targets need to be present in the runtime component.
+    foreach(DDNET_RUNTIME_TARGET ddnet_physics unique_physics ddnet_map_loader)
+        if(TARGET ${DDNET_RUNTIME_TARGET})
+            get_target_property(DDNET_RUNTIME_TARGET_TYPE ${DDNET_RUNTIME_TARGET} TYPE)
+            if(DDNET_RUNTIME_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
+                if(NOT DDNET_RUNTIME_TARGET STREQUAL "ddnet_map_loader")
+                    set(DDNET_RUNTIME_DESTINATION "libs/${DDNET_RUNTIME_TARGET}")
+                else()
+                    set(DDNET_RUNTIME_DESTINATION "libs/ddnet_physics/libs/ddnet_map_loader")
+                endif()
+                install(TARGETS ${DDNET_RUNTIME_TARGET}
+                    RUNTIME DESTINATION "${DDNET_RUNTIME_DESTINATION}" COMPONENT Runtime
+                    LIBRARY DESTINATION "${DDNET_RUNTIME_DESTINATION}" COMPONENT Runtime
+                )
+            endif()
+        endif()
+    endforeach()
+endif()
+
+if(TARGET sm64_game)
+    # The source GLSL stays in the checkout; the compiled shaders are the
+    # runtime assets that accompany the modules and native SM64 libraries.
+    # Every version's module reads them from its own data directory.
+    foreach(SM64_GAME_DATA sm64 sm64_jp sm64_eu sm64_sh)
+        install(DIRECTORY "${CMAKE_BINARY_DIR}/data/games/sm64/"
+            DESTINATION "data/games/${SM64_GAME_DATA}"
+            COMPONENT Runtime
+            FILES_MATCHING
+            PATTERN "*.spv"
+            PATTERN "thumbnail*.png"
+        )
+    endforeach()
+endif()
+
+if(TARGET tmuf_game)
+    install(TARGETS tmuf_game
+        RUNTIME DESTINATION "games" COMPONENT Runtime
+        LIBRARY DESTINATION "games" COMPONENT Runtime
+    )
+    # The proprietary Packs and GameData directories must come from the user's
+    # own TMUF installation. Never pick those ignored local files up in a
+    # release made from a developer checkout.
+    install(FILES
+        "${CMAKE_SOURCE_DIR}/data/games/tmuf/README.txt"
+        "${CMAKE_SOURCE_DIR}/data/games/tmuf/thumbnail.png"
+        DESTINATION "data/games/tmuf"
+        COMPONENT Runtime
+    )
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
