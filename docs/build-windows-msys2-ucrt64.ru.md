@@ -5,6 +5,23 @@
 чем собирается официальный Windows-релиз в
 `.github/workflows/build.yml` (`build-windows`).
 
+## Быстрый старт (одна команда)
+
+В дереве с исходниками (или в этой ветке) лежит `scripts/build-ucrt64.sh` — он
+ставит пакеты, клонирует/обновляет сабмодули, применяет патч, конфигурирует и
+собирает:
+
+```bash
+# в терминале «MSYS2 UCRT64», из корня дерева
+./scripts/build-ucrt64.sh                 # DEPS=1, TMUF=ON, FFmpeg обязателен
+INSTALL=1 ./scripts/build-ucrt64.sh       # ещё и переносимая папка build/dist
+TMUF=OFF FFMPEG=0 ./scripts/build-ucrt64.sh
+```
+
+То же из Проводника двойным щелчком: `scripts\build-ucrt64.cmd`.
+
+Дальше — что этот скрипт делает, по шагам (если хочется руками или что-то упало).
+
 ## 0. Что нужно заранее
 
 * Windows 10/11 x64, видеокарта с рабочим Vulkan-драйвером.
@@ -84,6 +101,21 @@ cd frametee
 `--recursive` важен: `libs/cimgui` тянет собственный сабмодуль `imgui`, без него
 CMake упадёт на `cimgui.h: No such file or directory`.
 
+> **Грабли с сабмодулями.** У вложенного сабмодуля
+> `libs/ddnet_demo/ddnet_maploader` адрес прописан как
+> `git@github.com:Teero888/ddnet_maploader.git`, то есть через SSH. Без
+> SSH-ключей на GitHub клон падает с `Connection reset by peer` /
+> `Permission denied (publickey)`. Лечится подменой SSH на https **на одну
+> команду** (глобальный конфиг не трогаем):
+>
+> ```bash
+> git -c url."https://github.com/".insteadOf="git@github.com:" clone --recursive https://github.com/Teero888/frametee.git
+> # в существующем клоне:
+> git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive
+> ```
+>
+> `scripts/build-ucrt64.sh` делает это сам.
+
 Если репозиторий уже склонирован без сабмодулей:
 
 ```bash
@@ -118,6 +150,22 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 * **GLFW.** На Windows всегда собирается скачанный 3.4 (со патчем цикла событий
   из `cmake/glfw/`). В логе будет `Fetching GLFW 3.4` — это нормально, нужен
   интернет. При первом конфигурировании может занять минуту.
+
+  Патч не косметический: движок на Windows ссылается на символ
+  `frametee_glfw_win32_mouse_motion_patch` (`src/renderer/graphics_backend.c`),
+  поэтому GLFW **без** этого патча просто не слинкуется
+  (`undefined reference to frametee_glfw_win32_mouse_motion_patch`). Если
+  `github.com`/`objects.githubusercontent.com` недоступны, скачайте
+  `glfw-3.4.zip` вручную, распакуйте, прогоните патч и подставьте каталог:
+
+  ```bash
+  cd /c/dev/glfw-3.4
+  cmake -DREPLACEMENT_SHA256=207c2123cd27f740cd2a869d78608a467feacd0b295b622d12bf629c30e4e1af \
+        -P /c/dev/frametee/cmake/glfw/patch_win32_mouse_motion.cmake
+  cd /c/dev/frametee
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DFETCHCONTENT_SOURCE_DIR_GLFW=C:/dev/glfw-3.4
+  ```
 * **FFmpeg.** В конце конфигурации смотрите строку:
   `MP4 export: enabled (libavcodec ...)` — значит FFmpeg найден.
   `MP4 export: disabled (FFmpeg not found)` — вкладка Render будет недоступна.
@@ -209,6 +257,8 @@ ldd dist/frametee.exe | grep "not found"   # пусто — хорошо
 | `glslangValidator not found. Please ensure Vulkan SDK is installed.` | не установлен `glslang`: `pacman -S mingw-w64-ucrt-x86_64-glslang` |
 | `Could NOT find Vulkan` | `mingw-w64-ucrt-x86_64-vulkan-headers` и `-vulkan-loader` |
 | `cimgui.h: No such file or directory` | сабмодули не инициализированы: `git submodule update --init --recursive` (именно `--recursive`) |
+| `Connection reset by peer` / `Permission denied (publickey)` при сабмодулях | `libs/ddnet_demo/ddnet_maploader` задан по SSH; клонируйте с `git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive` |
+| `undefined reference to frametee_glfw_win32_mouse_motion_patch` | GLFW собран без патча из `cmake/glfw/`; см. пункт «GLFW» в разделе 5 |
 | `games/sm64 needs libs/sm64_physics` | либо `git submodule update --init libs/sm64_physics`, либо `-DFRAMETEE_BUILD_SM64=OFF` |
 | `Could not find CURL` / `Freetype` | `pacman -S mingw-w64-ucrt-x86_64-curl mingw-w64-ucrt-x86_64-freetype` |
 | `Fetching GLFW 3.4` … ошибка скачивания | нет сети/прокси на `github.com`; скачайте `glfw-3.4.zip` вручную и положите туда, куда укажет CMake (`build/_deps/glfw-subbuild/...`) |
